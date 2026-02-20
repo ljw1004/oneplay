@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="description" content="Play your OneDrive music">
+
+    <title>OnePlay Music</title>
+    <link rel="icon" type="image/png" href="assets/favicon.png">
+    <link rel="apple-touch-icon" href="assets/appicon.png">
+    <link rel="manifest" href="manifest.json">
+
+    <meta name="theme-color" content="#f2efe5">
+    <meta name="color-scheme" content="light">
+    <script>
+    /* Synchronous theme application: prevent flash of wrong theme on load.
+     * Reads oneplay_music_theme from localStorage, resolves "auto" via matchMedia,
+     * and sets data-theme="dark" + meta tags before the browser paints <body>. */
+    try {
+        var t = localStorage.getItem('oneplay_music_theme') || 'light';
+        var dark = t === 'dark' || (t === 'auto' && matchMedia('(prefers-color-scheme:dark)').matches);
+        if (dark) {
+            document.documentElement.dataset.theme = 'dark';
+            var m = document.querySelector('meta[name="theme-color"]');
+            if (m) m.content = '#1a1a1c';
+            var cs = document.querySelector('meta[name="color-scheme"]');
+            if (cs) cs.content = 'dark';
+        }
+    } catch(e) {}
+    </script>
+
+    <script type="module">
+        import { onBodyLoad } from './dist/index.js';
+        document.addEventListener('DOMContentLoaded', async () => {
+            await onBodyLoad();
+        });
+    </script>
+    <link rel="stylesheet" href="theme.css">
+    <link rel="stylesheet" href="index.css">
+</head>
+
+<body>
+    <div id="status">Loading...</div>
+    <div id="tree-container" hidden>
+        <div id="breadcrumbs"></div>
+        <div id="children"></div>
+    </div>
+    <div id="settings-container" hidden></div>
+    <audio id="player" hidden></audio>
+    <div id="footer"></div>
+    <div id="action-bar"></div>
+    <button id="select-cancel">Cancel</button>
+    <div id="log-panel"></div>
+</body>
+
+</html>

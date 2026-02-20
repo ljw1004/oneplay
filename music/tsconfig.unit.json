@@ -1,0 +1,33 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist-test",
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": [
+    "src/favorites.ts",
+    "src/logger.ts",
+    "src/indexer.ts",
+    "src/auth.ts",
+    "src/db.ts",
+    "src/tracks.ts",
+    "src/downloads.ts",
+    "src/playback-engine.ts",
+    "src/playback.ts",
+    "src/tree.ts",
+    "src/select.ts",
+    "src/search.ts",
+    "src/media-title.ts",
+    "src/path-names.ts",
+    "test/unit/favorites.test.ts",
+    "test/unit/tracks.test.ts",
+    "test/unit/downloads.test.ts",
+    "test/unit/auth.test.ts",
+    "test/unit/search.test.ts",
+    "test/unit/indexer.test.ts",
+    "test/unit/playback-engine.test.ts",
+    "test/unit/media-title.test.ts",
+    "test/unit/path-names.test.ts"
+  ]
+}

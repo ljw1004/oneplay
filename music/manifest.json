@@ -1,0 +1,22 @@
+{
+  "name": "OnePlay Music",
+  "short_name": "OnePlay Music",
+  "description": "Play your OneDrive music",
+  "start_url": ".",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#fffef9",
+  "theme_color": "#fffef9",
+  "icons": [
+    {
+      "src": "assets/appicon.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "assets/bigicon.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

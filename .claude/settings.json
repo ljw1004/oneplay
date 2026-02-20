@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod:*)",
+      "Bash(curl:*)",
+      "Bash(npm run build:*)"
+    ],
+    "additionalDirectories": [
+      "/Users/ljw/code/mymusic2/.claude"
+    ]
+  }
+}

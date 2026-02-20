@@ -1,0 +1,19 @@
+{
+  "name": "oneplay-music",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "serve": "serve -l 5500 -n ..",
+    "deploy": "bash -c 'set -e && N=$(( $(cat deploy-counter.txt) + 1 )) && npm run build && grep -q __DEPLOY_COUNTER__ dist/index.js || { echo \"ERROR: __DEPLOY_COUNTER__ not found in dist/index.js\"; exit 1; } && grep -q __DEPLOY_COUNTER__ sw.js || { echo \"ERROR: __DEPLOY_COUNTER__ not found in sw.js\"; exit 1; } && STAGE=$(mktemp -d) && trap \"rm -rf $STAGE\" EXIT && cp -R dist \"$STAGE/dist\" && cp -R assets \"$STAGE/assets\" && cp sw.js index.html manifest.json theme.css index.css \"$STAGE/\" && sed -i \"\" \"s/__DEPLOY_COUNTER__/$N/g\" \"$STAGE/dist/index.js\" && sed -i \"\" \"s/__DEPLOY_COUNTER__/$N/g\" \"$STAGE/sw.js\" && chmod -R a+rX \"$STAGE\" && rsync --recursive --times --compress --progress --delete --perms --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r --rsync-path=\"mkdir -p /mnt/disks/pod7disk/www/untome/oneplay/music && rsync\" \"$STAGE/\" lu@unto.me:/mnt/disks/pod7disk/www/untome/oneplay/music && echo $N > deploy-counter.txt'",
+    "test": "bash test/integration/run.sh",
+    "test:unit": "rm -rf dist-test && tsc -p tsconfig.unit.json && node --test dist-test/test/unit/*.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "serve": "^14",
+    "typescript": "^5.7"
+  }
+}

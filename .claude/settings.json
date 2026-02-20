@@ -6,7 +6,7 @@
       "Bash(npm run build:*)"
     ],
     "additionalDirectories": [
-      "/Users/ljw/code/mymusic2/.claude"
+      "/Users/ljw/code/oneplay/.claude"
     ]
   }
 }

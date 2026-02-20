@@ -9,7 +9,7 @@ Features:
 - Shows and plays your OneDrive music, in your directory structure
 - Supports favorites (playlists). You can make them available offline
 - Friends can share their OneDrive music collections with you
+- Search your tracks, folders, favorites
 - Dark mode, and iPod-style scrollwheel!
 
-![screenshot1](music/assets/screenshot1.png) ![screenshot2](music/assets/screenshot2.png)
-
+![scrollwheel](music/assets/screenshot-scrollwheel.png) &nbsp;&nbsp; ![offline](music/assets/screenshot-offline.png) &nbsp;&nbsp; ![search](music/assets/screenshot-search.png) &nbsp;&nbsp; ![settings](music/assets/screenshot-settings.png) &nbsp;&nbsp; ![dark mode](music/assets/screenshot-dark.png)

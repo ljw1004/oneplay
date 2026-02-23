@@ -5,7 +5,7 @@
  *   npm test                          runs all tests
  *   npm test -- "settings"            runs tests matching "settings"
  *
- * Uses the shared Chromium profile at /tmp/oneplay-music-profile so the user's
+ * Uses the shared Chromium profile at /tmp/oneplay-profile so the user's
  * sign-in session is available. Tests run against http://localhost:5500/music/.
  *
  * INVARIANT: Each test function receives a fresh page (same browser context).
@@ -18,7 +18,7 @@ const os = require("os");
 const path = require("path");
 
 const URL = process.env.ONEPLAY_MUSIC_TEST_URL || "http://localhost:5500/music/";
-const PROFILE = "/tmp/oneplay-music-profile";
+const PROFILE = "/tmp/oneplay-profile";
 const TREE_NOT_VISIBLE_ERROR = "Tree not visible after 15s — is the user signed in?";
 
 /** Parse --log <file> from argv. If present, all output is tee'd to the file

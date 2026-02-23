@@ -10,7 +10,7 @@
  * - Startup terminal UI/deadline policy (owned by index-startup.ts).
  * - App composition/tree-playback-select wiring (owned by index.ts).
  */
-import type { Auth } from './auth.js';
+import type { Auth, EvidenceState } from './auth.js';
 import { dbGet, dbPut, dbDelete, dbClear } from './db.js';
 import { log, logError, logCatch, errorMessage, errorDetail } from './logger.js';
 import {
@@ -87,7 +87,7 @@ export interface IndexSyncController {
     updateSettingsIndexSection(): void;
     cancelScheduledPull(): void;
     requestPullFromOneDrive(source: PullSource): Promise<void>;
-    requestStartupPullIfOnline(): Promise<void>;
+    requestStartupPullIfEvidenceAllows(): Promise<void>;
     onShareAdded(record: ShareRecordPersisted): void;
     onShareRemoved(record: ShareRecordPersisted): Promise<void>;
 }
@@ -109,7 +109,11 @@ function deniedReasonFromStatus(status: number): string {
     return `Share unavailable (${status})`;
 }
 
-function shouldAutoRedirect(wasInitialStartup: boolean, tokensExpired: boolean): boolean {
+function shouldAutoRedirect(
+    wasInitialStartup: boolean,
+    tokensExpired: boolean,
+    evidence: EvidenceState,
+): boolean {
     if (!wasInitialStartup) { log('auto-redirect: blocked by wasInitialStartup'); return false; }
     const lineageRaw = localStorage.getItem('oneplay_music_auth_lineage_time');
     if (!lineageRaw) { log('auto-redirect: blocked by missing lineage time'); return false; }
@@ -122,7 +126,7 @@ function shouldAutoRedirect(wasInitialStartup: boolean, tokensExpired: boolean):
             return false;
         }
     }
-    if (!navigator.onLine) { log('auto-redirect: blocked by navigator.onLine=false'); return false; }
+    if (evidence === 'evidence:not-online') { log('auto-redirect: blocked by evidence:not-online'); return false; }
     const attemptRaw = localStorage.getItem('oneplay_music_redirect_attempt');
     if (attemptRaw) {
         const attemptTime = parseInt(attemptRaw, 10);
@@ -392,7 +396,8 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         if (freshInfo === 'auth') {
             logError('failed to fetch account info (auth)');
             deps.auth.transition('evidence:signed-out');
-            if (shouldAutoRedirect(wasInitialStartup, true)) {
+            const evidence = deps.auth.reconcileEvidenceFromNavigator('index-sync:auto-redirect:tokens-expired');
+            if (shouldAutoRedirect(wasInitialStartup, true, evidence)) {
                 log('auto-redirect: redirecting (tokens expired)');
                 await deps.auth.attemptSilentRedirect();
                 return undefined;
@@ -623,7 +628,8 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         if (!freshInfo) return;
         writeFreshAccountInfoIntoStateAndSetSignedIn(freshInfo);
 
-        if (shouldAutoRedirect(wasInitialStartup, false)) {
+        const evidence = deps.auth.reconcileEvidenceFromNavigator('index-sync:auto-redirect:token-refresh');
+        if (shouldAutoRedirect(wasInitialStartup, false, evidence)) {
             log('auto-redirect: redirecting (token refresh)');
             await deps.auth.attemptSilentRedirect();
             return;
@@ -716,10 +722,10 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         return pullInFlightPromise;
     };
 
-    const requestStartupPullIfOnline = async (): Promise<void> => {
-        if (!navigator.onLine) {
-            deps.auth.transition('evidence:not-online');
-            log('skipping pull: navigator.onLine is false');
+    const requestStartupPullIfEvidenceAllows = async (): Promise<void> => {
+        const evidence = deps.auth.reconcileEvidenceFromNavigator('index-sync:startup-pull-gate', { logUnchanged: true });
+        if (evidence === 'evidence:not-online') {
+            log('skipping pull: evidence is not-online');
             return;
         }
         await requestPullFromOneDrive('startup');
@@ -760,7 +766,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         updateSettingsIndexSection,
         cancelScheduledPull,
         requestPullFromOneDrive,
-        requestStartupPullIfOnline,
+        requestStartupPullIfEvidenceAllows,
         onShareAdded,
         onShareRemoved,
     };

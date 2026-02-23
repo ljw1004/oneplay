@@ -94,6 +94,17 @@ export interface Auth {
      *  on actual transitions. Called by the wrapper and by external callers
      *  (online/offline events, debug button). */
     transition(newState: EvidenceState): void;
+    /** Reconciles evidence against navigator.onLine.
+     *  Uses navigator.onLine only as a reliable negative signal. */
+    reconcileEvidenceFromNavigator(
+        reason: string,
+        options?: { logUnchanged?: boolean; suppressLog?: boolean },
+    ): EvidenceState;
+    /** Classifies evidence from an HTTP status and transitions auth evidence. */
+    provideEvidenceFromHttpStatus(status: number, reason: string): EvidenceState;
+    /** Classifies evidence from an operational error and transitions auth evidence
+     *  for network/timeout-style failures. */
+    provideEvidenceFromError(error: unknown, reason: string): EvidenceState;
     /** True if we have a plausible access token in localStorage.
      *  INVARIANT: signOut() writes sentinels starting with "null:" (e.g. "null: logged out ...").
      *  Failed 4xx refresh also sentinels (e.g. "null: 401 failed to refresh - ...").
@@ -435,8 +446,18 @@ export function createAuth(): Auth {
     const auth: Auth = {
         async fetch(url, retryOn429, options) {
             try {
+                const onlineBeforeFetch = navigator.onLine;
+                const evidenceBeforeFetch = auth.reconcileEvidenceFromNavigator(
+                    `authFetch:init:${url}`,
+                    onlineBeforeFetch ? { suppressLog: true } : { logUnchanged: true },
+                );
+                if (evidenceBeforeFetch === 'evidence:not-online') {
+                    const offlineResponse = errorResponse(url, 'navigator.onLine=false before fetch');
+                    auth.provideEvidenceFromHttpStatus(offlineResponse.status, `authFetch:skip-offline:${url}`);
+                    return offlineResponse;
+                }
                 const r = await rawAuthFetch(url, retryOn429, options);
-                auth.transition(classifyEvidence(r.status, isSignedIn(), navigator.onLine));
+                auth.provideEvidenceFromHttpStatus(r.status, `authFetch:${url}`);
                 return r;
             } catch (e) {
                 if (isAbortError(e)) throw e;
@@ -451,6 +472,47 @@ export function createAuth(): Auth {
             if (newState === prev) return;
             evidence = newState;
             auth.onEvidenceChange(newState, prev);
+        },
+
+        reconcileEvidenceFromNavigator(reason, options) {
+            const online = navigator.onLine;
+            const next = online
+                ? (evidence === 'evidence:not-online' ? 'no-evidence' : evidence)
+                : 'evidence:not-online';
+            if (next !== evidence) {
+                if (options?.suppressLog !== true) {
+                    log(`evidence: navigator reconcile reason=${reason} online=${online} -> ${next}`);
+                }
+                auth.transition(next);
+            } else if (options?.logUnchanged === true && options?.suppressLog !== true) {
+                log(`evidence: navigator reconcile reason=${reason} online=${online} -> ${next} (unchanged)`);
+            }
+            return auth.getEvidence();
+        },
+
+        provideEvidenceFromHttpStatus(status, reason) {
+            const prev = evidence;
+            const state = classifyEvidence(status, isSignedIn(), navigator.onLine);
+            auth.transition(state);
+            if (state !== prev) {
+                log(`evidence: status classify reason=${reason} status=${status} -> ${state}`);
+            }
+            return state;
+        },
+
+        provideEvidenceFromError(error, reason) {
+            const message = error instanceof Error ? error.message : String(error);
+            const lower = message.toLowerCase();
+            const isNetworkLike = lower.includes('timeout')
+                || lower.includes('network')
+                || lower.includes('fetch')
+                || lower.includes('failed to fetch')
+                || lower.includes('abort');
+            if (!isNetworkLike) return auth.getEvidence();
+            const state: EvidenceState = navigator.onLine ? 'no-evidence' : 'evidence:not-online';
+            auth.transition(state);
+            log(`evidence: error classify reason=${reason} -> ${state}`);
+            return state;
         },
 
         isSignedIn,

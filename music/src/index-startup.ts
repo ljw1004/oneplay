@@ -17,6 +17,7 @@ export type StartupTerminalState = 'tree' | 'sign-in' | 'error' | 'deadline';
 
 export interface IndexStartupDeps {
     readonly swDebug: boolean;
+    readonly appVersionLabel: string;
     readonly startupDeadlineMsDefault: number;
     readonly startupDeadlineWithOauthCodeMs: number;
     readonly startupErrorMessage: string;
@@ -158,8 +159,7 @@ export function createIndexStartup(deps: IndexStartupDeps): IndexStartupControll
     };
 
     const onBodyLoad = async (startupInner: () => Promise<void>): Promise<void> => {
-        log('');
-        log('===============================================================');
+        log(`====== APP LAUNCH v${deps.appVersionLabel} ========`);
         startupTerminated = false;
         startupDeadlineGuardActive = true;
         startupDeadlineBypassedForFirstTimeIndexing = false;

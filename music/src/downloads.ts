@@ -10,7 +10,7 @@
  * - evidence: owned by the auth module. Downloads reads it via deps.getEvidence()
  *   and reacts via handleEvidenceTransition(). Downloads only pump when
  *   evidence is 'evidence:signed-in'. Error classification in download workers
- *   calls deps.transitionEvidence() to push state changes back to auth.
+ *   delegates evidence interpretation to auth-owned deps helpers.
  * - activeKeys/retainKeys: pushed by caller. activeKeys determines the
  *   download queue; retainKeys determines GC retention.
  * - queue: ordered list of {driveId, itemId} to download.
@@ -29,7 +29,7 @@
 import {
     audioGet, audioPut, audioDelete, audioKeys, audioTotalBytes, audioClear,
 } from './db.js';
-import { type EvidenceState, type AuthFetch, classifyEvidence } from './auth.js';
+import { type EvidenceState, type AuthFetch } from './auth.js';
 import { log, logError, errorMessage, errorDetail } from './logger.js';
 
 // ---------------------------------------------------------------------------
@@ -40,6 +40,20 @@ const MAX_CONCURRENT = 2;
 const DEFAULT_QUOTA_BYTES = 1 * 1024 * 1024 * 1024; // 1 GB
 export const QUOTA_OPTIONS_GB = [1, 2, 5, 10];
 const QUOTA_LS_KEY = 'oneplay_music_quota_bytes';
+
+/** Shared offline-badge classifier used by tree + modal rendering.
+ *  Incomplete favorites are "paused" whenever they are blocked for any reason. */
+export function classifyOfflineBadgeState(
+    hasMissingTracks: boolean,
+    evidence: EvidenceState,
+    pausedByUser: boolean,
+    overQuota: boolean,
+    hasError: boolean,
+): 'complete' | 'downloading' | 'paused' {
+    if (!hasMissingTracks) return 'complete';
+    if (pausedByUser || overQuota || hasError || evidence !== 'evidence:signed-in') return 'paused';
+    return 'downloading';
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -67,7 +81,7 @@ export interface Downloads {
      * Pushes the set of track keys that should be downloaded (activeKeys)
      * and the set that should be retained in storage (retainKeys).
      * INVARIANT: activeKeys ⊆ retainKeys.
-     * Triggers queue recalculation if signed in.
+     * Triggers queue recalculation immediately (pump remains evidence-gated).
      */
     setPinnedKeys(activeKeys: ReadonlySet<string>, retainKeys: ReadonlySet<string>): void;
     /** Notifies the download engine that evidence changed externally.
@@ -99,14 +113,12 @@ export interface DownloadsDeps {
     audioClear: typeof audioClear;
     loadQuotaBytes(): number;
     saveQuotaBytes(bytes: number): void;
-    /** Returns navigator.onLine (reliable negative signal: false = definitely offline). */
-    isOnline(): boolean;
     /** Returns the current evidence state (owned by auth module). */
     getEvidence(): EvidenceState;
-    /** Transitions evidence state (owned by auth module). */
-    transitionEvidence(state: EvidenceState): void;
-    /** Returns whether the user has a plausible access token. */
-    isSignedIn(): boolean;
+    /** Delegates HTTP status evidence classification to auth evidence owner. */
+    provideEvidenceFromHttpStatus(status: number, reason: string): EvidenceState;
+    /** Delegates error evidence classification to auth evidence owner. */
+    provideEvidenceFromError(error: unknown, reason: string): EvidenceState;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +135,6 @@ const defaultDeps = {
     saveQuotaBytes: (bytes: number) => {
         try { localStorage.setItem(QUOTA_LS_KEY, String(bytes)); } catch { /* quota */ }
     },
-    isOnline: () => navigator.onLine,
 } satisfies Partial<DownloadsDeps>;
 
 // ---------------------------------------------------------------------------
@@ -131,12 +142,14 @@ const defaultDeps = {
 // ---------------------------------------------------------------------------
 
 /**
- * Creates the download engine. Auth-related deps (authFetch, evidence, isSignedIn)
+ * Creates the download engine. Auth-related deps (authFetch, evidence helpers)
  * must be provided; I/O deps default to production implementations.
  * The engine has no knowledge of favorites — it operates purely on track key
  * sets pushed in by the caller.
  */
-export function createDownloads(deps: Partial<DownloadsDeps> & Pick<DownloadsDeps, 'authFetch' | 'getEvidence' | 'transitionEvidence' | 'isSignedIn'>): Downloads {
+export function createDownloads(
+    deps: Partial<DownloadsDeps> & Pick<DownloadsDeps, 'authFetch' | 'getEvidence' | 'provideEvidenceFromHttpStatus' | 'provideEvidenceFromError'>,
+): Downloads {
     const d: DownloadsDeps = { ...defaultDeps, ...deps } as DownloadsDeps;
 
     // -- State ---------------------------------------------------------------
@@ -326,15 +339,15 @@ export function createDownloads(deps: Partial<DownloadsDeps> & Pick<DownloadsDep
                 if (signal?.aborted || myGeneration !== generation) return;
                 const msg = errorMessage(e);
                 if (msg.includes('timeout') || msg.includes('abort')) {
-                    const target = d.isOnline() ? 'no-evidence' : 'evidence:not-online';
                     lastError = msg;
-                    d.transitionEvidence(target);
+                    const target = d.provideEvidenceFromError(e, `downloads:timeout-or-abort:${key}`);
+                    log(`downloads: evidence from error reason=timeout-or-abort key=${key} -> ${target}`);
                     logError(`download: connectivity lost (${errorDetail(e)}) → ${target}`);
                 } else if (msg.includes('fetch') || msg.includes('network') || msg.includes('Failed to fetch')) {
-                    // Transient network error: consult navigator.onLine for state
-                    const target = d.isOnline() ? 'no-evidence' : 'evidence:not-online';
+                    // Transient network error: evidence owner maps to no-evidence/not-online.
                     queue.push(item);
-                    d.transitionEvidence(target);
+                    const target = d.provideEvidenceFromError(e, `downloads:transient-network:${key}`);
+                    log(`downloads: evidence from error reason=transient-network key=${key} -> ${target}`);
                     logError(`download: transient network error for ${key}: ${errorDetail(e)} → ${target}`);
                 } else {
                     lastError = msg;
@@ -364,8 +377,9 @@ export function createDownloads(deps: Partial<DownloadsDeps> & Pick<DownloadsDep
     }
 
     /** Classifies an HTTP error status and takes action on the queue item.
-     * For auth-wrapped fetches (metadata), evidence is already classified by
-     * auth.fetch. For plain fetches (SAS-token audio), uses classifyEvidence.
+     * For auth-wrapped fetches (metadata), auth.fetch already reconciles evidence.
+     * For plain fetches (SAS-token audio), evidence classification is delegated
+     * to auth via deps.provideEvidenceFromHttpStatus.
      * Queue management: 404 → remove, 429/5xx → retry, timeout → pause. */
     function classifyHttpError(status: number, item: QueueItem): void {
         if (status === 429 || status === 500 || status === 502 || status === 503) {
@@ -375,12 +389,20 @@ export function createDownloads(deps: Partial<DownloadsDeps> & Pick<DownloadsDep
         } else if (status === 408 || status === 504) {
             // Timeout: classify evidence via the shared utility
             lastError = `HTTP ${status}`;
-            d.transitionEvidence(classifyEvidence(status, d.isSignedIn(), d.isOnline()));
+            const prevEvidence = d.getEvidence();
+            const target = d.provideEvidenceFromHttpStatus(status, `downloads:http:${status}`);
+            if (target !== prevEvidence) {
+                log(`downloads: evidence from status status=${status} -> ${target}`);
+            }
             logError(`download: ${status}, pausing downloads`);
         } else if (status === 401) {
             // Auth failure
             lastError = 'Authentication failed';
-            d.transitionEvidence('evidence:signed-out');
+            const prevEvidence = d.getEvidence();
+            const target = d.provideEvidenceFromHttpStatus(status, `downloads:http:${status}`);
+            if (target !== prevEvidence) {
+                log(`downloads: evidence from status status=${status} -> ${target}`);
+            }
             logError(`download: 401, signed out`);
         } else {
             // Other (including 404): remove from queue
@@ -416,15 +438,11 @@ export function createDownloads(deps: Partial<DownloadsDeps> & Pick<DownloadsDep
             activeKeys = new Set(newActiveKeys); // defensive copy
             retainKeys = enforced;
             dirty = true;
-
-            if (d.getEvidence() === 'evidence:signed-in') {
-                recalculate();
-            }
+            recalculate();
         },
 
         handleEvidenceTransition() {
             const newState = d.getEvidence();
-            log(`downloads: evidence → ${newState}`);
 
             if (newState === 'evidence:signed-in' && dirty) {
                 recalculate();  // recalculate calls notifyUI internally

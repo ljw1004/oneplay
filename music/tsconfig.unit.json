@@ -28,6 +28,7 @@
     "test/unit/indexer.test.ts",
     "test/unit/playback-engine.test.ts",
     "test/unit/media-title.test.ts",
-    "test/unit/path-names.test.ts"
+    "test/unit/path-names.test.ts",
+    "test/unit/sw-shell.test.ts"
   ]
 }

@@ -77,7 +77,7 @@ The agent is responsible for fully validating every change, end-to-end, autonomo
 
 - Build/test/deploy commands live in the dedicated `Testing` and `Build and deploy` sections below. Keep those sections as the source of truth for command usage.
 - Localhost development will require OneDrive registration to accept localhost as a PKCE redirect. We'll have to remove localhost before deployment.
-- Localhost testing is done with a shared Chromium profile at `/tmp/oneplay-music-profile` - that way the human can open it once to sign in `"/Users/ljw/Library/Caches/ms-playwright/chromium-1208/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing" --user-data-dir=/tmp/oneplay-music-profile http://localhost:5500/music/`, then quit Chrome, and after that the AI can benefit from signin for the next 24 hours using the same shared profile. Run `npm run serve` from `music/` (`cd /Users/ljw/code/mymusic2/music`); it serves repo root so music is at `/music/` and video can live at `/video/`. The same single profile also works for https://unto.me/oneplay/music/, but the human must sign in separately on each origin (localStorage tokens are per-origin). The agent will reuse this profile for all its headless tasks.
+- Localhost testing is done with a shared Chromium profile at `/tmp/oneplay-profile` - that way the human can open it once to sign in `"/Users/ljw/Library/Caches/ms-playwright/chromium-1208/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing" --user-data-dir=/tmp/oneplay-profile http://localhost:5500/music/`, then quit Chrome, and after that the AI can benefit from signin for the next 24 hours using the same shared profile for both music and video. Run `npm run serve` from `music/` (`cd /Users/ljw/code/mymusic2/music`); it serves repo root so music is at `/music/` and video can live at `/video/`. The same single profile also works for https://unto.me/oneplay/music/ and https://unto.me/oneplay/video/, but the human must sign in separately on each origin (localStorage tokens are per-origin). The agent will reuse this profile for all its headless tasks.
 - Important: Entra `prompt=none` silent re-auth is not reliable on localhost redirect URIs (Microsoft may show an interactive confirmation interstitial, which `prompt=none` turns into `interaction_required`). This means localhost integration tests will periodically need the human to re-auth in the shared profile when tokens expire (roughly daily).
 
 ## Testing
@@ -89,7 +89,7 @@ Two test layers:
   engines tested via `onStateChange` callbacks, not arbitrary delays.
 - **Integration tests** (`music/test/integration/tree.test.cjs`): Playwright against
   `http://localhost:5500/music/`. Use the shared Chromium profile at
-  `/tmp/oneplay-music-profile` for persistent OneDrive auth. Tests verify DOM state
+  `/tmp/oneplay-profile` for persistent OneDrive auth. Tests verify DOM state
   (classes, element counts, bounding boxes), not simulated touch behavior.
 
 Run from `music/` with `npm test` (integration) or `npm run test:unit` (unit). Integration tests log their progress to `/tmp/oneplay-music-test.log`. The design is that each integration test should take <0.5s, and the entire run should take <15s.

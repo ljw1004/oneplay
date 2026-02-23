@@ -100,3 +100,4 @@ Keep architecture constraints unchanged: all IndexedDB startup reads remain pre-
 3. Generic startup error + reload is preferred over detailed user-facing diagnostics.
 4. Logs are the primary diagnostic artifact across launches (`mymusic_logs`).
 5. No startup reordering is performed.
+6. iOS PWA resume-time airplane-mode connectivity nag is accepted platform behavior and out of scope; this plan targets cold-launch startup correctness.

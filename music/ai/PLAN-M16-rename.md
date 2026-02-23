@@ -57,7 +57,7 @@ There is **no cross-app data sharing** at all.
    - IndexedDB DB: `oneplay-music-cache`
    - SW cache: `oneplay-music-${CACHE_VERSION}`
    - Logs key: `oneplay_music_logs`
-   - Integration profile/log files: `/tmp/oneplay-music-profile`, `/tmp/oneplay-music-test.log`
+   - Integration profile/log files: `/tmp/oneplay-profile`, `/tmp/oneplay-music-test.log`
 4. Deploy target path changes from `/untome/mymusic` to `/untome/oneplay/music`.
 
 ## Phase A: OnePlay Music Identity + Runtime Cutover (Current Layout)

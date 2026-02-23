@@ -30,7 +30,7 @@ import { type Favorites, type RootsMap, type PlaylistMember, type ItemRef } from
 import { type TreeView } from './tree.js';
 import { walkFolder } from './indexer.js';
 import { log, logError } from './logger.js';
-import { type Downloads, QUOTA_OPTIONS_GB } from './downloads.js';
+import { type Downloads, QUOTA_OPTIONS_GB, classifyOfflineBadgeState } from './downloads.js';
 import { collectPhysicalTracks } from './tracks.js';
 import { isWalkableRoot } from './roots.js';
 import { buildMembersFromSelection as buildMembersFromSelectionFromState } from './select-dialogs.js';
@@ -756,10 +756,14 @@ export function createSelect(
             badgeEl.className = '';
             badgeEl.textContent = '';
         } else {
-            const hasQueued = Array.from(trackKeys).some(k => !snap.downloadedKeys.has(k));
-            const iconState = (hasQueued && (fav.offlinePin.paused || snap.overQuota || snap.lastError)) ? 'paused'
-                : (snap.evidence === 'evidence:signed-in' && hasQueued) ? 'downloading'
-                : 'complete';
+            const hasMissingTracks = Array.from(trackKeys).some(k => !snap.downloadedKeys.has(k));
+            const iconState = classifyOfflineBadgeState(
+                hasMissingTracks,
+                snap.evidence,
+                fav.offlinePin.paused,
+                snap.overQuota,
+                !!snap.lastError,
+            );
             badgeEl.className = 'offline-badge'
                 + (iconState === 'downloading' ? ' downloading' : '')
                 + (iconState === 'paused' ? ' paused' : '');
@@ -767,10 +771,17 @@ export function createSelect(
         }
 
         // Stats line: "28 tracks" | "Downloading 3/28 tracks ⏸︎" | "Paused 3/28 tracks ▶︎" | "28 tracks, 43 Mb ✓"
-        const incomplete = fav.offlinePin && downloadedCount < totalTracks;
+        const hasMissingTracks = downloadedCount < totalTracks;
+        const incomplete = !!fav.offlinePin && hasMissingTracks;
         const trackLabel = `${totalTracks} track${totalTracks !== 1 ? 's' : ''}`;
-        const isDownloading = incomplete && !fav.offlinePin!.paused && !snap.overQuota
-            && !snap.lastError && snap.evidence === 'evidence:signed-in';
+        const iconState = classifyOfflineBadgeState(
+            hasMissingTracks,
+            snap.evidence,
+            fav.offlinePin?.paused ?? false,
+            snap.overQuota,
+            !!snap.lastError,
+        );
+        const isDownloading = iconState === 'downloading';
 
         statsEl.textContent = '';
         if (!fav.offlinePin) {

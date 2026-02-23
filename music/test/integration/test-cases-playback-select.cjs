@@ -802,6 +802,63 @@ module.exports = {
         await page.waitForSelector(".modal-backdrop", { state: "hidden", timeout: 3000 });
     },
 
+    /** In evidence:not-online with missing tracks, offline modal shows paused badge + Not online warning. */
+    async "select: offline modal shows paused badge when not online"(page) {
+        if (!await ensureFavoritesExist(page)) return;
+        const favRow = page.locator("#children .tree-row", {
+            has: page.locator(".fav-icon"),
+        }).first();
+        if (await favRow.count() === 0) return;
+
+        await page.evaluate(async () => {
+            await window._testDownloads?.clear();
+            window._testAuth?.transition("evidence:not-online");
+        });
+
+        const openOfflineModal = async () => {
+            await favRow.click({ button: "right" });
+            await waitForSelectMode(page, true);
+            await page.locator("#action-bar .right-btn").click();
+            await waitForActionDropdown(page);
+            await page.locator(".action-dropdown button", {
+                hasText: /Available offline|Make available offline/i,
+            }).first().click();
+            await waitForSelectMode(page, false);
+            await page.waitForSelector(".modal-backdrop", { state: "visible", timeout: 3000 });
+        };
+
+        await openOfflineModal();
+        const actionLabel = (await page.locator(".modal .modal-cancel").first().textContent() || "").trim();
+        if (/make available offline/i.test(actionLabel)) {
+            await page.locator(".modal .modal-cancel").first().click();
+            await page.waitForSelector(".modal-backdrop", { state: "hidden", timeout: 3000 });
+            await openOfflineModal();
+        }
+
+        await page.waitForFunction(() => {
+            const warning = document.querySelector(".offline-warning");
+            return warning && /Not online/i.test(warning.textContent || "");
+        }, undefined, { timeout: 3000 });
+
+        const state = await page.evaluate(() => {
+            const badge = document.querySelector(".offline-badge");
+            const warning = document.querySelector(".offline-warning")?.textContent?.trim() || "";
+            const progress = document.querySelector(".offline-progress")?.textContent?.trim() || "";
+            const badgeClass = badge?.className || "";
+            return { badgeClass, warning, progress };
+        });
+
+        assert(state.badgeClass.includes("paused"),
+            `Expected paused badge class, got "${state.badgeClass}"`);
+        assert(!state.badgeClass.includes("downloading"),
+            `Did not expect downloading badge class, got "${state.badgeClass}"`);
+        assert(/Not online/i.test(state.warning), `Expected "Not online" warning, got "${state.warning}"`);
+        assert(/Paused/i.test(state.progress), `Expected paused progress line, got "${state.progress}"`);
+
+        await page.locator(".modal .modal-close").first().click();
+        await page.waitForSelector(".modal-backdrop", { state: "hidden", timeout: 3000 });
+    },
+
     /** Create playlist modal disables Create until name is non-empty and unique. */
     async "select: create playlist name validation disables Create"(page) {
         if (!await ensureFavoritesExist(page)) return;

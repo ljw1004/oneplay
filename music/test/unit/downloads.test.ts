@@ -24,8 +24,8 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { createDownloads, type Downloads, type DownloadsDeps } from '../../src/downloads.js';
-import { type EvidenceState } from '../../src/auth.js';
+import { createDownloads, classifyOfflineBadgeState, type Downloads, type DownloadsDeps } from '../../src/downloads.js';
+import { classifyEvidence, type EvidenceState } from '../../src/auth.js';
 
 // ---------------------------------------------------------------------------
 // DI stubs: in-memory audio store + mock fetch + evidence state
@@ -36,6 +36,8 @@ function makeStubDeps(): {
     audioStore: Map<string, Blob>;
     fetchLog: Array<{ url: string }>;
     setOnline: (value: boolean) => void;
+    provideEvidenceFromStatusCallCount: () => number;
+    provideEvidenceFromErrorCallCount: () => number;
     /** Sets evidence state in the stub and notifies the engine. Must be called
      *  after createDownloads() so `dl` is set. */
     setEvidence: (state: EvidenceState) => void;
@@ -47,6 +49,8 @@ function makeStubDeps(): {
     let quotaBytes = 10 * 1024 * 1024 * 1024; // 10 GB (generous for tests)
     let online = true;
     let evidence: EvidenceState = 'no-evidence';
+    let provideEvidenceFromStatusCalls = 0;
+    let provideEvidenceFromErrorCalls = 0;
     let dlRef: Downloads | undefined;
 
     const deps: DownloadsDeps = {
@@ -78,10 +82,20 @@ function makeStubDeps(): {
         async audioClear() { audioStore.clear(); },
         loadQuotaBytes() { return quotaBytes; },
         saveQuotaBytes(bytes) { quotaBytes = bytes; },
-        isOnline() { return online; },
         getEvidence() { return evidence; },
-        transitionEvidence(state) { evidence = state; },
-        isSignedIn() { return true; },
+        provideEvidenceFromHttpStatus(status) {
+            provideEvidenceFromStatusCalls++;
+            evidence = classifyEvidence(status, evidence !== 'evidence:signed-out', online);
+            return evidence;
+        },
+        provideEvidenceFromError(error) {
+            provideEvidenceFromErrorCalls++;
+            const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+            if (msg.includes('timeout') || msg.includes('network') || msg.includes('fetch') || msg.includes('abort')) {
+                evidence = online ? 'no-evidence' : 'evidence:not-online';
+            }
+            return evidence;
+        },
     };
 
     const setOnline = (value: boolean): void => { online = value; };
@@ -98,7 +112,16 @@ function makeStubDeps(): {
 
     // Patch: after createDownloads, caller must set dlRef so setEvidence works.
     // We return a setter via a closure trick below.
-    const result = { deps, audioStore, fetchLog, setOnline, setEvidence, getEvidence };
+    const result = {
+        deps,
+        audioStore,
+        fetchLog,
+        setOnline,
+        setEvidence,
+        getEvidence,
+        provideEvidenceFromStatusCallCount: () => provideEvidenceFromStatusCalls,
+        provideEvidenceFromErrorCallCount: () => provideEvidenceFromErrorCalls,
+    };
 
     // Hook: createDownloads wrapper that sets dlRef automatically
     const origSetEvidence = setEvidence;
@@ -232,6 +255,17 @@ describe('queue calculation', () => {
         await waitForState(dl, () => true); // first onStateChange = recalculation done
         assert.equal(stubs.fetchLog.length, 0);
     });
+
+    it('setPinnedKeys hydrates cached downloadedKeys while evidence is not-online', async () => {
+        const stubs = makeStubDeps();
+        stubs.audioStore.set(`${DRIVE}:f1`, new Blob(['data']));
+        const dl = createTestDownloads(stubs);
+        stubs.setEvidence('evidence:not-online');
+        dl.setPinnedKeys(keySet('f1'), keySet('f1'));
+        await waitForState(dl, () => dl.getSnapshot().downloadedKeys.size === 1);
+        assert.equal(dl.getSnapshot().downloadedKeys.size, 1);
+        assert.equal(stubs.fetchLog.length, 0, 'must not start network fetch while not-online');
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -317,11 +351,26 @@ describe('error classification', () => {
         const dl = createTestDownloads(stubs);
         dl.setPinnedKeys(keySet('f1'), keySet('f1'));
         stubs.setEvidence('evidence:signed-in');
-        // 504 transitions evidence to no-evidence via deps.transitionEvidence;
-        // wait for the snapshot to reflect it
+        // 504 transitions evidence via the delegated auth evidence helper.
         await waitForState(dl, () => stubs.getEvidence() === 'no-evidence');
         assert.equal(stubs.getEvidence(), 'no-evidence');
+        assert.equal(stubs.provideEvidenceFromStatusCallCount(), 1);
         assert.ok(dl.getSnapshot().lastError, 'lastError should be set');
+    });
+
+    it('network exception delegates evidence mapping to auth helper', async () => {
+        const stubs = makeStubDeps();
+        stubs.setOnline(false);
+        stubs.deps.authFetch = () => Promise.resolve(new Response(
+            JSON.stringify({ '@microsoft.graph.downloadUrl': 'https://cdn/test' }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ));
+        stubs.deps.fetcher = () => Promise.reject(new TypeError('Failed to fetch'));
+        const dl = createTestDownloads(stubs);
+        dl.setPinnedKeys(keySet('f1'), keySet('f1'));
+        stubs.setEvidence('evidence:signed-in');
+        await waitForState(dl, () => stubs.getEvidence() === 'evidence:not-online');
+        assert.equal(stubs.provideEvidenceFromErrorCallCount(), 1);
     });
 
     it('aborted worker fetch during recalculate does not latch error or change evidence', async () => {
@@ -450,8 +499,31 @@ describe('evidence:not-online', () => {
         const dl = createTestDownloads(stubs);
         dl.setPinnedKeys(keySet('f1'), keySet('f1'));
         stubs.setEvidence('evidence:signed-in');
-        // 504 + !isOnline → evidence:not-online (via deps.transitionEvidence)
+        // 504 + offline -> evidence:not-online via delegated status mapping.
         await waitForState(dl, () => stubs.getEvidence() === 'evidence:not-online');
         assert.equal(stubs.getEvidence(), 'evidence:not-online');
+    });
+});
+
+describe('offline badge classifier', () => {
+    it('missing + not-online returns paused', () => {
+        assert.equal(
+            classifyOfflineBadgeState(true, 'evidence:not-online', false, false, false),
+            'paused',
+        );
+    });
+
+    it('missing + signed-in + no blockers returns downloading', () => {
+        assert.equal(
+            classifyOfflineBadgeState(true, 'evidence:signed-in', false, false, false),
+            'downloading',
+        );
+    });
+
+    it('no missing tracks returns complete', () => {
+        assert.equal(
+            classifyOfflineBadgeState(false, 'evidence:not-online', false, true, true),
+            'complete',
+        );
     });
 });

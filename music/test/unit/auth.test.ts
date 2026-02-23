@@ -132,7 +132,7 @@ describe('auth cancellation semantics', () => {
         });
     });
 
-    it('timeoutMs returns synthetic non-ok response and classifies evidence', async () => {
+    it('known-offline at fetch initiation short-circuits network and classifies evidence', async () => {
         await withAuthTestEnv(false, async () => {
             (globalThis as Record<string, unknown>).fetch = (_url: string, init?: RequestInit) =>
                 new Promise<Response>((_resolve, reject) => {
@@ -147,7 +147,7 @@ describe('auth cancellation semantics', () => {
             const auth = createAuth();
             const r = await auth.fetch('https://graph.microsoft.com/v1.0/me', false, { timeoutMs: 5 });
             assert.equal(r.ok, false);
-            assert.equal(r.status, 504);
+            assert.equal(r.status, 503);
             assert.equal(auth.getEvidence(), 'evidence:not-online');
         });
     });

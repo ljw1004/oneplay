@@ -9,7 +9,7 @@ import { createTree, type TreeView } from './tree.js';
 import { createPlayback, type Playback, type PlaybackMode, isValidMode } from './playback.js';
 import { createFavorites, type Favorites } from './favorites.js';
 import { createSelect, type Select } from './select.js';
-import { createDownloads, type Downloads } from './downloads.js';
+import { createDownloads, type Downloads, classifyOfflineBadgeState } from './downloads.js';
 import { collectPhysicalTracks, resolveTrackIds } from './tracks.js';
 import {
     runSearchSingleWalk,
@@ -114,6 +114,7 @@ let restoredTime: number | undefined;
 let favoriteCustomizeToastShownInSession = false;
 let activeToastEl: HTMLElement | undefined;
 let activeToastTimer: ReturnType<typeof setTimeout> | undefined;
+let appResumeLogArmed = false;
 
 /** Shows a short-lived toast above the bottom controls. */
 function showToastMessage(message: string): void {
@@ -206,6 +207,7 @@ type SearchReason = 'open' | 'query-change' | 'show-tree' | 'share-roots' | 'off
 
 const startup = createIndexStartup({
     swDebug: SW_DEBUG,
+    appVersionLabel: DEPLOY_COUNTER,
     startupDeadlineMsDefault: STARTUP_DEADLINE_MS,
     startupDeadlineWithOauthCodeMs: STARTUP_DEADLINE_WITH_OAUTH_CODE_MS,
     startupErrorMessage: STARTUP_ERROR_MESSAGE,
@@ -621,12 +623,16 @@ function computeAndPushOfflineState(): void {
             pendingTrackCount += missing;
             pendingByFavorite.push(`${fav.name}(${missing})`);
         }
-        const hasQueued = missing > 0;
-        if (hasQueued && (fav.offlinePin.paused || snap.overQuota || snap.lastError)) {
-            icons.set(fav.id, 'paused');
-        } else {
-            icons.set(fav.id, snap.evidence === 'evidence:signed-in' && hasQueued ? 'downloading' : 'complete');
-        }
+        icons.set(
+            fav.id,
+            classifyOfflineBadgeState(
+                missing > 0,
+                snap.evidence,
+                fav.offlinePin.paused,
+                snap.overQuota,
+                !!snap.lastError,
+            ),
+        );
     }
     if (pendingByFavorite.length > 0) {
         if (!prevOfflineHadPending) {
@@ -761,8 +767,8 @@ function wireFavoritesUi(): void {
         downloads = createDownloads({
             authFetch: auth.fetch,
             getEvidence: () => auth.getEvidence(),
-            transitionEvidence: (s) => auth.transition(s),
-            isSignedIn: () => auth.isSignedIn(),
+            provideEvidenceFromHttpStatus: (status, reason) => auth.provideEvidenceFromHttpStatus(status, reason),
+            provideEvidenceFromError: (error, reason) => auth.provideEvidenceFromError(error, reason),
         });
         downloads.onStateChange = () => {
             computeAndPushOfflineState();
@@ -844,24 +850,44 @@ async function startupInner(): Promise<void> {
     } else {
         sync.setLastIndexUpdatedAt(undefined);
     }
+    auth.reconcileEvidenceFromNavigator('startup:init', { logUnchanged: true });
 
     // -- M11b: online/offline event listeners (wired early, before any pull) --
     window.addEventListener('offline', () => {
-        auth.transition('evidence:not-online');
+        auth.reconcileEvidenceFromNavigator('window:offline');
         sync.cancelScheduledPull();
     });
     window.addEventListener('online', () => {
-        auth.transition('no-evidence');
+        auth.reconcileEvidenceFromNavigator('window:online');
         sync.requestPullFromOneDrive('online').catch(logCatch('online pull'));
     });
     // Backstop: visibilitychange catches missed online events (PWA/iOS)
     document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible' && navigator.onLine
-            && auth.getEvidence() === 'evidence:not-online') {
-            auth.transition('no-evidence');
-            sync.requestPullFromOneDrive('online').catch(logCatch('visible pull'));
+        if (document.visibilityState === 'hidden') {
+            appResumeLogArmed = true;
+            return;
+        }
+        if (document.visibilityState === 'visible') {
+            if (appResumeLogArmed) {
+                log(`====== APP RESUME v${DEPLOY_COUNTER} ========`);
+                appResumeLogArmed = false;
+            }
+            const before = auth.getEvidence();
+            const after = auth.reconcileEvidenceFromNavigator('document:visibilitychange');
+            if (before === 'evidence:not-online' && after !== 'evidence:not-online') {
+                sync.requestPullFromOneDrive('online').catch(logCatch('visible pull'));
+            }
         }
     });
+    // If the app starts with stale evidence while hidden lifecycle events were missed,
+    // reconcile once more at first visible opportunity before any startup pull gate.
+    if (document.visibilityState === 'visible') {
+        const before = auth.getEvidence();
+        const after = auth.reconcileEvidenceFromNavigator('startup:visible');
+        if (before === 'evidence:not-online' && after !== 'evidence:not-online') {
+            sync.requestPullFromOneDrive('online').catch(logCatch('visible pull'));
+        }
+    }
     // Re-apply theme when OS preference changes (only matters when themePreference === 'auto')
     matchMedia('(prefers-color-scheme:dark)').addEventListener('change', () => applyTheme());
 
@@ -914,7 +940,7 @@ async function startupInner(): Promise<void> {
                 showTree(savedInfo, cached);
                 log('showing cached index (offline)');
                 restorePlaybackState();
-                await sync.requestStartupPullIfOnline();
+                await sync.requestStartupPullIfEvidenceAllows();
                 return;
             }
         }
@@ -931,15 +957,14 @@ async function startupInner(): Promise<void> {
         showTree(savedInfo!, cachedData);
         log(`showing cached: ${cachedData.count} tracks`);
         restorePlaybackState();
-    } else if (!navigator.onLine) {
-        auth.transition('evidence:not-online');
-        log('startup: signed-in with no cache while navigator.onLine is false');
+    } else if (auth.reconcileEvidenceFromNavigator('startup:signed-in-no-cache-check') === 'evidence:not-online') {
+        log('startup: signed-in with no cache while evidence is not-online');
         startup.markStartupTerminalState('error');
         startup.renderStartupErrorIntoStatusAndWireReload(STARTUP_ERROR_MESSAGE);
         return;
     }
 
-    await sync.requestStartupPullIfOnline();
+    await sync.requestStartupPullIfEvidenceAllows();
     if (!cachedData && !startup.isStartupTerminalUiRendered()) {
         log('startup: startup pull returned without terminal UI');
         startup.markStartupTerminalState('error');

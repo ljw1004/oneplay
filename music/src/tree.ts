@@ -83,6 +83,8 @@ export interface TreeView {
     getSelectedPath(): FolderPath;
     /** Set selected path programmatically (for future state restoration). */
     setSelectedPath(path: FolderPath): void;
+    /** Opens the track's logical parent and scrolls its row into view if needed. */
+    revealTrack(path: FolderPath): void;
     /** Update playback indicators (track SVG, folder highlighting, play glyph). */
     setPlaybackInfo(info: PlaybackInfo | undefined): void;
     /** Update select mode rendering state. Checkboxes appear on selectable rows
@@ -425,6 +427,15 @@ export function createTree(
             selectedPath = path.length >= 1 && path[0] === 'OnePlay Music' ? path : ['OnePlay Music'];
             render();
             view.onPathChange(selectedPath);
+        },
+        revealTrack(path) {
+            // A folder transition can temporarily unclip the list, disabling scrolling.
+            childrenEl.style.overflow = '';
+            const parent = path.slice(0, -1);
+            if (!pathEquals(parent, selectedPath)) view.setSelectedPath(parent);
+            view.closeSearchMode();
+            const key = CSS.escape(JSON.stringify(path));
+            childrenEl.querySelector(`[data-path="${key}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
         },
         setPlaybackInfo(info) {
             playbackInfo = info;

@@ -461,7 +461,9 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
         };
         playback.onChevronClick = () => {
             const info = playback!.getInfo();
-            if (info) tree!.setSelectedPath(info.track.slice(0, -1));
+            if (!info) return;
+            if (settings?.isOpen()) closeSettingsPage();
+            tree!.revealTrack(info.track);
         };
 
         // M10: persist view state on path or expanded changes

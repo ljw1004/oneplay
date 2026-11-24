@@ -62,6 +62,50 @@ module.exports = {
         assert(structure.indicator, "Footer should have indicator SVG");
     },
 
+    /** A reveal follows the current playlist entry and scrolls only when it is clipped. */
+    async "playback: footer chevron reveals the exact playlist row only as far as needed"(page) {
+        const fixture = await getFirstOneDriveTrackFixture(page);
+        const track = await page.evaluate(async ({ driveId, fileId, folderPath, fileName }) => {
+            const favs = window._testFavorites;
+            favs._testOnlySuppressSave(true);
+            const id = crypto.randomUUID();
+            const member = { driveId, itemId: fileId, path: [...folderPath, fileName], isFolder: false };
+            // Identical titles and physical IDs distinguish a logical reveal from a name or ID lookup.
+            await favs.add({ kind: "playlist", id, name: "Chevron test", hasPrivatePlayback: false,
+                members: Array(100).fill(member) });
+            const folder = ["OnePlay Music", "fav:" + id];
+            const track = [...folder, "m:79"];
+            window._testPlayback.restoreVisualState(folder, track, "all", false, 0, id);
+            return track;
+        }, fixture);
+        const chevron = page.locator(".footer-indicator");
+        const row = page.locator("#children .tree-row").nth(79);
+        const geometry = () => row.evaluate(el => {
+            const list = el.parentElement.getBoundingClientRect();
+            const bounds = el.getBoundingClientRect();
+            return { top: bounds.top - list.top, bottom: list.bottom - bounds.bottom };
+        });
+
+        await chevron.click();
+        assert(await row.getAttribute("data-path") === JSON.stringify(track), "Should open the logical playlist");
+        const fromRoot = await geometry();
+        assert(fromRoot.top >= 0 && Math.abs(fromRoot.bottom) <= 1, "Should reveal the song at the bottom edge");
+
+        // Clip the first few pixels of the current row, leaving most of it visible.
+        await row.evaluate(el => {
+            const list = el.parentElement;
+            list.scrollTop += el.getBoundingClientRect().top - list.getBoundingClientRect().top + 5;
+        });
+        await chevron.click();
+        const fromBelow = await geometry();
+        assert(Math.abs(fromBelow.top) <= 1 && fromBelow.bottom >= 0, "Should reveal the clipped top of the row");
+
+        await page.locator("#children").evaluate(el => { el.scrollTop -= 100; });
+        const visible = await geometry();
+        await chevron.click();
+        assert((await geometry()).top === visible.top, "A fully visible song should stay put");
+    },
+
     /** After clicking play on a folder, the play button changes to filled ▶. */
     async "playback: play button changes to filled after play"(page) {
         await clickAccount(page);

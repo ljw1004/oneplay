@@ -50,7 +50,8 @@ const APP_SHELL = [
 self.addEventListener('install', (event) => {
     event.waitUntil(
         caches.open(CACHE_NAME)
-            .then((cache) => cache.addAll(APP_SHELL))
+            // A new shell must fetch this release even if the HTTP cache still holds the previous one.
+            .then((cache) => cache.addAll(APP_SHELL.map(url => new Request(url, { cache: 'reload' }))))
             .then(() => self.skipWaiting())
     );
 });

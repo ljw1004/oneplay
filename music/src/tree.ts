@@ -877,13 +877,15 @@ export function createTree(
             const first = crumb.getClientRects()[0];
             if (!first) continue;
             const oneLine = first.height + 1;
-            let startsAtLeft = first.left <= left + 1;
+            // The tap area reaches into the preceding gap. Wrap by the text edge.
+            const nameLeft = name.getClientRects()[0].left;
+            let startsAtLeft = nameLeft <= left + 1;
             // A short current name can use the remaining space. A long one
             // starts on a fresh line if less than 10em of text would be visible.
             if (lineBreak instanceof HTMLBRElement && crumb.getBoundingClientRect().height > oneLine) {
                 const end = first.top + first.height / 2 < searchBounds.bottom ? beforeSearch : right;
                 const tailWidth = crumb.querySelector<HTMLElement>('.play-tail')!.getBoundingClientRect().width;
-                if (end - name.getClientRects()[0].left < 10 * parseFloat(style.fontSize) + tailWidth) {
+                if (end - nameLeft < 10 * parseFloat(style.fontSize) + tailWidth) {
                     lineBreak.hidden = false;
                     startsAtLeft = true;
                 }

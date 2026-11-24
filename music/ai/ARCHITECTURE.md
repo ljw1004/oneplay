@@ -141,6 +141,17 @@ The primary and shared-root probes use `cache: 'no-store'` to obtain that
 live size. Graph can return 304 for a folder's old ETag even when its
 recursive byte count has changed.
 
+**Refresh can report “up to date” for several minutes after a file change.**
+OneDrive's recursive byte count can lag behind an upload or deletion. Refresh
+reads the total Graph currently reports and skips rebuilding while it matches
+the cached index. A later refresh picks up the change once the total differs.
+
+In a OneDrive Personal test on 2026-11-24, Graph still reported the old Music
+total 2m 31s after creating `Music/Pop/Queen/alpha.mp3`. The saved Queen index
+contained the file by 3m 34s and the full Music index by 3m 40s. These
+end-to-end timings include polling and rebuilding. The exact propagation time
+and its upper bound are unknown.
+
 The index is stored in three places:
 1. **IndexedDB** (`index:{driveId}`) — for instant offline startup.
 2. **OneDrive App folder** — per-folder cache files for incremental re-indexing.

@@ -129,7 +129,7 @@ module.exports = {
         const [root, comedy, lionel] = idle.names.map(lines => lines[0]);
         assert(root[1] === comedy[1], "OnePlay and Comedy Offline must share a baseline");
         const song = await page.locator("#children .row-name").first().boundingBox();
-        assert(root[0] === song.x && lionel[0] === song.x && Math.abs(lionel[1] - root[1] - 28) <= 1,
+        assert(root[0] === song.x && lionel[0] === song.x && Math.abs(lionel[1] - root[1] - 36) <= 1,
             "OnePlay and wrapped Lionel Nimrod should align with song text");
         assert(idle.separators[0][0][1] === idle.separators[1][0][1], "Chevron baselines should match");
         const icons = await page.locator(".app-root .row-icon:not(.row-icon-menu-left)").evaluateAll(nodes =>
@@ -171,6 +171,23 @@ module.exports = {
         await waitForBreadcrumbCount(page, 1);
         const breadcrumbCount = await page.locator("#breadcrumbs .tree-row").count();
         assert(breadcrumbCount === 1, `Expected 1 breadcrumb after nav to root, got ${breadcrumbCount}`);
+    },
+
+    /** Tapping just outside the text should navigate to the nearest folder,
+     * including above and below the label when another row wraps underneath. */
+    async "nav: breadcrumb tap areas follow the labels"(page) {
+        await page.setViewportSize({ width: 320, height: 700 });
+        await page.evaluate(() => window._testTree.setAccount("fixture", { id: "root", children: {
+            Classical: { id: "genre", children: { Bach: { id: "composer", children: {} } } },
+        } }, { displayName: "OneDrive" }));
+        for (const [depth, side, dy] of [[1, "right", 0], [2, "left", 0], [2, "center", -15],
+            [2, "center", 15], [3, "left", 0]]) {
+            await page.evaluate(() => window._testTree.setSelectedPath(["OnePlay Music", "fixture", "Classical", "Bach"]));
+            const name = await page.locator(".crumb .row-name").nth(depth - 1).boundingBox();
+            const x = side === "left" ? name.x - 8 : side === "right" ? name.x + name.width + 8 : name.x + name.width / 2;
+            await page.mouse.click(x, name.y + name.height / 2 + dy);
+            await waitForBreadcrumbCount(page, depth);
+        }
     },
 
     // -- Search ---------------------------------------------------------------

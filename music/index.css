@@ -19,8 +19,11 @@ body{background:var(--bg-page);height:100%;display:flex;flex-direction:column;al
 #children .row-name{overflow-wrap:anywhere;}
 .fav-icon{font-weight:normal;font-size:0.85rem;opacity:0.7;}
 /* Only Search affects line wrapping. The left gutter also serves wrapped rows. */
-.folder-trail{position:relative;padding:12px 12px 8px var(--tree-text-left);text-align:left;font-size:0.95rem;line-height:max(28px,1.75em);background:var(--bg-page);border-bottom:1px solid var(--border-separator);}
-.folder-trail .crumb{display:inline;position:static;padding:4px 0;font-weight:normal;}
+.folder-trail{--crumb-side-gap:16px;position:relative;padding:8px 12px 4px var(--tree-text-left);text-align:left;font-size:0.95rem;line-height:max(36px,2em);background:var(--bg-page);border-bottom:1px solid var(--border-separator);}
+.folder-trail .crumb{display:inline;position:static;padding:9px 0;font-weight:normal;}
+/* Give the space before a name to that folder, including at a line break.
+ * Equal padding and negative margin preserve the shared text edge. */
+.folder-trail .crumb:not(.app-root){position:relative;margin-left:calc(-1 * var(--crumb-side-gap));padding-left:var(--crumb-side-gap);}
 .folder-trail .app-root{white-space:nowrap;}
 .folder-trail .crumb.selected{font-weight:var(--font-weight-bold);}
 .crumb > :not(.row-icon-menu-left){position:relative;}
@@ -30,7 +33,7 @@ body{background:var(--bg-page);height:100%;display:flex;flex-direction:column;al
 /* The separator width is fixed. Only its glyph shifts to share the gap
  * with a checkbox on its right or a refresh spinner on its left. */
 .crumb-end{white-space:nowrap;}
-.crumb-separator{position:relative;padding:0 12px;color:var(--text-secondary);font-weight:normal;}
+.crumb-separator{position:relative;padding:0 var(--crumb-side-gap);color:var(--text-secondary);font-weight:normal;}
 .crumb-separator > span{position:relative;}
 .selecting .crumb-separator > span{left:-12px;}
 .crumb-separator:has(.sync-spinner) > span{left:12px;}
@@ -42,7 +45,7 @@ body{background:var(--bg-page);height:100%;display:flex;flex-direction:column;al
 .row-icon{font-size:0.85rem;cursor:pointer;opacity:0.6;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;height:var(--row-height);width:44px;margin-left:2px;}
 /* Both header menus use the same origin, glyph metrics and hit area. */
 .row-icon-menu-left{position:absolute;left:0;top:0;width:var(--tree-text-left);height:44px;margin:0;padding:8px 0 0 calc(2 * var(--tree-marker-left) + var(--tree-marker-size) - var(--tree-text-left));appearance:none;border:0;border-radius:0;background:transparent;color:inherit;font-family:inherit;font-size:1.3rem;font-weight:400;line-height:1;transform:translateY(-1px);}
-.folder-trail > .row-icon-search{float:right;margin:-12px -6px -4px 12px;height:44px;appearance:none;border:0;padding:8px 0 0;background:transparent;color:inherit;opacity:0.55;}
+.folder-trail > .row-icon-search{float:right;margin:-8px -6px 0 12px;height:44px;appearance:none;border:0;padding:8px 0 0;background:transparent;color:inherit;opacity:0.55;}
 .row-icon-search svg{width:23px;height:23px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round;}
 .row-icon:hover{opacity:1;}
 .row-icon-warning{color:var(--color-warning);opacity:1;text-shadow:0 0 6px rgba(198,40,40,0.22);}

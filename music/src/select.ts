@@ -25,9 +25,8 @@
  * - Long-press: 500ms timer, primary pointer only, cancel on move > 10px.
  */
 
-import { type FolderPath } from './tree.js';
+import { setOfflineBadge, type FolderPath, type TreeView } from './tree.js';
 import { type Favorites, type RootsMap, type PlaylistMember, type ItemRef } from './favorites.js';
-import { type TreeView } from './tree.js';
 import { walkFolder } from './indexer.js';
 import { log, logError } from './logger.js';
 import { type Downloads, QUOTA_OPTIONS_GB, classifyOfflineBadgeState } from './downloads.js';
@@ -131,7 +130,10 @@ export function createSelect(
     let rightBtnMode: 'fav' | 'delete' | 'hidden' = 'hidden';
     let rightBtnFavId: string | undefined;
 
-    actionBarEl.append(shareBtn, actionText, rightBtn);
+    const summary = document.createElement('div');
+    summary.className = 'selection-summary';
+    summary.append(actionText, cancelBtn);
+    actionBarEl.append(shareBtn, summary, rightBtn);
 
     // -- Helpers --------------------------------------------------------------
 
@@ -751,25 +753,6 @@ export function createSelect(
         const snap = downloadsRef.getSnapshot();
         const downloadedCount = Array.from(trackKeys).filter(k => snap.downloadedKeys.has(k)).length;
 
-        // Badge: matches tree row logic from index.ts computeAndPushOfflineState
-        if (!fav.offlinePin) {
-            badgeEl.className = '';
-            badgeEl.textContent = '';
-        } else {
-            const hasMissingTracks = Array.from(trackKeys).some(k => !snap.downloadedKeys.has(k));
-            const iconState = classifyOfflineBadgeState(
-                hasMissingTracks,
-                snap.evidence,
-                fav.offlinePin.paused,
-                snap.overQuota,
-                !!snap.lastError,
-            );
-            badgeEl.className = 'offline-badge'
-                + (iconState === 'downloading' ? ' downloading' : '')
-                + (iconState === 'paused' ? ' paused' : '');
-            badgeEl.textContent = '\u2193';
-        }
-
         // Stats line: "28 tracks" | "Downloading 3/28 tracks ⏸︎" | "Paused 3/28 tracks ▶︎" | "28 tracks, 43 Mb ✓"
         const hasMissingTracks = downloadedCount < totalTracks;
         const incomplete = !!fav.offlinePin && hasMissingTracks;
@@ -781,6 +764,7 @@ export function createSelect(
             snap.overQuota,
             !!snap.lastError,
         );
+        setOfflineBadge(badgeEl, fav.offlinePin ? iconState : undefined);
         const isDownloading = iconState === 'downloading';
 
         statsEl.textContent = '';
@@ -862,7 +846,9 @@ export function createSelect(
         path.length > 1 && !(path.length === 2 && !path[1].startsWith(FAV_PREFIX));
 
     const pathFromTreeEventTarget = (target: EventTarget | null): FolderPath | undefined => {
-        const row = (target as HTMLElement | null)?.closest<HTMLElement>(
+        const element = target instanceof Element ? target : null;
+        if (element?.closest('.play-btn')) return undefined;
+        const row = element?.closest<HTMLElement>(
             '#children .tree-row[data-path], #breadcrumbs .tree-row[data-path]',
         );
         return row?.dataset.path ? JSON.parse(row.dataset.path) : undefined;

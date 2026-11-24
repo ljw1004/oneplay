@@ -38,6 +38,21 @@ import { type EvidenceState } from './auth.js';
 import { type SearchResult } from './search.js';
 import { resolvePathTailDisplayName } from './path-names.js';
 
+/** Paint the same compact arrow in the trail, child list and offline details.
+ * The pause bar and arrow share a viewBox, independently of text line height. */
+export function setOfflineBadge(badge: HTMLElement, state: 'complete' | 'downloading' | 'paused' | undefined): void {
+    badge.replaceChildren();
+    badge.className = state ? 'offline-badge ' + state : '';
+    if (!state) return;
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('role', 'img');
+    svg.setAttribute('aria-label', state === 'paused' ? 'Downloads paused' : state === 'downloading' ? 'Downloading' : 'Marked for offline');
+    // The rounded stroke extends 0.8 units past the arrow vertex to the baseline at y=12.
+    svg.innerHTML = '<path d="M8 1.5v9.7M4 7.2l4 4 4-4"/>' + (state === 'paused' ? '<path d="M3.5 14h9"/>' : '');
+    badge.appendChild(svg);
+}
+
 /** Key prefix for favorite roots in the RootsMap. */
 const FAV_PREFIX = 'fav:';
 
@@ -125,7 +140,7 @@ export interface TreeView {
     onSearchResultClick: (result: SearchResult) => void;
 }
 
-/** Options for makeRow. Depth-derived flags (isAppRoot, indent, isSelected)
+/** Options for makeRow. Depth-derived flags (isAppRoot, isSelected)
  *  are computed inside makeRow from path. */
 interface RowOptions {
     readonly name: string;
@@ -156,12 +171,20 @@ interface RowOptions {
 export function createTree(
     container: HTMLElement,
     initialPath?: FolderPath,
-    initialScrollMap?: Record<string, {top: number, left: number}>,
+    initialScrollMap?: Record<string, {top: number}>,
     deployCounter = '',
     debugGlyphs?: Readonly<Record<EvidenceState, string>>,
 ): TreeView {
     const breadcrumbsEl = container.querySelector<HTMLElement>('#breadcrumbs')!;
     const childrenEl = container.querySelector<HTMLElement>('#children')!;
+    const trail = document.createElement('div');
+    trail.className = 'folder-trail';
+    const search = document.createElement('button');
+    search.type = 'button';
+    search.className = 'row-icon row-icon-search';
+    search.setAttribute('aria-label', 'Search music');
+    search.appendChild(createSearchIconSvg());
+    search.onclick = () => view.onSearchOpen();
 
     // -- State ---------------------------------------------------------------
 
@@ -173,11 +196,11 @@ export function createTree(
     let playbackInfo: PlaybackInfo | undefined;
 
     // -- Scroll position tracking (M10) --------------------------------------
-    // INVARIANT: scrollMap stores {top, left} per folder path. Populated from
+    // INVARIANT: scrollMap stores the vertical offset per folder path. Populated from
     // initialScrollMap on startup. Updated on scroll events (rAF-throttled).
     // Capped at 100 entries; oldest entries trimmed on save.
 
-    const scrollMap = new Map<string, {top: number, left: number}>(
+    const scrollMap = new Map<string, {top: number}>(
         initialScrollMap ? Object.entries(initialScrollMap) : [],
     );
     let scrollRafPending = false;
@@ -229,7 +252,7 @@ export function createTree(
     const makeSearchResultRow = (result: SearchResult): HTMLElement => {
         const isFolder = result.kind === 'favorite' || result.kind === 'folder';
         const row = document.createElement('div');
-        row.className = `tree-row ${isFolder ? 'folder' : 'file'} indent-1`;
+        row.className = `tree-row ${isFolder ? 'folder' : 'file'}`;
         row.dataset.path = JSON.stringify(result.path);
 
         const name = document.createElement('span');
@@ -264,7 +287,7 @@ export function createTree(
     };
 
     /** Creates a plain magnifier icon with deterministic shape across platforms. */
-    const createSearchIconSvg = (): SVGSVGElement => {
+    function createSearchIconSvg(): SVGSVGElement {
         const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
         svg.setAttribute('viewBox', '0 0 24 24');
         svg.setAttribute('aria-hidden', 'true');
@@ -276,7 +299,7 @@ export function createTree(
         handle.setAttribute('d', 'M20 20l-4.35-4.35');
         svg.append(circle, handle);
         return svg;
-    };
+    }
 
     /** Renders the pinned search header row in #breadcrumbs. */
     const renderSearchHeader = (focusInput: boolean): void => {
@@ -599,7 +622,7 @@ export function createTree(
 
     /**
      * Creates a single tree row element. Used for both breadcrumb rows and
-     * child rows. Derives depth-based flags (isAppRoot, indent, isSelected)
+     * child rows. Derives depth-based flags (isAppRoot, isSelected)
      * from opts.path to keep callsites simple.
      *
      * At depth 2, dispatches on root type:
@@ -610,7 +633,6 @@ export function createTree(
     function makeRow(opts: RowOptions): HTMLElement {
         const depth = opts.path.length;
         const isAppRoot = depth === 1;
-        const indent = Math.min(depth - 1, 4);
         const isSelected = opts.isBreadcrumb && depth === selectedPath.length;
 
         // Root type dispatch at depth 2
@@ -629,17 +651,22 @@ export function createTree(
         el.className = 'tree-row'
             + (opts.isFolder ? ' folder' : ' file')
             + (isSelected ? ' selected' : '')
-            + ` indent-${indent}`;
+            + (opts.isBreadcrumb ? ' crumb' : '')
+            + (isAppRoot ? ' app-root' : '');
         el.dataset.path = JSON.stringify(opts.path);
 
         // Select mode checkbox: shown on selectable rows only.
         // Non-selectable rows are app root and account roots.
         const isSelectableRow = !isAppRoot && !isAccount && !isShareRoot;
+        if (isSelectableRow) el.classList.add('selectable');
         if (selectModeActive && isSelectableRow) {
             const pathKey = JSON.stringify(opts.path);
             const isChecked = selectModePaths.has(pathKey);
             const check = document.createElement('span');
             check.className = 'select-check' + (isChecked ? ' checked' : '');
+            check.setAttribute('aria-hidden', 'true');
+            el.setAttribute('role', 'checkbox');
+            el.setAttribute('aria-checked', String(isChecked));
             check.textContent = isChecked ? '\u2713' : '';
             el.prepend(check);
         }
@@ -661,37 +688,48 @@ export function createTree(
         // - Favorite root rows show root.name
         // - Playlist member segments "m:N" resolve via favorites.resolveDisplayName
         // - Everything else uses the raw segment name
-        const displayName = isAppRoot ? `OnePlay Music${debugEnabled ? deployCounter : ''}`
+        const displayName = isAppRoot ? `OnePlay${debugEnabled ? deployCounter : ''}`
             : isAccount ? 'OneDrive'
             : isShareRoot && rootEntry ? rootEntry.name
             : isFavoriteRoot && rootEntry ? rootEntry.name
             : resolvePathTailDisplayName(opts.path, roots, favoritesRef);
 
-        // Wrap in a span so CSS text-overflow can truncate long names
-        // (bare text nodes can't be styled). The span gets min-width:0
-        // to shrink below its natural width in the flex row.
+        // The full display name remains available when a breadcrumb is shortened.
         const nameSpan = document.createElement('span');
         nameSpan.className = 'row-name';
         nameSpan.textContent = displayName;
-        el.appendChild(nameSpan);
+        if (opts.isBreadcrumb) {
+            nameSpan.title = displayName;
+            el.setAttribute('aria-label', displayName);
+            if (isSelected) el.setAttribute('aria-current', 'location');
+        }
+        if (opts.isBreadcrumb && !isAppRoot && isSelectableRow) {
+            const label = document.createElement('span');
+            label.className = 'crumb-label';
+            label.append(...el.childNodes, nameSpan);
+            el.appendChild(label);
+        } else {
+            el.appendChild(nameSpan);
+        }
+
+        // A breadcrumb's badges and trailing separator wrap together with the
+        // end of its name. A separator on its own would indent the next folder.
+        const suffix = opts.isBreadcrumb ? document.createElement('span') : el;
 
         // Favorite markers are passive badges (no dedicated click target).
         // They remain appended after the name so tapping them behaves like row tap.
         if (isFavoriteRoot) {
             const favIcon = document.createElement('span');
             favIcon.className = 'fav-icon';
-            favIcon.textContent = '\u2002' + (rootType === 'shortcut' ? '☆' : '♫');
-            el.appendChild(favIcon);
+            favIcon.textContent = (opts.isBreadcrumb ? '\u00a0' : '\u2002') + (rootType === 'shortcut' ? '☆' : '♫');
+            suffix.appendChild(favIcon);
 
             // ↓ offline badge: driven by offlineIcons map (pushed by index.ts)
             const iconState = offlineIcons.get(opts.path[1].slice(FAV_PREFIX.length));
             if (iconState) {
                 const badge = document.createElement('span');
-                badge.className = 'offline-badge'
-                    + (iconState === 'downloading' ? ' downloading' : '')
-                    + (iconState === 'paused' ? ' paused' : '');
-                badge.textContent = '\u2193';
-                el.appendChild(badge);
+                setOfflineBadge(badge, iconState);
+                suffix.appendChild(badge);
             }
         }
 
@@ -706,8 +744,8 @@ export function createTree(
             if (refFav) {
                 const favIcon = document.createElement('span');
                 favIcon.className = 'fav-icon';
-                favIcon.textContent = '\u2002' + (refFav.kind === 'shortcut' ? '☆' : '♫');
-                el.appendChild(favIcon);
+                favIcon.textContent = (opts.isBreadcrumb ? '\u00a0' : '\u2002') + (refFav.kind === 'shortcut' ? '☆' : '♫');
+                suffix.appendChild(favIcon);
             }
         }
 
@@ -722,27 +760,28 @@ export function createTree(
         };
 
         /** Appends the shared spinner glyph (⟳) used by sync and reindex states. */
-        const addSpinner = (): void => {
+        const addSpinner = (parent: HTMLElement): void => {
             const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
             svg.setAttribute('viewBox', '0 0 16 16');
             svg.classList.add('sync-spinner');
             svg.innerHTML = '<circle cx="8" cy="8" r="5"/>';
-            el.appendChild(svg);
+            parent.appendChild(svg);
         };
 
-        // App root "OnePlay Music": left menu/warning icon, right-side debug/state icons,
-        // and a right-aligned Search button in the close-button slot.
+        // The menu occupies the left gutter. Only the text belongs to the path.
         if (isAppRoot) {
             // Force text-presentation glyphs (FE0E) for a flatter, monochrome look.
             const showWarning = evidence === 'evidence:signed-out' || deniedRootKeys.size > 0 || hasIndexFailureWarning;
-            const menuIcon = addIcon(
-                showWarning
-                    ? 'row-icon row-icon-menu row-icon-menu-left row-icon-settings row-icon-warning'
-                    : 'row-icon row-icon-menu row-icon-menu-left row-icon-settings',
-                showWarning ? '⚠\uFE0E' : '☰\uFE0E',
-                () => view.onSettingsClick(),
-            );
-            // Keep the app-root control at the far left so title-row taps avoid right-side controls.
+            const menuIcon = document.createElement('button');
+            menuIcon.type = 'button';
+            menuIcon.className = 'row-icon row-icon-menu row-icon-menu-left row-icon-settings';
+            menuIcon.classList.toggle('row-icon-warning', showWarning);
+            menuIcon.setAttribute('aria-label', 'Open settings');
+            menuIcon.textContent = showWarning ? '⚠\uFE0E' : '☰\uFE0E';
+            menuIcon.onclick = event => {
+                event.stopPropagation();
+                view.onSettingsClick();
+            };
             el.insertBefore(menuIcon, nameSpan);
             if (debugEnabled) {
                 addIcon('row-icon', '📋', () => {
@@ -754,22 +793,50 @@ export function createTree(
             if (debugGlyphs && debugEnabled) {
                 addIcon('row-icon', debugGlyphs[evidence], () => view.onDebugEvidenceGlyphClick());
             }
-            if (isSyncing) addSpinner();
-            const searchBtn = addIcon('row-icon row-icon-search row-icon-search-right', '', () => view.onSearchOpen());
-            searchBtn.appendChild(createSearchIconSvg());
         }
 
-        // Account row: no static icon; show spinner only while re-indexing.
-        if ((isAccount && rootEntry?.type === 'onedrive' && rootEntry.reindexing)
-            || (isShareRoot && rootEntry?.type === 'share' && rootEntry.reindexing)) {
-            addSpinner();
-        }
+        const reindexing = depth === 2 && (rootEntry?.type === 'onedrive' || rootEntry?.type === 'share')
+            && rootEntry.reindexing;
+        if (reindexing && !opts.isBreadcrumb) addSpinner(el);
 
         // Selected folder (not root, not account): play button.
         // ▶ (filled) if this folder IS the playback folder, ▷ (ghost) otherwise.
         if (isSelected && !isAppRoot && !isAccount && !isShareRoot && opts.showPlayButton !== false) {
-            addIcon('play-btn', isPlaybackFolder ? '\u25B6' : '\u25B7',
-                () => view.onPlayClick(selectedPath));
+            const play = document.createElement('button');
+            play.className = 'play-btn';
+            play.setAttribute('aria-label', `Play ${displayName}`);
+            play.textContent = isPlaybackFolder ? '▶' : '▷';
+            play.onclick = event => {
+                event.stopPropagation();
+                view.onPlayClick(opts.path);
+            };
+            // An inline nonbreaking space reserves the trailing button width on
+            // the same line as the name. Its tap target can fill the line height.
+            const tail = document.createElement('span');
+            tail.className = 'play-tail';
+            tail.append('\u00a0', play);
+            suffix.appendChild(tail);
+        }
+
+        if (opts.isBreadcrumb && (!isSelected || isAppRoot || isAccount || isShareRoot)) {
+            const separator = document.createElement('span');
+            separator.className = 'crumb-separator';
+            separator.setAttribute('aria-hidden', 'true');
+            // The separator owns the gap even when the root is the final crumb.
+            // Its spinner is out of flow so refresh can never rewrap the path.
+            separator.textContent = '\u00a0';
+            if (!isSelected) {
+                const chevron = document.createElement('span');
+                chevron.textContent = '›';
+                separator.appendChild(chevron);
+            }
+            if (!selectModeActive && ((isAppRoot && isSyncing) || reindexing)) addSpinner(separator);
+            suffix.appendChild(separator);
+        }
+
+        if (opts.isBreadcrumb) {
+            suffix.className = 'crumb-end';
+            el.appendChild(suffix);
         }
 
         // Click handler: in select mode, selectable rows toggle selection.
@@ -785,6 +852,75 @@ export function createTree(
 
         return el;
     }
+
+    /** Fit only the ancestor trail. The browser chooses word breaks, including
+     * splits within filenames. A partial first line earns one continuation. */
+    function fitBreadcrumbNames(): void {
+        const width = trail.clientWidth;
+        if (!width) return; // ResizeObserver will fit it when the tree becomes visible.
+        const playTail = trail.querySelector<HTMLElement>('.play-tail');
+        if (playTail) playTail.style.lineHeight = '';
+        const style = getComputedStyle(trail);
+        const left = trail.getBoundingClientRect().left + parseFloat(style.paddingLeft);
+        const lineHeight = parseFloat(style.lineHeight);
+        const right = left + width - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+        const searchBounds = search.getBoundingClientRect();
+        const beforeSearch = searchBounds.left - parseFloat(getComputedStyle(search).marginLeft);
+        for (const crumb of trail.querySelectorAll<HTMLElement>('.crumb')) {
+            const name = crumb.querySelector<HTMLElement>('.row-name')!;
+            const full = name.title;
+            name.textContent = full;
+            const lineBreak = crumb.previousElementSibling;
+            if (lineBreak instanceof HTMLBRElement) lineBreak.hidden = true;
+            // Bidi runs and badges can yield several rectangles on one line.
+            // The inline box height increases by one line-height per wrap.
+            const first = crumb.getClientRects()[0];
+            if (!first) continue;
+            const oneLine = first.height + 1;
+            let startsAtLeft = first.left <= left + 1;
+            // A short current name can use the remaining space. A long one
+            // starts on a fresh line if less than 10em of text would be visible.
+            if (lineBreak instanceof HTMLBRElement && crumb.getBoundingClientRect().height > oneLine) {
+                const end = first.top + first.height / 2 < searchBounds.bottom ? beforeSearch : right;
+                const tailWidth = crumb.querySelector<HTMLElement>('.play-tail')!.getBoundingClientRect().width;
+                if (end - name.getClientRects()[0].left < 10 * parseFloat(style.fontSize) + tailWidth) {
+                    lineBreak.hidden = false;
+                    startsAtLeft = true;
+                }
+            }
+            const maxHeight = oneLine + (startsAtLeft ? 0 : lineHeight);
+            if (crumb.getBoundingClientRect().height <= maxHeight) continue;
+            // Keep the longest grapheme prefix that fits with its ellipsis,
+            // badges and separator. Full song titles never enter this path.
+            const letters = Array.from(new Intl.Segmenter().segment(full), part => part.segment);
+            let low = 0, high = letters.length;
+            while (low < high) {
+                const mid = Math.ceil((low + high) / 2);
+                name.textContent = letters.slice(0, mid).join('').trimEnd() + '…';
+                if (crumb.getBoundingClientRect().height <= maxHeight) low = mid;
+                else high = mid - 1;
+            }
+            name.textContent = letters.slice(0, low).join('').trimEnd() + '…';
+        }
+        // If Play ends directly below Search, separate their 44px hit areas.
+        // Only that final line needs extra leading; text widths stay the same.
+        if (playTail) {
+            const play = playTail.firstElementChild!.getBoundingClientRect();
+            const overlap = searchBounds.bottom - play.top;
+            if (overlap > 0 && play.right > searchBounds.left && play.left < searchBounds.right) {
+                playTail.style.lineHeight = (lineHeight + 2 * Math.ceil(overlap)) + 'px';
+            }
+        }
+    }
+
+    // Rotation, resizing and returning from Settings can all change line breaks.
+    let lastTrailSize = '';
+    new ResizeObserver(() => {
+        const size = trail.clientWidth + '/' + getComputedStyle(trail).fontSize;
+        if (size === lastTrailSize) return;
+        lastTrailSize = size;
+        fitBreadcrumbNames();
+    }).observe(trail);
 
     // -- render --------------------------------------------------------------
 
@@ -857,12 +993,21 @@ export function createTree(
         // (select-mode toggles, playback indicator updates) can preserve exact
         // viewport even when scrollMap persistence is one frame behind.
         const hadChildrenRows = childrenEl.childElementCount > 0;
-        const liveScrollBeforeRender = {
-            top: childrenEl.scrollTop,
-            left: childrenEl.scrollLeft,
-        };
+        const liveScrollBeforeRender = childrenEl.scrollTop;
 
-        breadcrumbsEl.replaceChildren(...breadcrumbRows);
+        trail.classList.toggle('selecting', selectModeActive);
+        trail.replaceChildren(search, breadcrumbRows[0]);
+        for (const crumb of breadcrumbRows.slice(1)) {
+            trail.append(' ');
+            if (crumb.querySelector('.play-btn')) {
+                const lineBreak = document.createElement('br');
+                lineBreak.hidden = true;
+                trail.appendChild(lineBreak);
+            }
+            trail.appendChild(crumb);
+        }
+        breadcrumbsEl.replaceChildren(trail);
+        fitBreadcrumbNames();
         childrenEl.replaceChildren(...childRows);
 
         // -- Scroll restoration (M10) ----------------------------------------
@@ -878,14 +1023,11 @@ export function createTree(
             && selectedPath.every((s, i) => s === previousPath[i]);
         const savedScroll = scrollMap.get(pathKey);
         if (isSamePath && hadChildrenRows) {
-            childrenEl.scrollTop = liveScrollBeforeRender.top;
-            childrenEl.scrollLeft = liveScrollBeforeRender.left;
+            childrenEl.scrollTop = liveScrollBeforeRender;
         } else if (isUpOrSame && savedScroll !== undefined) {
             childrenEl.scrollTop = savedScroll.top;
-            childrenEl.scrollLeft = savedScroll.left;
         } else {
             childrenEl.scrollTop = 0;
-            childrenEl.scrollLeft = 0;
         }
         previousPath = selectedPath;
 
@@ -921,6 +1063,15 @@ export function createTree(
                 const dx = old.left - cur.left;
                 const dy = old.top - cur.top;
                 if (dx === 0 && dy === 0) continue;
+                if (row.classList.contains('crumb')) {
+                    // Inline text can span line boxes. Animate relative offsets
+                    // on its fragments, including the attached Play target.
+                    for (const fragment of row.children) {
+                        fragment.animate([{ left: dx + 'px', top: dy + 'px' }, { left: '0', top: '0' }],
+                            { duration: 220, easing: 'cubic-bezier(0.33, 1, 0.68, 1)' });
+                    }
+                    continue;
+                }
                 row.style.transition = 'none';
                 row.style.transform = `translate(${dx}px, ${dy}px)`;
                 requestAnimationFrame(() => {
@@ -960,14 +1111,14 @@ export function createTree(
         requestAnimationFrame(() => {
             scrollRafPending = false;
             const key = JSON.stringify(selectedPath);
-            scrollMap.set(key, {top: childrenEl.scrollTop, left: childrenEl.scrollLeft});
+            scrollMap.set(key, {top: childrenEl.scrollTop});
             // Cap at 100 entries: trim oldest (first inserted)
             if (scrollMap.size > 100) {
                 const first = scrollMap.keys().next().value;
                 if (first !== undefined) scrollMap.delete(first);
             }
             // Persist to localStorage
-            const obj: Record<string, {top: number, left: number}> = {};
+            const obj: Record<string, {top: number}> = {};
             for (const [k, v] of scrollMap) obj[k] = v;
             try { localStorage.setItem('oneplay_music_scroll', JSON.stringify(obj)); } catch { /* quota */ }
         });

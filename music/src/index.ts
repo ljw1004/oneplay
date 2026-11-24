@@ -108,7 +108,7 @@ const clearM10State = (): void => {
 // Restored M10 state, read synchronously at the top of onBodyLoad().
 // Module-scoped so showTree and wireFavoritesUi can access them.
 let restoredView: { path: string[]; expanded: boolean } | undefined;
-let restoredScroll: Record<string, {top: number, left: number}> | undefined;
+let restoredScroll: Record<string, {top: number}> | undefined;
 let restoredPlayback: { folder: string[]; track: string[]; mode: string; favId?: string } | undefined;
 let restoredTime: number | undefined;
 let favoriteCustomizeToastShownInSession = false;
@@ -830,7 +830,7 @@ async function startupInner(): Promise<void> {
     // M10: Read persisted UI state synchronously before first render.
     // These are module-scoped so showTree() can pass them to createTree().
     restoredView = readJson<{ path: string[]; expanded: boolean }>('oneplay_music_view');
-    restoredScroll = readJson<Record<string, {top: number, left: number}>>('oneplay_music_scroll');
+    restoredScroll = readJson<Record<string, {top: number}>>('oneplay_music_scroll');
     restoredPlayback = readJson<{ folder: string[]; track: string[]; mode: string; favId?: string }>('oneplay_music_playback');
     restoredTime = (() => {
         const raw = localStorage.getItem('oneplay_music_time');

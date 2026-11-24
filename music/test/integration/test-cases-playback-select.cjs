@@ -332,7 +332,7 @@ module.exports = {
             await waitForBreadcrumbCount(page, 3);
         }
         // Click OnePlay Music breadcrumb to go back to root
-        await page.locator("#breadcrumbs .tree-row", { hasText: "OnePlay Music" }).click();
+        await page.locator("#breadcrumbs .app-root .row-name").click();
         await waitForBreadcrumbCount(page, 1);
         const breadcrumbCount = await page.locator("#breadcrumbs .tree-row").count();
         assert(breadcrumbCount === 1, `Expected 1 breadcrumb at root, got ${breadcrumbCount}`);
@@ -501,7 +501,7 @@ module.exports = {
     async "select: right-click breadcrumb enters select mode"(page) {
         await clickAccount(page);
         await clickFirstFolder(page);
-        await enterSelectViaRightClick(page, "#breadcrumbs .tree-row[data-path]:nth-child(3)");
+        await enterSelectViaRightClick(page, "#breadcrumbs .crumb.selected");
         const breadcrumbChecked = await page.evaluate(() =>
             document.querySelectorAll("#breadcrumbs .select-check.checked").length
         );
@@ -572,7 +572,7 @@ module.exports = {
     async "select: checkboxes on selectable breadcrumbs only"(page) {
         await clickAccount(page);
         await clickFirstFolder(page);
-        await enterSelectViaRightClick(page, "#breadcrumbs .tree-row[data-path]:nth-child(3)");
+        await enterSelectViaRightClick(page, "#breadcrumbs .crumb.selected");
         const state = await page.evaluate(() => {
             const rows = Array.from(document.querySelectorAll("#breadcrumbs .tree-row"));
             return rows.map((row, idx) => ({
@@ -647,7 +647,7 @@ module.exports = {
         const checkedBefore = await page.evaluate(() =>
             document.querySelectorAll(".select-check.checked").length
         );
-        await page.locator("#breadcrumbs .tree-row", { hasText: "OnePlay Music" }).click();
+        await page.locator("#breadcrumbs .app-root .row-name").click();
         const after = await page.evaluate(() => ({
             breadcrumbs: document.querySelectorAll("#breadcrumbs .tree-row").length,
             hasSelectMode: document.body.classList.contains("select-mode"),
@@ -706,52 +706,18 @@ module.exports = {
         await exitSelectMode(page);
     },
 
-    /** Horizontal scroll in children keeps checkbox x-position fixed. */
-    async "select: horizontal scroll keeps checkbox fixed"(page) {
-        const prevFlipSeq = await getTestSeq(page, "_testTreeFlipSeq");
+    /** Long unbroken track names remain fully visible within the viewport in select mode. */
+    async "select: long names wrap alongside the checkbox"(page) {
         await clickAccount(page);
-        await waitForFlipSettled(page, prevFlipSeq);
         await enterSelectViaRightClick(page);
-        const result = await page.evaluate(async () => {
-            const children = document.getElementById("children");
-            const row = children?.querySelector(".tree-row[data-path]");
-            const name = row?.querySelector(".row-name");
-            const check = row?.querySelector(".select-check");
-            if (!children || !row || !name || !check) return { ok: false, reason: "missing nodes" };
-            row.style.width = "2000px";
-            row.style.minWidth = "2000px";
-            const spacer = document.createElement("div");
-            spacer.style.width = "2500px";
-            spacer.style.height = "1px";
-            children.appendChild(spacer);
-            children.scrollLeft = 0;
-            await new Promise(requestAnimationFrame);
-            const maxScroll = children.scrollWidth - children.clientWidth;
-            if (maxScroll < 80) return { ok: false, reason: `insufficient overflow (${maxScroll})` };
-            const before = {
-                checkLeft: check.getBoundingClientRect().left,
-                nameLeft: name.getBoundingClientRect().left,
-                scrollLeft: children.scrollLeft,
-            };
-            children.scrollLeft = Math.min(180, maxScroll);
-            await new Promise(requestAnimationFrame);
-            const after = {
-                checkLeft: check.getBoundingClientRect().left,
-                nameLeft: name.getBoundingClientRect().left,
-                scrollLeft: children.scrollLeft,
-            };
-            return {
-                ok: true,
-                checkDelta: after.checkLeft - before.checkLeft,
-                nameDelta: after.nameLeft - before.nameLeft,
-                scrollDelta: after.scrollLeft - before.scrollLeft,
-            };
+        const fits = await page.evaluate(() => {
+            const list = document.querySelector("#children");
+            const name = list.querySelector(".select-check").parentElement.querySelector(".row-name");
+            name.textContent = "LongFilename".repeat(100);
+            return name.offsetHeight > parseFloat(getComputedStyle(name).lineHeight) * 2
+                && list.scrollWidth === list.clientWidth;
         });
-        assert(result.ok, `Expected horizontal overflow test setup to succeed: ${result.reason || "unknown"}`);
-        assert(Math.abs(result.scrollDelta) >= 40,
-            `Expected horizontal scroll delta >= 40px, got ${result.scrollDelta.toFixed(2)}px`);
-        assert(Math.abs(result.checkDelta) <= 0.75,
-            `Expected checkbox x-shift <= 0.75px during horizontal scroll, got ${result.checkDelta.toFixed(2)}px`);
+        assert(fits, "Expected multiple visible lines without horizontal overflow");
         await exitSelectMode(page);
     },
 

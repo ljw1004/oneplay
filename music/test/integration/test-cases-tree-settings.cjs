@@ -12,32 +12,153 @@ module.exports = {
         assert(childCount >= 1, `Expected children >= 1, got ${childCount}`);
     },
 
-    // -- Indentation ----------------------------------------------------------
-
-    /** Breadcrumbs indent progressively by depth (indent-0, indent-1, ...). */
-    async "indent: breadcrumbs indent by depth"(page) {
+    /** Short ancestors share a line, with one consistent left margin for all children. */
+    async "tree: compact trail and flat children"(page) {
         await clickAccount(page);
+        const names = "#children .tree-row .row-name";
+        const before = await page.locator(names).first().boundingBox();
         await clickFirstFolder(page);
-        const classes = await page.evaluate(() =>
-            Array.from(document.querySelectorAll("#breadcrumbs .tree-row"))
-                .map(el => el.className)
-        );
-        assert(classes[0].includes("indent-0"), `Root should be indent-0, got: ${classes[0]}`);
-        assert(classes[1].includes("indent-1"), `Account should be indent-1, got: ${classes[1]}`);
-        assert(classes[2].includes("indent-2"), `Folder should be indent-2, got: ${classes[2]}`);
+        const crumbs = page.locator(".folder-trail .crumb");
+        assert(await crumbs.count() === 3, "Expected the app root, account and folder in the trail");
+        const folder = await crumbs.last().getAttribute("aria-current");
+        assert(folder === "location", "The final breadcrumb should identify the current folder");
+        const after = await page.locator(names).first().boundingBox();
+        assert(Math.abs(after.x - before.x) < 1, "Opening a folder should preserve the list margin");
     },
 
-    /** Children indent one level deeper than their parent breadcrumb. */
-    async "indent: children indent deeper than parent"(page) {
-        await clickAccount(page);
-        const childClasses = await page.evaluate(() =>
-            Array.from(document.querySelectorAll("#children .tree-row.folder"))
-                .slice(0, 3)
-                .map(el => el.className)
-        );
-        for (const cls of childClasses) {
-            assert(cls.includes("indent-2"), `Child of account should be indent-2, got: ${cls}`);
+    /** The first crumb gets one line, a mid-line crumb can use the next,
+     * and revealing/toggling checkboxes leaves every fragment and Play fixed. */
+    async "tree: wrapped breadcrumbs keep their geometry in Select"(page) {
+        await page.setViewportSize({ width: 375, height: 720 });
+        await page.evaluate(() => {
+            const tree = window._testTree;
+            const long = "Beethoven — Complete Symphonies from the Vienna recordings ".repeat(4);
+            tree.setAccount("fixture", { id: "root", children: { Classical: { id: "genre",
+                children: { [long]: { id: "box", children: { Album: { id: "album",
+                    children: { "Overture.mp3": { id: "track" } } } } } } } } }, { displayName: "OneDrive" });
+            tree.setSelectedPath(["OnePlay Music", "fixture", "Classical", long, "Album"]);
+        });
+        const geometry = () => page.evaluate(() => {
+            const trail = document.querySelector(".folder-trail");
+            const crumbs = Array.from(trail.querySelectorAll(".crumb"));
+            return {
+                lines: crumbs.map(c => [...c.getClientRects()].map(r => [r.x, r.y, r.width, r.height])),
+                text: crumbs.map(c => c.querySelector(".row-name").textContent),
+                play: trail.querySelector(".play-btn").getBoundingClientRect().toJSON(),
+                listTop: document.querySelector("#children").getBoundingClientRect().top,
+            };
+        });
+        const before = await geometry();
+        assert(new Set(before.lines[0].map(r => r[1])).size === 1, "Root should fit in one line");
+        assert(new Set(before.lines[3].map(r => r[1])).size === 2 && before.text[3].endsWith("…"),
+            "Mid-line long ancestor should use exactly one continuation");
+        await enterSelectViaRightClick(page, ".crumb.selected .row-name");
+        await page.locator(".crumb").nth(3).locator(".select-check").click();
+        assert(JSON.stringify(await geometry()) === JSON.stringify(before), "Selection reflowed the trail");
+        assert(await page.locator(".crumb .select-check.checked").count() === 2,
+            "Expected both ancestor and current folder to be checked");
+        await exitSelectMode(page);
+    },
+
+    /** Only the first line shares space with Search. Play stays with the final
+     * fragment, and a long name starts there only when its 10em allowance fits. */
+    async "tree: OnePlay, Search and folder Play share the trail"(page) {
+        const album = "Live recordings from the summer concert series ".repeat(3);
+        await page.evaluate(name => {
+            const tree = window._testTree;
+            const tracks = { id: "album", children: { "One.mp3": { id: "one" } } };
+            tree.setAccount("fixture", { id: "root", children: {
+                Jazz: { id: "genre", children: { [name]: tracks, Live: tracks } },
+            } }, { displayName: "OneDrive" });
+        }, album);
+        for (const [width, name, startsOnFirstLine] of [[494, "Live", true], [494, album, false], [640, album, true]]) {
+            await page.setViewportSize({ width, height: 720 });
+            const layout = await page.evaluate(name => {
+                window._testTree.setSelectedPath(["OnePlay Music", "fixture", "Jazz", name]);
+                const trail = document.querySelector(".folder-trail");
+                const root = trail.querySelector(".app-root .row-name").getBoundingClientRect();
+                const search = trail.querySelector(".row-icon-search").getBoundingClientRect();
+                const play = trail.querySelector(".play-btn").getBoundingClientRect();
+                const fragments = trail.querySelector(".selected .row-name").getClientRects();
+                const last = fragments[fragments.length - 1];
+                return {
+                    rootOnFirstLine: root.top < search.bottom,
+                    first: Math.abs(fragments[0].top - root.top) < 4,
+                    playAfterName: play.left >= last.right && play.left - last.right < 12
+                        && play.top <= last.top && play.bottom >= last.bottom,
+                    clearOfSearch: play.right <= search.left || play.top >= search.bottom,
+                };
+            }, name);
+            assert(layout.rootOnFirstLine && layout.first === startsOnFirstLine,
+                `Unexpected first-line layout at ${width}px: ${JSON.stringify(layout)}`);
+            assert(layout.playAfterName && layout.clearOfSearch,
+                `Play must follow the final fragment clear of Search at ${width}px`);
         }
+    },
+
+    /** The root, wrapped folder and separators keep the same geometry while
+     * sync and selection repurpose the gap after OnePlay. */
+    async "tree: Comedy Offline aligns across sync and Select"(page) {
+        await page.setViewportSize({ width: 494, height: 700 });
+        const geometry = () => page.evaluate(() => {
+            const rects = selector => Array.from(document.querySelectorAll(selector), el => {
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                return [...range.getClientRects()].map(r => [r.x, r.y, r.width, r.height]);
+            });
+            return {
+                names: rects(".folder-trail .row-name"),
+                separators: rects(".crumb-separator > span"),
+                play: document.querySelector(".play-btn").getBoundingClientRect().toJSON(),
+            };
+        });
+        await page.evaluate(() => {
+            const tree = window._testTree;
+            const name = "Lionel Nimrod's Inexplicable World";
+            tree.setDebugEnabled(true);
+            tree.setFavorites({
+                getAll: () => [{ id: "comedy", name: "Comedy Offline", kind: "playlist", members: [] }],
+                resolveChildren: (_id, path) => path.length ? [["Episode 1.mp3", false]] : [["m:0", true]],
+                resolvePathSegmentName: () => name,
+            });
+            tree.setOfflineIcons(new Map([["comedy", "paused"]]));
+            tree.setSelectedPath(["OnePlay Music", "fav:comedy", "m:0"]);
+            tree.setSyncing(false);
+        });
+        const idle = await geometry();
+        const [root, comedy, lionel] = idle.names.map(lines => lines[0]);
+        assert(root[1] === comedy[1], "OnePlay and Comedy Offline must share a baseline");
+        const song = await page.locator("#children .row-name").first().boundingBox();
+        assert(root[0] === song.x && lionel[0] === song.x && Math.abs(lionel[1] - root[1] - 28) <= 1,
+            "OnePlay and wrapped Lionel Nimrod should align with song text");
+        assert(idle.separators[0][0][1] === idle.separators[1][0][1], "Chevron baselines should match");
+        const icons = await page.locator(".app-root .row-icon:not(.row-icon-menu-left)").evaluateAll(nodes =>
+            nodes.map(el => el.getBoundingClientRect().toJSON()));
+        assert(icons.length === 2 && Math.abs(icons[0].left - root[0] - root[2]) < 1
+            && Math.abs(icons[1].left - icons[0].right) < 1, "Debug controls should touch the version and each other");
+        assert(await page.locator(".app-root").evaluate(el => getComputedStyle(el).fontWeight) === "400",
+            "An ancestor root uses regular weight");
+        await page.evaluate(() => window._testTree.setSyncing(true));
+        await page.locator(".app-root .crumb-separator .sync-spinner").waitFor();
+        const syncing = await geometry();
+        assert(JSON.stringify(syncing.names) === JSON.stringify(idle.names), "Sync shifted a folder name");
+        await enterSelectViaRightClick(page, ".crumb.selected .row-name");
+        const selecting = await geometry();
+        const centers = await page.evaluate(() => {
+            const menuGlyph = document.createRange();
+            menuGlyph.selectNodeContents(document.querySelector(".app-root .row-icon-menu-left"));
+            return [menuGlyph, document.querySelector(".crumb.selected .select-check"),
+                document.querySelector("#children .select-check")].map(el => {
+                const r = el.getBoundingClientRect();
+                return r.left + r.width / 2;
+            });
+        });
+        assert(Math.max(...centers) - Math.min(...centers) < 1, "Menu and checkmarks should share a centerline");
+        assert(JSON.stringify(selecting.names) === JSON.stringify(idle.names), "Select shifted a folder name");
+        assert(JSON.stringify(selecting.play) === JSON.stringify(idle.play), "Select moved Play");
+        assert(await page.locator(".app-root .sync-spinner").count() === 0, "Select hides the root spinner");
+        await exitSelectMode(page);
+        await page.locator(".app-root .crumb-separator .sync-spinner").waitFor();
     },
 
     // -- Navigation -----------------------------------------------------------
@@ -46,7 +167,7 @@ module.exports = {
     async "nav: breadcrumb click navigates up"(page) {
         await clickAccount(page);
         await clickFirstFolder(page);
-        await page.locator("#breadcrumbs .tree-row", { hasText: "OnePlay Music" }).click();
+        await page.locator("#breadcrumbs .app-root .row-name").click();
         await waitForBreadcrumbCount(page, 1);
         const breadcrumbCount = await page.locator("#breadcrumbs .tree-row").count();
         assert(breadcrumbCount === 1, `Expected 1 breadcrumb after nav to root, got ${breadcrumbCount}`);
@@ -380,7 +501,20 @@ module.exports = {
             assert(!state.treeHidden, `Expected tree visible after ${label}`);
         };
 
+        const menuGeometry = locator => locator.evaluate(button => {
+            const glyph = document.createRange();
+            glyph.selectNodeContents(button);
+            return [button.getBoundingClientRect().toJSON(), glyph.getBoundingClientRect().toJSON()];
+        });
+        const rootTitle = await page.locator(".app-root .row-name").boundingBox();
+        const browsing = await menuGeometry(page.locator(".app-root .row-icon-settings"));
         await openSettingsPage(page);
+        const settings = await menuGeometry(page.locator(".settings-menu"));
+        assert(JSON.stringify(browsing) === JSON.stringify(settings), "Opening Settings moved the menu button or glyph");
+        const menu = await page.locator(".settings-menu").boundingBox();
+        const title = await page.locator(".settings-title").boundingBox();
+        assert(title.x >= menu.x + menu.width && title.x === rootTitle.x,
+            "Settings must clear its menu and align with the OnePlay title");
         await page.locator("#settings-container .settings-menu").click();
         await assertClosed("hamburger click");
 
@@ -783,7 +917,7 @@ module.exports = {
         await closeSettingsPage(page);
         const offState = await getDebugState();
         assert(!offState.hasGlyph, `Debug glyph should be hidden after explicit disable (icons=${JSON.stringify(offState.icons)})`);
-        assert(offState.rowName === "OnePlay Music",
+        assert(offState.rowName === "OnePlay",
             `Expected plain OnePlay Music title when debug is off, got "${offState.rowName}"`);
 
         await openSettingsPage(page);
@@ -797,14 +931,14 @@ module.exports = {
         await closeSettingsPage(page);
         const onState = await getDebugState();
         assert(onState.hasGlyph, `Debug glyph should appear after enabling debug (icons=${JSON.stringify(onState.icons)})`);
-        assert(onState.rowName.startsWith("OnePlay Music") && onState.rowName.length > "OnePlay Music".length,
+        assert(onState.rowName.startsWith("OnePlay") && onState.rowName.length > "OnePlay".length,
             `Expected deploy suffix in title when debug is on, got "${onState.rowName}"`);
 
         await page.goto(URL, { waitUntil: "domcontentloaded" });
         await page.waitForSelector("#tree-container:not([hidden])", { timeout: 15000 });
         const persistedState = await getDebugState();
         assert(persistedState.hasGlyph, `Debug glyph should persist across reload (icons=${JSON.stringify(persistedState.icons)})`);
-        assert(persistedState.rowName.startsWith("OnePlay Music") && persistedState.rowName.length > "OnePlay Music".length,
+        assert(persistedState.rowName.startsWith("OnePlay") && persistedState.rowName.length > "OnePlay".length,
             `Expected deploy suffix to persist in title when debug is on, got "${persistedState.rowName}"`);
     },
 

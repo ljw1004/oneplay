@@ -106,6 +106,7 @@
 - **For flex overflow, widen the flex container (`max-content` + floor width), not just the child.**
 - **`:has()` depends on DOM presence, not visibility.** Remove nodes when layout should stop matching.
 - **Read CSS `env()` values via custom properties, not direct `getComputedStyle('env(...)')`.**
+- **Count rendered lines by vertical position or height.** In Chromium an inline element can return multiple client rectangles on the same line. Counting rectangles over-truncated breadcrumb text that fit in WebKit.
 - **FLIP animations need deterministic cleanup fallback (timeout), not only `transitionend`.**
 - **`max-height` transitions require measured pixel targets, not `auto`.**
 - **Restarting CSS animations requires forced reflow between class remove/add.**

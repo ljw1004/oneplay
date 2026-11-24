@@ -341,7 +341,7 @@ module.exports = {
         const created = await createTestFavorites(page);
         if (!created) return;
         // Navigate to root to see favorites
-        await page.locator("#breadcrumbs .tree-row", { hasText: "OnePlay Music" }).click();
+        await page.locator("#breadcrumbs .app-root .row-name").click();
         await waitForBreadcrumbCount(page, 1);
         // Click the first shortcut row (has ☆ icon)
         const clicked = await page.evaluate(() => {
@@ -398,7 +398,7 @@ module.exports = {
         const created = await createTestFavorites(page);
         if (!created) return;
 
-        await page.locator("#breadcrumbs .tree-row", { hasText: "OnePlay Music" }).click();
+        await page.locator("#breadcrumbs .app-root .row-name").click();
         await waitForBreadcrumbCount(page, 1);
 
         const clicked = await page.evaluate(() => {

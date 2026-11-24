@@ -512,8 +512,7 @@ async function clickFirstFolder(page) {
     const before = await page.locator("#breadcrumbs .tree-row").count();
     await page.locator("#children .tree-row.folder").first().click();
     // Wait for a new breadcrumb to appear (navigation completed).
-    await page.locator(`#breadcrumbs .tree-row:nth-child(${before + 1})`)
-        .waitFor({ timeout: 5000 });
+    await waitForBreadcrumbCount(page, before + 1);
 }
 
 /**
@@ -575,7 +574,7 @@ async function createTestFavorites(page) {
         });
     });
     // Navigate to root to see favorites
-    await page.locator("#breadcrumbs .tree-row", { hasText: "OnePlay Music" }).click();
+    await page.locator("#breadcrumbs .app-root .row-name").click();
     await waitForBreadcrumbCount(page, 1);
     await waitForFavIconCount(page, 1);
     return true;

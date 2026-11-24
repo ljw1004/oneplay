@@ -55,7 +55,7 @@ And I'll click on Sgt Pepper:
 
 The pattern is (1) there's a breadcrumb view from the top level down to the currently selected folder, (2) we see all immediate children of the current folder, (3) the currently-selected folder has a "play" button which will set the "currently-playing" to be the recursive descendents of that.
 
-I imagine that the breadcrumb items will be styled one way (say with a background color grey), the currently selected folder will be styled (say with a yellow background color), and the immediate children of the currently selected folder will have their own style (no background). Also, maybe we'll show folders in bold, and individual tracks in regular type.
+The header uses the darker page background throughout. Settings and the tappable OnePlay root start the left-aligned trail, with Search at the far right of its first line. The current folder is bold. A separator stays with the end of each ancestor name. OnePlay, Settings, wrapped folder names and songs share a left text edge. The menu glyph and selection checkmarks share a centerline in the gutter. Debug icons sit immediately after the root’s version number. Each separator reserves space for a checkbox or sync spinner so folder text stays in place. In Select, tap a name or its checkbox to toggle that folder. Child folders are bold and tracks use regular type.
 
 Icons/buttons:
 - ▷ is a button to "set the currently-playing list to be this folder and all its recusive descendents". It is shown on the currently-selected folder. We might show it filled-in ▶ if the selected-folder is already the currently-playing list (so that clicking on it will be a no-op)
@@ -65,12 +65,12 @@ Icons/buttons:
 - 🔗 is a non-functional badge to indicate a share. (I'm not sure whether we should have this or not).
 - 🔍 lets you search.
 - ↓ is a badge to show that a favorite has been marked for "make available offline" and is complete. It may be animated "↓⌄_" to show that we're actively downloading. It's just a badge; not tappable.
-- ⟳ immediately to the right of "OnePlay Music" shows we'll pulling favorites, or pushing our updates to favorites, or polling OneDrive/shares to see if we need to rebuild the index. It's always very short-lived.
+- ⟳ in the reserved gap after OnePlay is hidden during selection. At other times it shows we'll pulling favorites, or pushing our updates to favorites, or polling OneDrive/shares to see if we need to rebuild the index. It's always very short-lived.
 - ⟳ immediately to the right of OneDrive or a share shows that we're indexing that source. This often lasts 30s but can be 2-5mins the first time for shares. The user can click the hamburger menu ☰ to see progress.
 - ⟳ to the left of a track shows that we're currently loading this track to start playing it.
 - > to the left of a track shows it is currently playing, or is the currently selected playback folder
 
-Almost all of the screen is taken up by this hierarchical view. You can naturally scroll up and down. But because track titles are long 50-120 characters, and I don't want to truncate them nor wrap them, you also have to be able to scroll left and right. I suppose we might want some kind of "snap" so that a human scroll gesture is interpreted solely as either a vertical scroll or a horizontal scroll? Hard to tell. Anyway, the breadcrumbs area will never scroll horizontally.
+Children share a left margin at every depth. Their full names wrap across as many lines as needed and the list scrolls vertically. A breadcrumb starting at the left margin gets one line. A breadcrumb starting partway across can also use the next line, after which its name is ellipsized. The current folder can start on the remaining line when its name (up to 10em), a nonbreaking space and Play fit clear of Search. Otherwise it starts a fresh line. Play follows the last visible part of the name.
 
 Navigating the hierarchy (clicking a folder, clicking a breadcrumb) must be animated. Rows that persist across the transition slide from their old position to their new position; new children fade in. This uses the FLIP technique (First, Last, Invert, Play). Without animation, navigation feels disorienting — the user loses spatial context.
 
@@ -155,8 +155,7 @@ Plan:
 - You enter "select" mode (similar to iPhone Photos app) by click+holding on an itme.
   - In select mode, there will be checkboxes to the left of each row in the playlist area, for you to select/deselect that row
   - And a bar at the bottom of the screen can appear, similar to iPhone Photos app. In iPhone photos app it shows (1) a share button through which we might add it to a favorite, (2) a count of how many photos are selected; we might show how many things have been selected, or how many recursive files that selection denotes; (3) a button to delete, which we might use to remove selected items from a playlist, or remove a favorite entirely.
-  - In select mode, there should be a floating "cancel" button at the top right to get out of select mode.
-  - Some apps on iPhone (e.g. Outlook, though not Photos) also allow swipe-to-select. That's less discoverable but a bit conventional by now. We could use that for a quicker way to favorite an individual folder, but I think that's not possible because we allow horizontal scrolling.
+  - In select mode, Cancel sits beside the selection count in the bottom action bar.
 - Favorites need the ability to have their own playback (currentTrack, currentTime, repeatMode) for sake of audiobooks; it's part of MVP.
   - When a favorite is created for the first time, there will be a checkbox for whether this favorite should have its own playback.
   - When a user selects a favorite, the action bar should offer a way to turn that on or off. (The absence is called "use global defaults")
@@ -187,7 +186,6 @@ Rejected ideas:
 - User-authored algorithmic favorites e.g. "all tracks with this tag" or "recently added". These have a high administrative burden. A user's ability to upload new music into a directory already gives them similar expressivity -- i.e. if they modify the content of a directory on OneDrive, then any favorited thing that mentions that directory will automatically include the new tracks.
 - "Recently played" algorithmic favorite. This would be nice. But we'll skip it for now to keep the app simple: it's not part of the MVP.
 - Queues and filters. We have no playback queues. We only have "currently playing folder". This is a nice simplification for us.
-- Swipe. Many apps such as Mail use side-swipe to select/delete items. That would be nice. But for us, horizontal scrolling is already reserved for scrolling long track names, so we can't re-use it.
 - Surfacing "broken references". It would be nice to indicate to a user when their favorite is broken in some way. But doing so will require more UI, so I just won't: not part of MVP.
 
 ## Memory

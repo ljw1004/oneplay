@@ -61,7 +61,7 @@ module.exports = {
     },
 
     /** Only the first line shares space with Search. Play stays with the final
-     * fragment, and a long name starts there only when its 10em allowance fits. */
+     * fragment, and a long name can start in the space left by its parent. */
     async "tree: OnePlay, Search and folder Play share the trail"(page) {
         const album = "Live recordings from the summer concert series ".repeat(3);
         await page.evaluate(name => {
@@ -71,7 +71,7 @@ module.exports = {
                 Jazz: { id: "genre", children: { [name]: tracks, Live: tracks } },
             } }, { displayName: "OneDrive" });
         }, album);
-        for (const [width, name, startsOnFirstLine] of [[494, "Live", true], [494, album, false], [640, album, true]]) {
+        for (const [width, name] of [[494, "Live"], [494, album], [640, album]]) {
             await page.setViewportSize({ width, height: 720 });
             const layout = await page.evaluate(name => {
                 window._testTree.setSelectedPath(["OnePlay Music", "fixture", "Jazz", name]);
@@ -89,17 +89,45 @@ module.exports = {
                     clearOfSearch: play.right <= search.left || play.top >= search.bottom,
                 };
             }, name);
-            assert(layout.rootOnFirstLine && layout.first === startsOnFirstLine,
+            assert(layout.rootOnFirstLine && layout.first,
                 `Unexpected first-line layout at ${width}px: ${JSON.stringify(layout)}`);
             assert(layout.playAfterName && layout.clearOfSearch,
                 `Play must follow the final fragment clear of Search at ${width}px`);
         }
     },
 
+    /** A playable folder can start beside the last fragment of a wrapped parent
+     * and still use the next line for the rest of its name and Play. */
+    async "tree: Baroque Guitar uses the space after Baroque 1600s on a phone"(page) {
+        await page.setViewportSize({ width: 375, height: 720 });
+        const layout = await page.evaluate(() => {
+            const parent = "Classical - Baroque 1600s";
+            const album = "Julian Bream Baroque Guitar";
+            const tree = window._testTree;
+            tree.setDebugEnabled(false);
+            tree.setAccount("fixture", { id: "root", children: { [parent]: {
+                id: "genre", children: { [album]: { id: "album", children: { "Suite.mp3": { id: "track" } } } },
+            } } }, { displayName: "OneDrive" });
+            tree.setSelectedPath(["OnePlay Music", "fixture", parent, album]);
+            const names = document.querySelectorAll(".folder-trail .row-name");
+            const parentEnd = [...names[2].getClientRects()].at(-1);
+            const parts = [...names[3].getClientRects()];
+            const last = parts.at(-1);
+            const play = document.querySelector(".folder-trail .play-btn").getBoundingClientRect();
+            return {
+                sharesLine: Math.abs(parentEnd.top - parts[0].top) < 2 && parts[0].left > parentEnd.right,
+                complete: names[3].textContent === album && last.top > parts[0].top,
+                playFollows: play.left >= last.right && play.top <= last.top && play.bottom >= last.bottom,
+            };
+        });
+        assert(layout.sharesLine && layout.complete && layout.playFollows, JSON.stringify(layout));
+    },
+
     /** The root, wrapped folder and separators keep the same geometry while
      * sync and selection repurpose the gap after OnePlay. */
     async "tree: Comedy Offline aligns across sync and Select"(page) {
-        await page.setViewportSize({ width: 494, height: 700 });
+        // Leave room for the second chevron, but not the first word of the next folder.
+        await page.setViewportSize({ width: 465, height: 700 });
         const geometry = () => page.evaluate(() => {
             const rects = selector => Array.from(document.querySelectorAll(selector), el => {
                 const range = document.createRange();

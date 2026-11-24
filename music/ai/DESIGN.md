@@ -70,7 +70,7 @@ Icons/buttons:
 - ⟳ to the left of a track shows that we're currently loading this track to start playing it.
 - > to the left of a track shows it is currently playing, or is the currently selected playback folder
 
-Children share a left margin at every depth. Their full names wrap across as many lines as needed and the list scrolls vertically. A breadcrumb starting at the left margin gets one line. A breadcrumb starting partway across can also use the next line, after which its name is ellipsized. The current folder can start on the remaining line when its name (up to 10em), a nonbreaking space and Play fit clear of Search. Otherwise it starts a fresh line. Play follows the last visible part of the name.
+Children share a left margin at every depth. Their full names wrap across as many lines as needed and the list scrolls vertically. A breadcrumb starting at the left margin gets one line. A breadcrumb starting partway across can also use the next line, after which its name is ellipsized. The current folder wraps by the same rule. Play stays with the last visible part of the name and clears Search.
 
 Navigating the hierarchy (clicking a folder, clicking a breadcrumb) must be animated. Rows that persist across the transition slide from their old position to their new position; new children fade in. This uses the FLIP technique (First, Last, Invert, Play). Without animation, navigation feels disorienting — the user loses spatial context.
 

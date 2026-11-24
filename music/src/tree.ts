@@ -867,40 +867,23 @@ export function createTree(
     /** Fit only the ancestor trail. The browser chooses word breaks, including
      * splits within filenames. A partial first line earns one continuation. */
     function fitBreadcrumbNames(): void {
-        const width = trail.clientWidth;
-        if (!width) return; // ResizeObserver will fit it when the tree becomes visible.
+        if (!trail.clientWidth) return; // ResizeObserver will fit it when the tree becomes visible.
         const playTail = trail.querySelector<HTMLElement>('.play-tail');
         if (playTail) playTail.style.lineHeight = '';
         const style = getComputedStyle(trail);
         const left = trail.getBoundingClientRect().left + parseFloat(style.paddingLeft);
         const lineHeight = parseFloat(style.lineHeight);
-        const right = left + width - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
-        const searchBounds = search.getBoundingClientRect();
-        const beforeSearch = searchBounds.left - parseFloat(getComputedStyle(search).marginLeft);
         for (const crumb of trail.querySelectorAll<HTMLElement>('.crumb')) {
             const name = crumb.querySelector<HTMLElement>('.row-name')!;
             const full = name.title;
             name.textContent = full;
-            const lineBreak = crumb.previousElementSibling;
-            if (lineBreak instanceof HTMLBRElement) lineBreak.hidden = true;
             // Bidi runs and badges can yield several rectangles on one line.
             // The inline box height increases by one line-height per wrap.
             const first = crumb.getClientRects()[0];
             if (!first) continue;
             const oneLine = first.height + 1;
             // The tap area reaches into the preceding gap. Wrap by the text edge.
-            const nameLeft = name.getClientRects()[0].left;
-            let startsAtLeft = nameLeft <= left + 1;
-            // A short current name can use the remaining space. A long one
-            // starts on a fresh line if less than 10em of text would be visible.
-            if (lineBreak instanceof HTMLBRElement && crumb.getBoundingClientRect().height > oneLine) {
-                const end = first.top + first.height / 2 < searchBounds.bottom ? beforeSearch : right;
-                const tailWidth = crumb.querySelector<HTMLElement>('.play-tail')!.getBoundingClientRect().width;
-                if (end - nameLeft < 10 * parseFloat(style.fontSize) + tailWidth) {
-                    lineBreak.hidden = false;
-                    startsAtLeft = true;
-                }
-            }
+            const startsAtLeft = name.getClientRects()[0].left <= left + 1;
             const maxHeight = oneLine + (startsAtLeft ? 0 : lineHeight);
             if (crumb.getBoundingClientRect().height <= maxHeight) continue;
             // Keep the longest grapheme prefix that fits with its ellipsis,
@@ -919,6 +902,7 @@ export function createTree(
         // Only that final line needs extra leading; text widths stay the same.
         if (playTail) {
             const play = playTail.firstElementChild!.getBoundingClientRect();
+            const searchBounds = search.getBoundingClientRect();
             const overlap = searchBounds.bottom - play.top;
             if (overlap > 0 && play.right > searchBounds.left && play.left < searchBounds.right) {
                 playTail.style.lineHeight = (lineHeight + 2 * Math.ceil(overlap)) + 'px';
@@ -1011,13 +995,7 @@ export function createTree(
         trail.classList.toggle('selecting', selectModeActive);
         trail.replaceChildren(search, breadcrumbRows[0]);
         for (const crumb of breadcrumbRows.slice(1)) {
-            trail.append(' ');
-            if (crumb.querySelector('.play-btn')) {
-                const lineBreak = document.createElement('br');
-                lineBreak.hidden = true;
-                trail.appendChild(lineBreak);
-            }
-            trail.appendChild(crumb);
+            trail.append(' ', crumb);
         }
         breadcrumbsEl.replaceChildren(trail);
         fitBreadcrumbNames();

@@ -477,6 +477,7 @@ async function configureStartupScenario(page, options) {
                 }
                 if (url.includes("/v1.0/me/drive/special/music?")
                     && url.includes("$select=name,id,cTag,eTag,size,lastModifiedDateTime,folder")) {
+                    window._testMusicRootRequestCache = new Request(input, init).cache;
                     return Promise.resolve(new Response(JSON.stringify({
                         id: "startup-test-music-root-id",
                         name: "Music",

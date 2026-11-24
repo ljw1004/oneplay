@@ -20,6 +20,9 @@
 - **Treat design-doc silence as "no."** Do not invent un-specified behavior; document any new behavior explicitly.
 - **Look for existing code first**. If adding something, can you re-use existing code? or cleanly refactor existing code to serve the new purpose?
 - **Be happy to refactor**. As a good engineer you seek out opportunities to improve the health of the codebase, and are eager to do them.
+- **Keep a narrow fix local.** When two existing calls need the same request option, add it at both call sites. Extract a helper when the fix requires shared logic or the user asks for the refactor.
+- **Preserve the reasoning in existing comments.** Explanations of invariants, propagation, and recovery are part of the design record. If a sentence needs correction for the task, edit that sentence and preserve the surrounding rationale.
+- **Give surprising options a brief reason at each use.** One line beside each `cache: 'no-store'` explains what a future maintainer could otherwise miss: the folder ETag can stay the same while its recursive size changes.
 
 ## Architecture and refactorability
 
@@ -41,6 +44,7 @@
 
 ## Network and reliability
 
+- **Name who makes each decision in a diagnosis.** For HTTP revalidation, the browser stores the ETag and sends `If-None-Match`, the server decides whether to return 304, the browser supplies the saved body, and the app compares the size. Say which steps the device log shows and which were reproduced separately.
 - **Request only OAuth scopes the product actually uses.** Extra scopes add consent friction and policy risk.
 - **HTTP body reads are fallible I/O.** `response.text()`/`response.json()` can fail after status is known; log status and parse stage explicitly.
 - **Classify failures by permanence.** Retry transient transport failures; avoid destructive state transitions on 5xx/network faults.
@@ -56,6 +60,7 @@
 
 ## Graph/OneDrive API behavior
 
+- **Bypass the HTTP cache when probing a folder's recursive size.** Graph can keep the folder's HTTP ETag after a descendant changes size. A browser revalidating with that tag can receive a 304 and reuse the old JSON. Use `cache: 'no-store'` for these metadata probes.
 - **Graph batch cache uploads may require base64-as-`text/plain`.** Some endpoints mishandle batch `application/json` request bodies.
 - **Graph batch `:/content` responses can require manual redirect follow.** Treat 302 as expected and fetch the redirect URL explicitly.
 - **Some Graph batch JSON payloads arrive as encoded strings.** Decode and parse defensively rather than assuming direct object JSON.
@@ -148,6 +153,7 @@
 
 ## Testing and Playwright practice
 
+- **Reproduce the user's starting state.** For a refresh bug on a returning device, seed the old response and index, then use the same Refresh button. A fresh sign-in exercises first-time indexing and can hide the failure.
 - **Avoid `networkidle` for apps with continuous background traffic.** Use structural readiness checks/log polling instead.
 - **Run short timeout-based probes before full suites.** Early failure clustering saves long waits.
 - **Inspect test logs incrementally during long runs.** Don't wait for full completion to discover systemic failures.

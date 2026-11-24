@@ -442,6 +442,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         const musicR = await deps.auth.fetch(
             'https://graph.microsoft.com/v1.0/me/drive/special/music?$select=name,id,cTag,eTag,size,lastModifiedDateTime,folder',
             false,
+            { cache: 'no-store' }, // Recursive size can change without a new folder ETag.
         );
         if (!musicR.ok) {
             const text = await musicR.text().catch(() => '');
@@ -520,6 +521,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
                 const r = await deps.auth.fetch(
                     `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(share.driveId)}/items/${encodeURIComponent(share.rootItemId)}?$select=name,id,cTag,eTag,size,lastModifiedDateTime,folder`,
                     false,
+                    { cache: 'no-store' }, // Recursive size can change without a new folder ETag.
                 );
                 const durationMs = Date.now() - startedAt;
                 if (!r.ok) {

@@ -114,6 +114,7 @@ module.exports = {
             const logs = Array.isArray(window.__ONEPLAY_MUSIC_LOGS) ? window.__ONEPLAY_MUSIC_LOGS : [];
             return {
                 hasIndexProgress: !!document.querySelector("#status .index-progress"),
+                rootRequestCache: window._testMusicRootRequestCache,
                 hasStartupError: !!document.querySelector("#status .startup-error"),
                 hasDeadlineExceeded: logs.some((entry) =>
                     typeof entry.message === "string" && entry.message.startsWith("startup: deadline exceeded (")),
@@ -121,6 +122,8 @@ module.exports = {
             };
         });
         assert(state.hasIndexProgress, "Expected indexing progress UI to remain visible after startup deadline window");
+        assert(state.rootRequestCache === "no-store",
+            "A saved folder ETag can validate a stale recursive size. The root probe must bypass the HTTP cache.");
         assert(!state.hasStartupError, "Did not expect startup error while first-time indexing is in progress");
         assert(!state.hasDeadlineExceeded, "Did not expect startup deadline exceeded log during first-time indexing");
         assert(!state.hasCompleteDeadline, "Did not expect startup complete: deadline during first-time indexing");

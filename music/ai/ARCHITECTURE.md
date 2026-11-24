@@ -137,6 +137,10 @@ of all descendant files. If any file changes anywhere in a subtree, the `size`
 changes propagate up. Comparing cached `size` against live `size` answers "has
 anything changed?" without traversal. This is how we know when to re-index.
 
+The primary and shared-root probes use `cache: 'no-store'` to obtain that
+live size. Graph can return 304 for a folder's old ETag even when its
+recursive byte count has changed.
+
 The index is stored in three places:
 1. **IndexedDB** (`index:{driveId}`) — for instant offline startup.
 2. **OneDrive App folder** — per-folder cache files for incremental re-indexing.

@@ -150,6 +150,7 @@
 - **Derive flags from existing data instead of threading redundant booleans through call chains.**
 - **Write optional-chain conditions in forms TypeScript can narrow correctly.**
 - **Test async engines with state-change callbacks, not arbitrary sleeps.**
+- **Preserve arithmetic order when rounding selects between discrete outcomes.** An algebraically equivalent conversion can move an exact half-turn across a floating-point rounding boundary and reverse a wheel seek. Test the actual pointer coordinates and resulting media position.
 - **DI test stubs for expected side effects should sink calls, not throw.**
 - **Test-only dependency/global overrides must be explicitly named and idempotent.**
 - **If test state is user-dependent, add deterministic data hooks instead of assuming empty real accounts.**

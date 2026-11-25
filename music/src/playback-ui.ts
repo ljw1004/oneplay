@@ -8,17 +8,24 @@
  *
  * Non-scope:
  * - Playback policy decisions and track selection.
- * - Storage/network/media-session side effects beyond direct UI interactions.
+ * - Reading or controlling the media element.
  */
-import { log, logCatch } from './logger.js';
+import { log } from './logger.js';
 import { type PlaybackMode } from './playback.js';
 
+/** A wheel release is valid only for the play on which the pointer went down. */
+interface ScrubGesture {
+    readonly startTime: number;
+    readonly isCurrent: () => boolean;
+    /** Seek, apply the press-time play intent and rearm the sleep timer if this play still owns the gesture. */
+    readonly commitScrubIfCurrent: (seconds: number) => void;
+}
+
 export interface PlaybackUiDeps {
-    readonly audioEl: HTMLAudioElement;
     readonly footerEl: HTMLElement;
     readonly getMode: () => PlaybackMode;
-    readonly getPhase: () => 'loading' | 'loaded';
-    readonly getAsyncCounter: () => number;
+    readonly getDuration: () => number | undefined;
+    readonly onScrubStart: () => ScrubGesture | undefined;
     readonly onModeCycleClick: () => void;
     readonly onExpandedChange: (expanded: boolean) => void;
     readonly onChevronClick: () => void;
@@ -27,8 +34,6 @@ export interface PlaybackUiDeps {
     readonly onPrev: () => void;
     readonly onNext: () => void;
     readonly onSeekBy: (delta: number) => void;
-    readonly onCancelSeekDebounce: () => void;
-    readonly onRearmTimerFromScrub: () => void;
 }
 
 export interface PlaybackUiController {
@@ -57,32 +62,32 @@ export function timeString(seconds: number): string {
         : `${mins}:${String(secs).padStart(2, '0')}`;
 }
 
-/**
- * Classifies a pointer event's position relative to the scrubber shell center.
- * Returns ['inside' | 'wheel' | 'outside', rawAngle] where rawAngle is
- * the angle in radians from center (atan2). The wheel zone is determined
- * dynamically from the average radius of the four edge buttons.
- */
-function radiusAndAngleForEvent(shell: HTMLElement, event: { clientX: number; clientY: number }): ['inside' | 'wheel' | 'outside', number] {
+/** The captured pointer only needs its angle. Measure button geometry only for a hit test. */
+function wheelPosition(shell: HTMLElement, event: PointerEvent | MouseEvent) {
     const rect = shell.getBoundingClientRect();
     const centerX = rect.left + rect.width / 2;
     const centerY = rect.top + rect.height / 2;
-    const radius = Math.hypot(event.clientX - centerX, event.clientY - centerY);
-    const angle = Math.atan2(event.clientY - centerY, event.clientX - centerX);
-    const wheelButtons = Array.from(shell.querySelectorAll<HTMLButtonElement>('.scrubber-edge-button'));
-    const [buttonRadius] = wheelButtons.reduce(([avg, count], b) => {
-        const bRect = b.getBoundingClientRect();
-        const r = Math.hypot(bRect.left + bRect.width / 2 - centerX, bRect.top + bRect.height / 2 - centerY);
-        return [(avg * count + r) / (count + 1), count + 1];
-    }, [0, 0]);
-    const wheelThickness = Math.max(Math.min(rect.width - buttonRadius * 2, 60), 40);
-    const radiusType = radius < buttonRadius - wheelThickness / 2 ? 'inside'
-        : radius > buttonRadius + wheelThickness / 2 ? 'outside' : 'wheel';
-    return [radiusType, angle];
+    const x = event.clientX - centerX;
+    const y = event.clientY - centerY;
+    return {
+        angle: Math.atan2(y, x),
+        getZone() {
+            const radius = Math.hypot(x, y);
+            const buttons = Array.from(shell.querySelectorAll<HTMLButtonElement>('.scrubber-edge-button'));
+            const buttonRadius = buttons.reduce((average, button, index) => {
+                const r = button.getBoundingClientRect();
+                const radius = Math.hypot(r.left + r.width / 2 - centerX, r.top + r.height / 2 - centerY);
+                return (average * index + radius) / (index + 1);
+            }, 0);
+            const wheelThickness = Math.max(Math.min(rect.width - buttonRadius * 2, 60), 40);
+            return radius < buttonRadius - wheelThickness / 2 ? 'inside'
+                : radius > buttonRadius + wheelThickness / 2 ? 'outside' : 'wheel';
+        },
+    };
 }
 
 export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
-    const { footerEl, audioEl } = deps;
+    const { footerEl } = deps;
 
     // SVG indicator (chevron > when loaded, spinner ⟳ when loading)
     const indicatorSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -208,15 +213,7 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
         expanded = value;
         footerEl.classList.toggle('expanded', value);
         expansion.style.maxHeight = value ? `${expansion.scrollHeight}px` : '0';
-        if (value) {
-            modeLabel.textContent = deps.getMode();
-            if (deps.getPhase() !== 'loading') {
-                const duration = audioEl.duration;
-                if (audioEl.readyState >= HTMLMediaElement.HAVE_METADATA && Number.isFinite(duration) && duration > 0) {
-                    scrubberTime.textContent = `${timeString(audioEl.currentTime)} / ${timeString(duration)}`;
-                }
-            }
-        }
+        if (value) modeLabel.textContent = deps.getMode();
         deps.onExpandedChange(value);
     };
 
@@ -301,7 +298,7 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
         const inShellArea = e.clientX >= shellRect.left && e.clientX <= shellRect.right
             && e.clientY >= shellRect.top && e.clientY <= shellRect.bottom;
         if (inShellArea) {
-            const [zone] = radiusAndAngleForEvent(scrubberShell, e);
+            const zone = wheelPosition(scrubberShell, e).getZone();
             if (zone === 'wheel') return;
         }
         expansionSwipeStartY = e.clientY;
@@ -356,19 +353,19 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
 
     // -- Scrubber interaction ------------------------------------------------
 
-    let scrubPointerId: number | undefined;
-    let scrubSessionId = 0;
-    let scrubStartSrc = '';
-    let scrubWasPlaying = false;
-    let scrubRawStartAngle = 0;
-    let scrubLastDelta = 0;
-    let scrubStartTime = 0;
-    let scrubLastTime = 0;
+    let scrub: {
+        pointerId: number;
+        gesture: ScrubGesture;
+        startAngle: number;
+        previewTime: number;
+    } | undefined;
 
+    /** Cancellation only dismisses the thumb. As with the original wheel, the next
+     * media update or reopening repaints the time, even when playback is paused. */
     const endScrub = (pointerId: number): void => {
-        if (pointerId !== scrubPointerId) return;
+        if (pointerId !== scrub?.pointerId) return;
+        scrub = undefined;
         if (scrubberShell.hasPointerCapture(pointerId)) scrubberShell.releasePointerCapture(pointerId);
-        scrubPointerId = undefined;
         scrubberThumb.classList.add('fading');
         scrubberThumb.addEventListener('transitionend', () => {
             if (scrubberThumb.classList.contains('fading')) {
@@ -386,70 +383,49 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
 
     scrubberShell.addEventListener('pointerdown', (e) => {
         if (e.button !== 0) return;
-        const duration = audioEl.duration;
-        if (!(Number.isFinite(duration) && duration > 0)) return;
-        const [zone, rawAngle] = radiusAndAngleForEvent(scrubberShell, e);
-        if (zone !== 'wheel') return;
+        const position = wheelPosition(scrubberShell, e);
+        if (position.getZone() !== 'wheel') return;
+        const gesture = deps.onScrubStart();
+        if (!gesture) return;
         e.stopPropagation();
-        deps.onCancelSeekDebounce();
         scrubberShell.setPointerCapture(e.pointerId);
-        scrubPointerId = e.pointerId;
-        scrubSessionId = deps.getAsyncCounter();
-        scrubStartSrc = audioEl.src;
-        scrubWasPlaying = !audioEl.paused;
-        scrubRawStartAngle = rawAngle;
-        scrubLastDelta = 0;
-        scrubStartTime = audioEl.currentTime;
-        scrubLastTime = scrubStartTime;
+        scrub = { pointerId: e.pointerId, gesture, startAngle: position.angle, previewTime: gesture.startTime };
         scrubberThumb.classList.remove('fading');
         scrubberThumb.removeAttribute('hidden');
         syncThumbGeometry();
-        setThumbAngle(rawAngle);
+        setThumbAngle(position.angle);
     });
 
     scrubberShell.addEventListener('pointermove', (e) => {
-        if (e.pointerId !== scrubPointerId) return;
-        if (scrubSessionId !== deps.getAsyncCounter() || scrubStartSrc !== audioEl.src) {
+        if (!scrub || e.pointerId !== scrub.pointerId) return;
+        if (!scrub.gesture.isCurrent()) {
             endScrub(e.pointerId);
             return;
         }
-        const duration = audioEl.duration;
-        if (!(Number.isFinite(duration) && duration > 0)) return;
-        const [, rawAngle] = radiusAndAngleForEvent(scrubberShell, e);
-        const baseAngleDelta = rawAngle - scrubRawStartAngle;
-        const angleDelta = baseAngleDelta + Math.round((scrubLastDelta - baseAngleDelta) / (Math.PI * 2)) * Math.PI * 2;
-        const desiredTime = scrubStartTime + (angleDelta / (Math.PI * 2)) * 216;
-        scrubLastTime = Math.max(0, Math.min(duration, desiredTime));
-        scrubLastDelta = (scrubLastTime - scrubStartTime) / 216 * Math.PI * 2;
-        scrubberTime.textContent = `${timeString(scrubLastTime)} / ${timeString(duration)}`;
-        setThumbAngle(scrubLastDelta + scrubRawStartAngle);
+        const duration = deps.getDuration();
+        if (duration === undefined) return;
+        const { angle: rawAngle } = wheelPosition(scrubberShell, e);
+        // Keep the conversion order: at exactly half a turn, rounding decides
+        // which way the drag wraps and can change the seek by 216 seconds.
+        const lastDelta = (scrub.previewTime - scrub.gesture.startTime) / 216 * Math.PI * 2;
+        const baseAngleDelta = rawAngle - scrub.startAngle;
+        const angleDelta = baseAngleDelta + Math.round((lastDelta - baseAngleDelta) / (Math.PI * 2)) * Math.PI * 2;
+        const desiredTime = scrub.gesture.startTime + (angleDelta / (Math.PI * 2)) * 216;
+        scrub.previewTime = Math.max(0, Math.min(duration, desiredTime));
+        scrubberTime.textContent = `${timeString(scrub.previewTime)} / ${timeString(duration)}`;
+        setThumbAngle(scrub.startAngle + (scrub.previewTime - scrub.gesture.startTime) / 216 * Math.PI * 2);
     });
 
     scrubberShell.addEventListener('pointerup', (e) => {
-        if (e.pointerId !== scrubPointerId) return;
-        if (scrubSessionId === deps.getAsyncCounter() && scrubStartSrc === audioEl.src) {
-            const duration = audioEl.duration;
-            if (Number.isFinite(duration) && duration > 0) {
-                const isNearEnd = Math.abs(duration - scrubLastTime) < 0.1;
-                if (isNearEnd) {
-                    audioEl.currentTime = duration - 0.02;
-                    audioEl.pause();
-                } else {
-                    audioEl.currentTime = scrubLastTime;
-                    if (scrubWasPlaying && audioEl.paused) {
-                        audioEl.play().catch(logCatch('play-on-scrub-release'));
-                    }
-                }
-            }
-            deps.onRearmTimerFromScrub();
-        }
+        if (!scrub || e.pointerId !== scrub.pointerId) return;
+        scrub.gesture.commitScrubIfCurrent(scrub.previewTime);
         endScrub(e.pointerId);
     });
     scrubberShell.addEventListener('pointercancel', (e) => endScrub(e.pointerId));
     scrubberShell.addEventListener('lostpointercapture', (e) => endScrub(e.pointerId));
 
     scrubberShell.addEventListener('click', (e) => {
-        const [zone] = radiusAndAngleForEvent(scrubberShell, e);
+        const zone = wheelPosition(scrubberShell, e).getZone();
         if (zone !== 'inside') return;
         e.stopPropagation();
         const flash = deps.onCenterTapToggle();
@@ -477,6 +453,6 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
 
         setExpanded,
         isExpanded: () => expanded,
-        isScrubbing: () => scrubPointerId !== undefined,
+        isScrubbing: () => scrub !== undefined,
     };
 }

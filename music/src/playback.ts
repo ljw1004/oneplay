@@ -384,9 +384,22 @@ export function createPlayback(
         playNext(trackList[idx], idx, true);
     }
 
-    const seekBy = (delta: number): void => {
+    /** Streams and unloaded sources may have an infinite or unknown duration. */
+    const getDuration = (): number | undefined => {
         const duration = audioEl.duration;
-        if (!(Number.isFinite(duration) && duration > 0)) return;
+        return Number.isFinite(duration) && duration > 0 ? duration : undefined;
+    };
+
+    /** Sample live timing when the wheel opens or receives a media time update. */
+    const showCurrentTime = (): void => {
+        const duration = getDuration();
+        scrubberTimeEl.textContent = audioEl.readyState >= HTMLMediaElement.HAVE_METADATA && duration !== undefined
+            ? `${timeString(audioEl.currentTime)} / ${timeString(duration)}` : '';
+    };
+
+    const seekBy = (delta: number): void => {
+        const duration = getDuration();
+        if (duration === undefined) return;
         const base = localSeekTarget ?? audioEl.currentTime;
         const target = Math.max(0, Math.min(duration, base + delta));
         localSeekTarget = target;
@@ -402,11 +415,36 @@ export function createPlayback(
     // -- UI wiring -----------------------------------------------------------
     // playback-ui owns DOM and gesture mechanics; this module supplies policy callbacks.
     const ui: PlaybackUiController = createPlaybackUi({
-        audioEl,
         footerEl,
         getMode: () => playbackMode,
-        getPhase: () => phase,
-        getAsyncCounter: () => asyncCounter,
+        getDuration,
+        onScrubStart: () => {
+            if (getDuration() === undefined) return undefined;
+            cancelSeekDebounce();
+            const counter = asyncCounter;
+            const src = audioEl.src;
+            const wasPlaying = !audioEl.paused;
+            // A replay can reuse the same URL, and a source can change within a play.
+            const isCurrent = () => asyncCounter === counter && audioEl.src === src;
+            return {
+                startTime: audioEl.currentTime,
+                isCurrent,
+                commitScrubIfCurrent(seconds) {
+                    if (!isCurrent()) return;
+                    const duration = getDuration();
+                    if (duration !== undefined) {
+                        if (Math.abs(duration - seconds) < 0.1) {
+                            audioEl.currentTime = duration - 0.02;
+                            audioEl.pause();
+                        } else {
+                            audioEl.currentTime = seconds;
+                            if (wasPlaying && audioEl.paused) audioEl.play().catch(logCatch('play-on-scrub-release'));
+                        }
+                    }
+                    rearmTimerFromUserInteractionIfPlaying('scrub');
+                },
+            };
+        },
         onModeCycleClick: () => {
             const prevMode = playbackMode;
             const currentIdx = MODES.indexOf(playbackMode);
@@ -427,7 +465,10 @@ export function createPlayback(
             savePlaybackStateFireAndForget();
             saveMmPlayback();
         },
-        onExpandedChange: (expanded) => view.onExpandedChange(expanded),
+        onExpandedChange: (expanded) => {
+            if (expanded && phase !== 'loading' && !ui.isScrubbing()) showCurrentTime();
+            view.onExpandedChange(expanded);
+        },
         onChevronClick: () => view.onChevronClick(),
         onFooterPlayPauseClick: () => {
             if (audioEl.paused) doPlay('play-on-playpause');
@@ -446,8 +487,6 @@ export function createPlayback(
         onPrev: doPrev,
         onNext: doNext,
         onSeekBy: seekBy,
-        onCancelSeekDebounce: cancelSeekDebounce,
-        onRearmTimerFromScrub: () => rearmTimerFromUserInteractionIfPlaying('scrub'),
     });
 
     const {
@@ -734,10 +773,7 @@ export function createPlayback(
             updatePositionState();
             return;
         }
-        const duration = audioEl.duration;
-        scrubberTimeEl.textContent = audioEl.readyState < HTMLMediaElement.HAVE_METADATA || !(Number.isFinite(duration) && duration > 0)
-            ? ''
-            : `${timeString(audioEl.currentTime)} / ${timeString(duration)}`;
+        showCurrentTime();
         updatePositionState();
     });
 

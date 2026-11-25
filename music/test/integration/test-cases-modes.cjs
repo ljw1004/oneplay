@@ -149,9 +149,15 @@ module.exports = {
         await setPlaybackMode(page, "timer");
 
         await setFakeNow(page, baseNow + 14 * 60 * 1000);
+        // The playback sequence changes at selection and at loadeddata. Wait
+        // for the new media and its play event before advancing the test clock.
+        const waitForPlayingTrack = () => page.waitForFunction(() =>
+            window._testPlayback.getInfo().phase === 'loaded' && !document.querySelector('#player').paused
+            && document.querySelector('.footer-playpause').textContent.includes('⏸'), undefined, { timeout: 8000 });
         const nextSeq = await getTestSeq(page, "_testPlaybackSeq");
         await page.locator(".scrubber-edge-button.right").click();
         await waitForPlaybackReady(page, nextSeq);
+        await waitForPlayingTrack();
 
         await setFakeNow(page, baseNow + 20 * 60 * 1000);
         await dispatchAudioTimeupdate(page);
@@ -165,6 +171,7 @@ module.exports = {
         const prevSeq = await getTestSeq(page, "_testPlaybackSeq");
         await page.locator(".scrubber-edge-button.left").click();
         await waitForPlaybackReady(page, prevSeq);
+        await waitForPlayingTrack();
 
         await setFakeNow(page, baseNow + 34 * 60 * 1000);
         await dispatchAudioTimeupdate(page);
@@ -277,18 +284,17 @@ module.exports = {
         await setFakeNow(page, baseNow);
         await setPlaybackMode(page, "timer");
 
-        await page.locator("#footer .footer-playpause").click(); // pause
-        await page.waitForFunction(() => {
-            const audio = document.getElementById("player");
-            return audio instanceof HTMLAudioElement && audio.paused;
-        }, { timeout: 3000 });
+        // The element's paused flag flips before its queued media event. Wait for
+        // the event-driven footer so the timer observes each action at the intended fake time.
+        const toggle = page.locator("#footer .footer-playpause");
+        await toggle.click();
+        await page.waitForFunction(() => document.querySelector(".footer-playpause").textContent.includes("▶"),
+            undefined, { timeout: 3000 });
 
         await setFakeNow(page, baseNow + 20 * 60 * 1000);
-        await page.locator("#footer .footer-playpause").click(); // resume
-        await page.waitForFunction(() => {
-            const audio = document.getElementById("player");
-            return audio instanceof HTMLAudioElement && !audio.paused;
-        }, { timeout: 3000 });
+        await toggle.click();
+        await page.waitForFunction(() => document.querySelector(".footer-playpause").textContent.includes("⏸"),
+            undefined, { timeout: 3000 });
 
         await setFakeNow(page, baseNow + 21 * 60 * 1000);
         await dispatchAudioTimeupdate(page);

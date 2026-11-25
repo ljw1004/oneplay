@@ -35,7 +35,7 @@ persistence live in domain modules or are orchestrated by `src/index.ts`.
 - **src/tree.ts** — Renders the hierarchical folder/file view with breadcrumb navigation. The only module that touches `#breadcrumbs` and `#children` DOM elements.
 - **src/playback.ts** — Playback orchestrator. Owns playback state machine and audio element side effects.
   - **src/playback-engine.ts** — Pure functional-style helpers for playback policy/cache. Includes selection/timer/media helpers plus download URL cache and near-end prefetch state machine.
-  - **src/playback-ui.ts** — Footer/expansion UI component. Owns footer DOM construction, gestures, and emits playback intent callbacks.
+  - **src/playback-ui.ts** — Footer/expansion UI component. Owns the footer DOM, pointer capture and drag preview. The player samples the media clock on expansion and gives each drag a seek callback bound to the play counter and source at press. A track change discards the preview on movement and invalidates release even if the pointer stayed still.
 - **src/favorites.ts** — Data model for shortcuts (☆) and playlists (♫). Handles persistence to IndexedDB + OneDrive, healing broken references, cycle detection.
 - **src/tracks.ts** — Track list computation. Traverses the index tree (physical) or favorites graph (logical) to produce ordered lists of track paths. Used by both playback and downloads.
 - **src/select.ts** — Select mode state machine/orchestrator. Owns selection mode transitions and action-bar flow.

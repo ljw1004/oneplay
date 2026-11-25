@@ -20,6 +20,138 @@ function silentWav() {
 }
 
 module.exports = {
+    /** Drive the native drawer through the snapshots from a cold Prev, including the gaps
+     * between required reads. The fake clock makes a short wait and a visible wait distinct. */
+    async 'wheel: native spinner stays through successive reads until playback'(page) {
+        const url = globalThis.__ONEPLAY_TEST_URL;
+        await page.route(url, route => route.fulfill({contentType: 'text/html', body: '<div id="footer"></div>'}));
+        await page.goto(url);
+        await page.clock.install({time: new Date('2026-01-01T00:00:00Z')});
+        await page.clock.pauseAt(new Date('2026-01-01T00:01:00Z'));
+        await page.evaluate(async () => {
+            const {attachNativePlayback} = await import('./dist/native-playback.js');
+            let reply = {sequence: 1, snapshot: {}};
+            const native = {state: {}, playback: async () => reply};
+            attachNativePlayback(native, document.querySelector('#footer'), info => { window.rowPhase = info?.phase; }, () => {}, () => {});
+            window.pushPlayback = (state, targetRevision) => {
+                reply = {sequence: reply.sequence + 1, snapshot: {state, targetRevision, item: 'occurrence', path: ['Satie', 'Track']}};
+                window.dispatchEvent(new CustomEvent('oneplay-playback', {detail: reply}));
+            };
+        });
+        const push = (state, target = 1) => page.evaluate(([s, r]) => window.pushPlayback(s, r), [state, target]);
+        const check = async loading => {
+            const indicators = await page.evaluate(() => [
+                window.rowPhase === 'loading',
+                document.querySelector('.footer-indicator').classList.contains('loading'),
+                document.querySelector('.scrubber-text').classList.contains('loading'),
+            ]);
+            assert.deepEqual(indicators, [loading, loading, loading]);
+        };
+        await push('buffering');
+        await page.clock.runFor(249);
+        await check(false);
+        await push('positioning'); // A brief miss during otherwise local setup.
+        await page.clock.runFor(500);
+        await check(false);
+        await push('buffering');
+        await page.clock.runFor(250);
+        await check(true);
+        // Swift can decline Prev at the start of the queue; its unchanged snapshot keeps this wait.
+        await page.locator('.scrubber-edge-button.left').evaluate(button => button.click());
+        await check(true);
+        for (const state of ['positioning', 'buffering', 'positioning']) {
+            await push(state);
+            await check(true);
+        }
+        await push('playing');
+        await check(false);
+        // Apply the same rule to a stall after playback has started. A native seek that
+        // preserves the occurrence gets a fresh target even when no web command was issued.
+        await push('buffering');
+        await page.clock.runFor(250);
+        await check(true);
+        await push('positioning', 2);
+        await page.clock.runFor(500);
+        await check(false);
+        for (const state of ['paused', 'ended', 'error']) {
+            await push('buffering', 2);
+            await page.clock.runFor(250);
+            await check(true);
+            await push(state, 2);
+            await check(false);
+        }
+    },
+    /** The outgoing row's geometry decides whether Next and ended may move the tree. */
+    async 'wheel: follow visible playback across rows and folders'(page) {
+        const url = globalThis.__ONEPLAY_TEST_URL;
+        await page.setViewportSize({width: 390, height: 844});
+        await page.route(url, route => route.fulfill({contentType: 'text/html', body:
+            '<link rel="stylesheet" href="index.css"><div id="tree-container"><div id="breadcrumbs"></div><div id="children"></div></div><audio id="player" muted></audio><div id="footer"></div>'}));
+        await page.route('**/wheel-test.wav', route => route.fulfill({contentType: 'audio/wav', body: silentWav()}));
+        await page.goto(url);
+        await page.evaluate(async () => {
+            const {createPlayback} = await import('./dist/playback.js');
+            const {createTree} = await import('./dist/tree.js');
+            const {createFavorites} = await import('./dist/favorites.js');
+            const root = ['OnePlay Music', 'drive'];
+            const album = id => ({id, children: Object.fromEntries(Array.from({length: 50}, (_, i) => {
+                const name = String(i).padStart(2, '0');
+                return [name, {id: id + name}];
+            }))});
+            const folder = {id: 'root', children: {A: album('A'), B: album('B')}};
+            const tree = createTree(document.querySelector('#tree-container'));
+            tree.setAccount('drive', folder, {driveId: 'drive', displayName: 'Music'});
+            tree.setFavorites(createFavorites({}, () => {}));
+            const media = URL.createObjectURL(await (await fetch('wheel-test.wav')).blob());
+            const player = createPlayback(document.querySelector('audio'), document.querySelector('#footer'),
+                async () => Response.json({'@microsoft.graph.downloadUrl': media}));
+            player.onPlaybackChange = tree.setPlaybackInfo;
+            const accounts = new Map([['drive', {driveId: 'drive', folder}]]);
+            await player.playFolder(root, accounts);
+            tree.setSelectedPath([...root, 'A']);
+            window.pick = name => player.playTrack([...root, 'A', name], accounts);
+            window.pick('25');
+            document.querySelector('.footer-gripper').click();
+            await Promise.all(document.querySelector('.expansion').getAnimations().map(a => a.finished));
+        });
+        const state = () => page.evaluate(() => {
+            const list = document.querySelector('#children');
+            const row = list.querySelector('.track-indicator')?.closest('.tree-row');
+            const r = row?.getBoundingClientRect(), l = list.getBoundingClientRect();
+            return {path: row && JSON.parse(row.dataset.path).slice(-2).join('/'), scroll: list.scrollTop,
+                visible: !!r && r.top >= l.top - 1 && r.bottom <= l.bottom + 1};
+        });
+        const next = () => page.locator('.scrubber-edge-button.right').click();
+        // Only the top three pixels of 25 are visible. Next should bring all of 26 into view.
+        await page.locator('#children').evaluate(list => {
+            const r = list.querySelector('.track-indicator').closest('.tree-row').getBoundingClientRect();
+            list.scrollTop += r.top - list.getBoundingClientRect().bottom + 3;
+        });
+        await next();
+        assert.equal((await state()).path, 'A/26');
+        assert.ok((await state()).visible, 'Next should fully reveal the row below the list');
+        // Browsing higher in the same folder, including when only the footer title is visible.
+        await page.locator('#children').evaluate(list => { list.scrollTop = 27; });
+        await next();
+        assert.equal((await state()).scroll, 27);
+        assert.equal((await state()).path, 'A/27');
+        // The queue crosses a folder boundary. Only follow it when the listener can see A/49.
+        const finishA = async visible => {
+            await page.evaluate(visible => {
+                window.pick('49');
+                document.querySelector('#children').scrollTop = visible ? 1e6 : 27;
+            }, visible);
+            await page.waitForFunction(() => document.querySelector('audio').readyState >= 2 && !!document.querySelector('audio').src);
+            await page.locator('audio').evaluate(audio => audio.dispatchEvent(new Event('ended')));
+            await page.waitForFunction(() => document.querySelector('.footer-title').textContent === '00');
+        };
+        await finishA(false);
+        assert.equal((await state()).scroll, 27);
+        assert.equal((await state()).path, undefined);
+        await finishA(true);
+        assert.equal((await state()).path, 'B/00');
+        assert.ok((await state()).visible);
+    },
     /** Exercise the real wheel, player and media element without account or timing dependencies. */
     async 'wheel: preview, release, cancellation and stale playback'(page) {
         const url = globalThis.__ONEPLAY_TEST_URL;

@@ -51,6 +51,8 @@ export interface IndexSyncDeps {
     readonly startupErrorMessage: string;
     readonly accountData: Map<string, { folder: MusicFolder; driveId: string }>;
     readonly getTree: () => TreeView | undefined;
+    readonly onShareAccessConfirmed?: (rootKey: string) => void;
+    readonly onPlaybackRootsChange?: () => void;
     readonly getPlayback: () => Playback | undefined;
     readonly getFavorites: () => Favorites | undefined;
     readonly getSelect: () => Select | undefined;
@@ -299,6 +301,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         const favorites = getFavorites();
         const playback = getPlayback();
         if (playback && favorites) playback.setContext(favorites, tree.getRoots());
+        deps.onPlaybackRootsChange?.();
         getSelect()?.setRoots(tree.getRoots());
         deps.invalidateSearchData();
         deps.runSearchAndPushIntoTree('share-roots');
@@ -501,7 +504,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
                 const durationMs = Date.now() - startedAt;
                 if (!stillConnected(share)) return { share, status: 'skipped' };
                 if (!r.ok) {
-                    if (native && r.status === 401 && r.headers.has('X-OnePlay-Account-Error')) {
+                    if (native && (r.status === 401 || (r.status === 403 && deps.auth.getEvidence() === 'evidence:signed-out'))) {
                         // MSAL lost the account. Keep this share's last permission state and cached tracks.
                         log(`share probe requires reconnect (${durationMs}ms, status=401)`);
                         return { share, status: 'failed' };
@@ -523,6 +526,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
                     return { share, status: 'denied' };
                 }
                 shares.setDeniedState(share.rootKey, undefined);
+                deps.onShareAccessConfirmed?.(share.rootKey);
                 log(`share probe ok: ${share.name} (${durationMs}ms)`);
                 return { share, status: 'ok', driveItem: item };
             } catch (e) {

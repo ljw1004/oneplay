@@ -15,11 +15,19 @@ final class MP3RangeDecoder {
     private var audio: AudioFileID?
     private var decoder: ExtAudioFileRef?
     private var nativeRate: Double = 44100
+    private var nextFrame: Int64 = 0
+    struct Length {
+        let frames: Int64
+        let estimated: Bool
+        static let unknown = Length(frames: 0, estimated: true)
+    }
+    private(set) var length = Length.unknown
+    private var pendingTail: AVAudioPCMBuffer?
     let format: AVAudioFormat
-    private(set) var frames: Int64 = 0
+    var frames: Int64 { length.frames }
     private(set) var hasDeclaredTiming = false
 
-    init(bytes: Int64, read: @escaping Read) throws {
+    init(bytes: Int64, knownLength: Length = .unknown, read: @escaping Read) throws {
         source = Source(bytes, read)
         guard let stereo = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2) else {
             throw PlaybackError("CD audio format unavailable")
@@ -49,41 +57,68 @@ final class MP3RangeDecoder {
         }
         try check(ExtAudioFileWrapAudioFileID(audio!, false, &decoder))
         var native = AudioStreamBasicDescription()
-        var length = UInt32(MemoryLayout.size(ofValue: native))
-        try check(ExtAudioFileGetProperty(decoder!, kExtAudioFileProperty_FileDataFormat, &length, &native))
+        var formatBytes = UInt32(MemoryLayout.size(ofValue: native))
+        try check(ExtAudioFileGetProperty(decoder!, kExtAudioFileProperty_FileDataFormat, &formatBytes, &native))
         guard native.mSampleRate > 0, (1...2).contains(native.mChannelsPerFrame) else {
             throw PlaybackError("Unsupported MP3 format")
         }
         nativeRate = native.mSampleRate
-        length = UInt32(MemoryLayout<Int64>.size)
-        try check(ExtAudioFileGetProperty(decoder!, kExtAudioFileProperty_FileLengthFrames, &length, &frames))
-        frames = Int64((Double(frames) * stereo.sampleRate / nativeRate).rounded())
+        // Asking ExtAudioFile for an exact length indexes every packet of an unindexed MP3.
+        // Its packet table, when present, already gives the playable length excluding encoder padding.
+        if !knownLength.estimated {
+            length = knownLength
+        } else if timing.mNumberValidFrames > 0, let valid = Int64(exactly: (Double(timing.mNumberValidFrames) * stereo.sampleRate / nativeRate).rounded()) {
+            length = Length(frames: valid, estimated: false)
+        } else {
+            length = Length(frames: estimatedFrames(), estimated: true)
+        }
         try check(ExtAudioFileSetProperty(decoder!, kExtAudioFileProperty_ClientDataFormat,
                                          UInt32(MemoryLayout<AudioStreamBasicDescription>.size), stereo.streamDescription))
     }
 
+    /// Core Audio refines this estimate as it sees ordinary playback packets.
+    private func estimatedFrames() -> Int64 {
+        var seconds: Double = 0
+        var length = UInt32(MemoryLayout.size(ofValue: seconds))
+        guard AudioFileGetProperty(audio!, kAudioFilePropertyEstimatedDuration, &length, &seconds) == noErr else { return 0 }
+        return max(0, Int64(exactly: (seconds * format.sampleRate).rounded()) ?? 0)
+    }
+
+    #if DEBUG
+    /// The explicit near-end audition needs a precise capture position even on unindexed recordings.
+    func exactFramesForAudition() throws -> Int64 {
+        var nativeFrames: Int64 = 0
+        var length = UInt32(MemoryLayout.size(ofValue: nativeFrames))
+        try check(ExtAudioFileGetProperty(decoder!, kExtAudioFileProperty_FileLengthFrames, &length, &nativeFrames))
+        guard let count = Int64(exactly: (Double(nativeFrames) * format.sampleRate / nativeRate).rounded()) else {
+            throw PlaybackError("Invalid MP3 duration")
+        }
+        return count
+    }
+    #endif
+
     /// Ask Apple's MP3 stream parser for a time-to-byte hint using only retained header bytes.
     /// This influences HTTP range sizing. ExtAudioFileSeek still positions the actual decoder.
-    static func estimatedSeekByte(seconds: Double, duration: Double, size: Int64, header: Data?) -> Int64 {
+    static func seekByte(seconds: Double, duration: Double, size: Int64, header: Data?) -> (offset: Int64, exact: Bool) {
         let fallback = Int64(exactly: (Double(size) * min(1, seconds / duration)).rounded(.down)) ?? size
         var parser: AudioFileStreamID?
         guard let header, !header.isEmpty,
               AudioFileStreamOpen(nil, { _,_,_,_ in }, { _,_,_,_,_ in }, kAudioFileMP3Type, &parser) == noErr,
-              let parser else { return fallback }
+              let parser else { return (fallback, false) }
         defer { AudioFileStreamClose(parser) }
         let status = header.withUnsafeBytes { AudioFileStreamParseBytes(parser, UInt32($0.count), $0.baseAddress!, []) }
         var format = AudioStreamBasicDescription()
         var length = UInt32(MemoryLayout.size(ofValue: format))
         guard status == noErr, AudioFileStreamGetProperty(parser, kAudioFileStreamProperty_DataFormat, &length, &format) == noErr,
               format.mFramesPerPacket > 0, let packet = Int64(exactly: (seconds * format.mSampleRate / Double(format.mFramesPerPacket)).rounded(.down))
-        else { return fallback }
+        else { return (fallback, false) }
         var start: Int64 = 0, offset: Int64 = 0
         var flags = AudioFileStreamSeekFlags()
         length = UInt32(MemoryLayout.size(ofValue: start))
         guard AudioFileStreamGetProperty(parser, kAudioFileStreamProperty_DataOffset, &length, &start) == noErr,
               AudioFileStreamSeek(parser, packet, &offset, &flags) == noErr,
-              start >= 0, start < size, offset >= 0, offset < size - start else { return fallback }
-        return start + offset
+              start >= 0, start < size, offset >= 0, offset < size - start else { return (fallback, false) }
+        return (start + offset, flags.isEmpty)
     }
 
     deinit {
@@ -98,12 +133,51 @@ final class MP3RangeDecoder {
 
     /// Cache misses resolve on the worker. The render thread only sees ready PCM.
     func decode(_ count: Int, at position: Int64? = nil) throws -> AVAudioPCMBuffer {
-        if let position { try check(ExtAudioFileSeek(decoder!, Int64((Double(position) * nativeRate / format.sampleRate).rounded()))) }
+        if let position {
+            guard let frame = Int64(exactly: (Double(position) * nativeRate / format.sampleRate).rounded()) else {
+                throw PlaybackError("Invalid seek position")
+            }
+            try check(ExtAudioFileSeek(decoder!, frame))
+        }
         var n = UInt32(count)
         guard let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: n) else { throw PlaybackError("PCM allocation failed") }
         pcm.frameLength = n
         try check(ExtAudioFileRead(decoder!, &n, pcm.mutableAudioBufferList))
         pcm.frameLength = n
+        nextFrame = (position ?? nextFrame) + Int64(n)
+        if length.estimated {
+            // Only samples actually decoded establish EOF. A seek past EOF can return zero immediately.
+            if n == 0 && position != nil { length = Length(frames: estimatedFrames(), estimated: true) }
+            else if n < count { length = Length(frames: nextFrame, estimated: false) }
+            else { length = Length(frames: max(nextFrame, estimatedFrames()), estimated: true) }
+        }
         return pcm
+    }
+
+    /// Keep enough unscheduled PCM for the 150 ms trailing trim and the 88-frame overlap.
+    /// Even if EOF falls exactly on a read boundary, the final buffer contains the real tail.
+    func decodePlaybackChunk(_ count: Int, at position: Int64?) throws -> (AVAudioPCMBuffer, final: Bool) {
+        let hold = 6615 + 88
+        let previous = position == nil ? pendingTail : nil
+        let requested = previous == nil ? count + hold : count
+        let fresh = try decode(requested, at: position)
+        let n = Int(fresh.frameLength)
+        let final = n < requested
+        pendingTail = final ? nil : fresh
+        if final && previous == nil { return (fresh, true) }
+        let head = previous == nil ? 0 : hold
+        let body = final ? n : n - hold
+        guard let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: UInt32(head + body)) else {
+            throw PlaybackError("PCM allocation failed")
+        }
+        pcm.frameLength = pcm.frameCapacity
+        for ch in 0..<Int(format.channelCount) {
+            let out = pcm.floatChannelData![ch]
+            if let previous {
+                out.update(from: previous.floatChannelData![ch] + (Int(previous.frameLength) - hold), count: hold)
+            }
+            out.advanced(by: head).update(from: fresh.floatChannelData![ch], count: body)
+        }
+        return (pcm, final)
     }
 }

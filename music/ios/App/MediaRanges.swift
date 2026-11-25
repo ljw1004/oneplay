@@ -95,6 +95,11 @@ final class MediaPool: @unchecked Sendable {
         }
     }
 
+    /// A UI hint while Graph confirms the version. Decoder reads always use the full versioned key.
+    func hasCachedAudio(drive: String, item: String) -> Bool {
+        lock.withLock { blocks.keys.contains { $0.file.drive == drive && $0.file.item == item } }
+    }
+
     /// Complete, aligned blocks only. An immutable Data returned to a decoder survives eviction.
     func store(_ data: Data, for file: File, at offset: Int64) {
         lock.withLock {
@@ -317,6 +322,16 @@ final class MediaRanges: @unchecked Sendable {
     final class Budget {
         fileprivate var charged = [Int: Int64]()
     }
+    /// The decoder can park beyond the early prefix for an entire audiobook. Scheduling
+    /// another chunk, reaching the join, or retiring the worker wakes it without polling.
+    final class SuccessorWindow {
+        let prefix: () -> Int64
+        let changed = DispatchSemaphore(value: 0)
+        private let join = DispatchGroup()
+        init(prefix: @escaping () -> Int64) { self.prefix = prefix; join.enter() }
+        var early: Bool { join.wait(timeout: .now()) == .timedOut }
+        func releaseAtJoin() { join.leave(); changed.signal() }
+    }
     static let limit: Int64 = 4_000_000
     static let block = 65_536
     // An ignored Range can put bytes in socket/TLS buffers before URLSession can reject the headers.
@@ -338,8 +353,10 @@ final class MediaRanges: @unchecked Sendable {
     private(set) var speculative: Bool
     private let budget: Budget
     let occurrence: Int
+    // Four blocks cover about 6.5 seconds at 320 kbit/s, plus a separate decoder tail probe.
+    static let openingPrefix = Int64(4 * block)
     static let wifiWindow: Int64 = 6_000_000
-    private let successorPrefix: (() -> Int64)?
+    private let successorWindow: SuccessorWindow?
     // A foreground range hint until the first PCM. The decoder still chooses its exact cursor.
     var meteredSeekByte: Int64 = 0
     private var lastReadEnd: Int64 = 0
@@ -352,15 +369,15 @@ final class MediaRanges: @unchecked Sendable {
     private let trace: (String) -> Void
     private let diagnostic: (String) -> Void
     private let renew: ((MediaLocation) throws -> MediaLocation)?
-    private let wifiOnly: (() throws -> Bool)?
     #if DEBUG
     private let signalDebug: () -> Void
     #endif
     private let awaitDemand: (() throws -> Void)?
     var onFirstBlockData: (() -> Void)?
+    var onDecoderWait: ((Bool) -> Void)?
 
     init(_ location: MediaLocation, drive: String = "", item: String = "", pool: MediaPool = MediaPool(),
-         budget: Budget = Budget(), occurrence: Int = 0, speculative: Bool, wifiOnly: (() throws -> Bool)? = nil, successorPrefix: (() -> Int64)? = nil,
+         budget: Budget = Budget(), occurrence: Int = 0, speculative: Bool, successorWindow: SuccessorWindow? = nil,
          signalDebug: @escaping () -> Void = {}, trace: @escaping (String) -> Void,
          diagnostic: @escaping (String) -> Void = { _ in }, awaitDemand: (() throws -> Void)? = nil, renew: ((MediaLocation) throws -> MediaLocation)? = nil) throws {
         guard location.size > 0, !location.etag.isEmpty, Self.allowed(location.url) else {
@@ -368,8 +385,7 @@ final class MediaRanges: @unchecked Sendable {
         }
         self.grant = location
         self.resource = location.url
-        self.wifiOnly = wifiOnly
-        self.successorPrefix = successorPrefix
+        self.successorWindow = successorWindow
         #if DEBUG
         self.signalDebug = signalDebug
         #endif
@@ -395,7 +411,10 @@ final class MediaRanges: @unchecked Sendable {
 
     deinit { cancel() }
 
-    func cancel() { lock.withLock { cancelled = true; tasks.forEach { $0.cancel() }; stopBackoff.signal() } }
+    func cancel() {
+        lock.withLock { cancelled = true; tasks.forEach { $0.cancel() }; stopBackoff.signal() }
+        successorWindow?.changed.signal()
+    }
 
     /// The decoder worker has finished issuing requests. Wait outside its playback lock for final metrics.
     func cancelAndDrain() { cancel(); transfers.wait() }
@@ -472,7 +491,7 @@ final class MediaRanges: @unchecked Sendable {
         request.setValue("bytes=\(bounds.lowerBound)-\(bounds.upperBound-1)", forHTTPHeaderField: "Range")
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         if let cdnTag, !cdnTag.hasPrefix("W/") { request.setValue(cdnTag, forHTTPHeaderField: "If-Match") }
-        if streams {
+        if streams || (speculative && bounds.count > Self.block) {
             response.publish = { [weak self] offset, bytes in
                 guard let self else { return }
                 self.lock.withLock {
@@ -524,7 +543,7 @@ final class MediaRanges: @unchecked Sendable {
         try extendWindow(from: lastReadEnd, to: lastReadEnd + min(bytes, file.size - lastReadEnd), wifiOnly: false)
     }
 
-    /// One forward transfer per reader, shared with demand. Successor read-ahead is Wi-Fi only.
+    /// Rolling forward transfers are shared with demand. Only unmetered Wi-Fi expands the successor window.
     func extendWindow(from start: Int64, to end: Int64, wifiOnly: Bool = true) throws {
         guard !grant.isRejected, !wifiOnly || pool.unmeteredWiFi(), end > start else { return }
         if let stream = forward {
@@ -548,6 +567,9 @@ final class MediaRanges: @unchecked Sendable {
 
     /// Keep one forward transfer. A distant decoder probe gets an independent small range on the same session.
     private func fetch(_ wanted: Range<Int64>) throws -> Data {
+        // Only the decoder calls fetch on a cache miss. Rolling read-ahead never enters here.
+        onDecoderWait?(true)
+        defer { onDecoderWait?(false) }
         var retriedLocation = false
         var redirects = 0
         var singleBlock = false
@@ -561,15 +583,19 @@ final class MediaRanges: @unchecked Sendable {
                 redirects = 0
                 continue
             }
-            let earlyWiFi = try speculative && (wifiOnly?() ?? false)
+            let early = speculative && successorWindow?.early == true
+            let wide = pool.unmeteredWiFi()
+            let earlyWiFi = early && wide
             let base = wanted.lowerBound
             let tail = (file.size - 1) / Int64(Self.block) * Int64(Self.block)
-            if speculative && pool.unmeteredWiFi(), let successorPrefix {
-                let target = successorPrefix()
-                try extendWindow(from: 0, to: target)
-                if earlyWiFi && wanted.upperBound > target && base != tail {
-                    // Decoder scans can reach beyond the audible window. The join releases this wait.
-                    Thread.sleep(forTimeInterval: 0.1)
+            if speculative, let successorWindow {
+                let prefix = successorWindow.prefix()
+                let target = wide ? prefix : min(prefix, Self.openingPrefix)
+                if wide { try extendWindow(from: 0, to: target) }
+                if early && (target == 0 || (wanted.upperBound > target && base != tail)) {
+                    // A large tag or high bitrate can put the prepared PCM beyond the early allowance.
+                    // A manual Next reopens against every complete block already delivered.
+                    successorWindow.changed.wait()
                     continue
                 }
             }
@@ -594,10 +620,10 @@ final class MediaRanges: @unchecked Sendable {
             if let hit = pool.read(file, at: base) { return hit }
             if grant.isRejected && renew != nil { continue }
             if speculative && Int64(wanted.count) + Self.cancellationReserve > Self.limit-specBytes {
-                // A headerless decoder can scan beyond today's prefix. Revisit the moving window until
+                // The decoder can need more than the opening. Revisit the moving window until
                 // Wi-Fi covers this block or normal near-join preparation can wait for promotion.
-                if earlyWiFi && successorPrefix != nil && !windowFailed {
-                    Thread.sleep(forTimeInterval: 0.1)
+                if early, let successorWindow {
+                    successorWindow.changed.wait()
                     continue
                 }
                 guard let awaitDemand else { throw PlaybackError("Speculation budget exhausted") }
@@ -605,7 +631,6 @@ final class MediaRanges: @unchecked Sendable {
                 promote()
                 continue
             }
-            let wide = pool.unmeteredWiFi()
             let window = wide ? Self.wifiWindow / Int64(Self.block) * Int64(Self.block) : Self.meteredWindow
             // ExtAudioFileSeek can scan every intervening MP3 frame header. Start at its actual miss
             // and stream through the estimated target plus the ordinary playback window. Split very
@@ -614,10 +639,15 @@ final class MediaRanges: @unchecked Sendable {
             let scan = wide ? 0 : min(16 * 1_024 * 1_024 - window, max(0, target - base))
             let end = min(tail, base + min(file.size - base, scan + window))
             // Leave the final block free for the decoder's opening metadata probe.
-            let gap = !speculative && !singleBlock && forward == nil && end > wanted.upperBound
-                ? pool.firstGap(file, in: base..<end) : wanted
+            let prefixEnd = min(tail, Self.openingPrefix)
+            let batchOpening = early && !wide && base < prefixEnd && prefixEnd-base + Self.cancellationReserve <= Self.limit-specBytes
+            let gap: Range<Int64>?
+            if batchOpening { gap = pool.firstGap(file, in: base..<prefixEnd) }
+            else if !speculative && !singleBlock && forward == nil && end > wanted.upperBound { gap = pool.firstGap(file, in: base..<end) }
+            else { gap = wanted }
             guard let bounds = gap, bounds.lowerBound == base else { continue }
-            let streams = bounds != wanted
+            // The bounded cellular prefix is validated and charged as one transaction.
+            let streams = !speculative && bounds != wanted
             let (active, response) = try startTransfer(bounds, streams: streams, wifiOnly: earlyWiFi || (wide && streams))
             if streams {
                 forward = (active, response)
@@ -642,7 +672,8 @@ final class MediaRanges: @unchecked Sendable {
                 trace(response.metricsLine(bytes: actual, speculative: true, charged: specBytes))
                 guard specBytes <= Self.limit else { throw PlaybackError("Speculative cap exceeded") }
                 if earlyWiFi && response.transportCancelled { continue }
-                guard let measured = response.wireBytes, measured >= response.received else { throw PlaybackError("Unmeasured speculative body") }
+                // An unmeasured attempt has already closed the occurrence's allowance. Valid
+                // bytes can still be used; the next miss waits for demand before further traffic.
             }
             if speculative, !(response.rejectsResource && response.status >= 400), response.expectedBytes > Int64(bounds.count) {
                 throw PlaybackError("Oversized speculative response (HTTP \(response.status))")
@@ -666,6 +697,13 @@ final class MediaRanges: @unchecked Sendable {
                     continue
                 }
                 throw PlaybackError(failure)
+            }
+            if response.publish != nil {
+                guard response.availableEnd == bounds.upperBound else { throw PlaybackError("Incomplete media range") }
+                // Complete opening blocks were published as they arrived, including if Next
+                // cancelled partway. The transaction's wire charge was settled above.
+                if let hit = pool.read(file, at: base) { return hit }
+                continue
             }
             guard response.body.count == bounds.count else { throw PlaybackError("Incomplete media range") }
             if retriedLocation { diagnostic("Renewed media URL returned HTTP \(response.status) at offset \(bounds.lowerBound)") }

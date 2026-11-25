@@ -106,7 +106,7 @@ export interface Playback {
     /** Called when user clicks the footer chevron indicator. Wired by index.ts. */
     onChevronClick: () => void;
     /** Called after every playback state change. Wired by index.ts → tree.setPlaybackInfo. */
-    onPlaybackChange: (info: PlaybackInfo | undefined) => void;
+    onPlaybackChange: (info: PlaybackInfo | undefined, advanced?: boolean) => void;
     /** Called when expanded state changes. Wired by index.ts to persist oneplay_music_view. */
     onExpandedChange: (expanded: boolean) => void;
     /** Called when folder play is user-triggered but no playable tracks exist. */
@@ -372,7 +372,7 @@ export function createPlayback(
             }
             if (nextIdx !== undefined) {
                 rearmTimerFromUserInteractionIfPlaying('next');
-                playNext(trackList[nextIdx], nextIdx, true);
+                playNext(trackList[nextIdx], nextIdx, true, 0, true);
             }
             return;
         }
@@ -381,7 +381,7 @@ export function createPlayback(
             : findNextPlayableIdxAfter(currentTrackIdx);
         if (idx === undefined) return;
         rearmTimerFromUserInteractionIfPlaying('next');
-        playNext(trackList[idx], idx, true);
+        playNext(trackList[idx], idx, true, 0, true);
     }
 
     /** Streams and unloaded sources may have an infinite or unknown duration. */
@@ -717,13 +717,13 @@ export function createPlayback(
                 logCatch('play-sync-ended')(e);
             });
             updateFooter();
-            view.onPlaybackChange(getInfo()!);
+            view.onPlaybackChange(getInfo()!, true);
             saveMmPlayback();
             log(`ENDED: sync play, total taken=${Math.round(performance.now() - t0)}ms`);
         } else {
             // Async fallback reuses full `playNext` pipeline with race guards.
             logError('ENDED: async fallback');
-            playNext(nextPath, nextIdx, true);
+            playNext(nextPath, nextIdx, true, 0, true);
         }
     });
 
@@ -820,7 +820,7 @@ export function createPlayback(
      * INVARIANT: every call increments asyncCounter; stale async completions
      * from older transitions are ignored.
      */
-    async function playNext(path: FolderPath, idx: number, shouldPlay: boolean, startTime?: number): Promise<void> {
+    async function playNext(path: FolderPath, idx: number, shouldPlay: boolean, startTime?: number, advanced = false): Promise<void> {
         log('PLAYNEXT...');
         cancelSeekDebounce();
         suppressTimerPauseClear = false;
@@ -853,7 +853,7 @@ export function createPlayback(
         phase = 'loading';
         updateFooter();
         bumpTestPlaybackSeq();
-        view.onPlaybackChange(getInfo()!);
+        view.onPlaybackChange(getInfo()!, advanced);
         saveMmPlayback();
 
         // Offline cache first keeps offline-first behavior and reduces latency.

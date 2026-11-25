@@ -205,13 +205,12 @@ export const shuffleTrackList = ({
     };
 };
 
-const didTrackSetChange = (
-    freshTrackList: readonly FolderPath[],
-    prevTrackList: readonly FolderPath[],
-    pathEquals: PathEquals,
-): boolean =>
-    freshTrackList.length !== prevTrackList.length
-    || freshTrackList.some(path => !prevTrackList.some(candidate => pathEquals(candidate, path)));
+/** Logical paths are unique rows, including distinct members pointing at one recording. */
+const didTrackSetChange = (fresh: readonly FolderPath[], previous: readonly FolderPath[]): boolean => {
+    if (fresh.length !== previous.length) return true;
+    const keys = new Set(previous.map(path => JSON.stringify(path)));
+    return fresh.some(path => !keys.has(JSON.stringify(path)));
+};
 
 export interface RefreshTrackListArgs {
     freshTrackList: readonly FolderPath[];
@@ -248,7 +247,7 @@ export const reduceRefreshedTrackList = ({
         };
     }
 
-    if (!didTrackSetChange(freshTrackList, prevTrackList, pathEquals)) {
+    if (!didTrackSetChange(freshTrackList, prevTrackList)) {
         const trackList = [...prevTrackList];
         return {
             trackList,

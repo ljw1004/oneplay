@@ -470,9 +470,9 @@ private final class TestAudioCDN: URLProtocol {
         let account = try NativeAccount(recordFile: record, identity: TestIdentity()) { [self] request in
             if request.url?.path == "/v1.0/me/drive" { return try response(request, data: drive) }
             let item = request.url?.lastPathComponent ?? ""
-            guard ["A", "B"].contains(item) else { return try response(request, status: 404, data: Data()) }
+            guard ["A", "B", "C", "D"].contains(item) else { return try response(request, status: 404, data: Data()) }
             calls.append(item)
-            if item == "B" {
+            if item != "A" {
                 let isEarly = calls.count == 2
                 XCTAssertTrue(request.allowsCellularAccess)
                 if holdLookups {
@@ -515,9 +515,17 @@ private final class TestAudioCDN: URLProtocol {
             const native = createNativeLibrary(window.webkit.messageHandlers.oneplay);
             await native.loadAccountState('state');
             document.getElementById('status').hidden = true;
-            const drawer = attachNativePlayback(native,document.getElementById('footer'),()=>{},()=>{},()=>{});
+            window.followedRows = [];
+            const drawer = attachNativePlayback(native,document.getElementById('footer'),
+                (info, advanced) => { if (advanced) window.followedRows.push(info.track.at(-1)); },()=>{},()=>{});
             if (!document.querySelector('.audio-ranges').hidden) throw Error('Debug is off initially');
             drawer.setDebugEnabled(true);
+            window.spinnerSeen = false;
+            const wheel = document.querySelector('.scrubber-text');
+            new MutationObserver(changes => {
+                if (wheel.classList.contains('loading') || changes.some(c => c.oldValue?.split(' ').includes('loading')))
+                    window.spinnerSeen = true;
+            }).observe(wheel, {attributes:true, attributeFilter:['class'], attributeOldValue:true});
             window.addEventListener('oneplay-playback', e => {
                 if (e.detail.snapshot.state === 'playing') {
                     window.readyPosition = e.detail.snapshot.position;
@@ -547,15 +555,27 @@ private final class TestAudioCDN: URLProtocol {
         image.name = "Expanded player during successor Graph lookup"
         image.lifetime = .keepAlways
         add(image)
+        try player.apply("pause", item: item, seconds: nil)
         releaseLookups()
         try await waitForUI("!document.querySelector('.audio-ranges .lookup')")
+        XCTAssertFalse(TestAudioCDN.fixture.withLock { $0.paths.contains("/B/2") })
+        try player.apply("play", item: item, seconds: nil)
         // A 128 kbps file needs ~560 kB through +30 and the first four seconds of resumed PCM.
-        // Wait for genuine cellular read-ahead on A while B has only its URL.
+        // Both the current cellular runway and the manual Next opening fill from the network.
         try await waitForUI("parseFloat(document.querySelector('.audio-ranges > :nth-child(2) .cached')?.style.width) >= 24")
-        XCTAssertFalse(TestAudioCDN.fixture.withLock { $0.paths.contains { $0.hasPrefix("/B/") } })
+        try await waitForUI("parseFloat(document.querySelector('.audio-ranges > :last-child .cached')?.style.width) >= 9")
+        let cachedOpening = XCTAttachment(image: try await page.takeSnapshot(configuration: nil))
+        cachedOpening.name = "Opening of Next cached during metered playback"
+        cachedOpening.lifetime = .keepAlways
+        add(cachedOpening)
+        XCTAssertTrue(TestAudioCDN.fixture.withLock { $0.paths.contains("/B/2") })
+        _ = try await page.evaluateJavaScript("window.spinnerSeen = false")
         let beforeSkip = try XCTUnwrap(player.snapshot["position"] as? Double)
         _ = try await page.evaluateJavaScript("document.querySelector('.scrubber-edge-button.top').click()")
         try await waitForUI("Math.abs(window.readyPosition - \(beforeSkip + 30)) < 1 && !document.querySelector('.scrubber-text.loading')")
+        let afterSkip = try XCTUnwrap(player.snapshot["position"] as? Double)
+        _ = try await page.evaluateJavaScript("document.querySelector('.scrubber-edge-button.bottom').click()")
+        try await waitForUI("Math.abs(window.readyPosition - \(afterSkip - 15)) < 1")
         fillCache(tracks[0])
         try await waitForUI("!document.querySelector('.audio-range-rail .fetching')")
         let requestsBeforeWarmSeeks = TestAudioCDN.fixture.withLock { $0.paths }
@@ -572,7 +592,7 @@ private final class TestAudioCDN: URLProtocol {
         }
         XCTAssertEqual(calls, ["A", "B"])
         XCTAssertFalse(requestsBeforeWarmSeeks.isEmpty)
-        XCTAssertTrue(requestsBeforeWarmSeeks.allSatisfy { $0.hasPrefix("/A/") })
+        XCTAssertEqual(Set(requestsBeforeWarmSeeks), ["/A/1", "/B/2"])
         XCTAssertEqual(TestAudioCDN.fixture.withLock { $0.paths }, requestsBeforeWarmSeeks)
         fillCache(tracks[1])
         wifi.withLock { $0 = true }
@@ -592,13 +612,18 @@ private final class TestAudioCDN: URLProtocol {
         try player.apply("seek", item: item, seconds: 120)
         XCTAssertEqual(player.snapshot["position"] as? Double, 120)
         XCTAssertEqual(player.snapshot["state"] as? String, "paused")
-        try player.apply("play", item: item, seconds: nil)
+        try await waitForUI("document.querySelector('.scrubber-text span')?.textContent.startsWith('2:00 /')")
+        _ = try await page.evaluateJavaScript("window.readyPosition = -1; document.querySelector('.footer-playpause').click()")
         try await waitForUI("window.readyPosition >= 120 && !document.querySelector('.scrubber-text.loading')")
         let began = ContinuousClock.now
         _ = try await page.evaluateJavaScript("document.querySelector('.scrubber-edge-button.right').click()")
-        try await waitForUI("document.querySelector('.footer-title')?.textContent === 'B' && !!document.querySelector('.scrubber-text:not(.loading)') && !!document.querySelector('.audio-range-rail .marker')")
+        try await waitForUI("document.querySelector('.footer-title')?.textContent === 'B' && window.readyTrack === 'B' && !!document.querySelector('.scrubber-text:not(.loading)') && !!document.querySelector('.audio-range-rail .marker')")
         XCTAssertEqual(player.snapshot["state"] as? String, "playing")
         XCTAssertEqual(calls, ["A", "B"])
+        let followed = try await page.evaluateJavaScript("window.followedRows") as? [String]
+        XCTAssertEqual(followed, ["B"], "Next should ask the tree to follow B once")
+        let warmSpinnerSeen = try await page.evaluateJavaScript("window.spinnerSeen") as? Bool
+        XCTAssertEqual(warmSpinnerSeen, false, "Warm skips, scrubs, Play and Next must never flash the spinner")
         print("Prepared Next to playing and displayed time: \(began.duration(to: .now))")
 
         let last = try XCTUnwrap(player.snapshot["item"] as? String)
@@ -619,6 +644,20 @@ private final class TestAudioCDN: URLProtocol {
         try player.apply("seek", item: last, seconds: 90)
         try player.apply("play", item: last, seconds: nil)
         try await waitForUI("!!document.querySelector('.scrubber-text.loading') && !!document.querySelector('.audio-ranges > :nth-child(2) .lookup')")
+        // Only the target block survives. Header and scan reads need the held renewal, but the
+        // listener can still see the requested time while those ancillary bytes are unavailable.
+        // This fixture has exactly 1152 samples and 417 bytes per MPEG frame.
+        let frameAtTarget = 30 * 44_100 / 1152
+        let base = (1 + frameAtTarget) * frame.count / MediaRanges.block * MediaRanges.block
+        pool.store(song.subdata(in: base..<base + MediaRanges.block),
+                   for: MediaPool.File(drive: "library", item: "B", version: "v1", size: Int64(size)), at: Int64(base))
+        try player.apply("seek", item: last, seconds: 30)
+        try await waitForUI("!document.querySelector('.scrubber-text.loading') && document.querySelector('.scrubber-text span')?.textContent.startsWith('0:30 /')")
+        _ = try await page.evaluateJavaScript("window.spinnerSeen = false")
+        try await waitForUI("!!document.querySelector('.audio-ranges > :nth-child(2) .lookup')")
+        _ = try await page.callAsyncJavaScript("await new Promise(resolve => setTimeout(resolve, 500))", arguments: [:], in: nil, contentWorld: .page)
+        let partialSpinnerSeen = try await page.evaluateJavaScript("window.spinnerSeen") as? Bool
+        XCTAssertEqual(partialSpinnerSeen, false)
         fillCache(tracks[1])
         try player.apply("seek", item: last, seconds: 30)
         try await waitForUI("Math.abs(window.readyPosition - 30) < 1 && !document.querySelector('.scrubber-text.loading')")
@@ -630,8 +669,8 @@ private final class TestAudioCDN: URLProtocol {
         try player.apply("seek", item: last, seconds: 60)
         try player.apply("play", item: last, seconds: nil)
         try await waitForUI("Math.abs(window.readyPosition - 60) < 1 && !document.querySelector('.scrubber-text.loading')")
-        XCTAssertEqual(calls, ["A", "B", "B", "B"])
-        XCTAssertTrue(TestAudioCDN.fixture.withLock { $0.paths.contains("/B/4") })
+        XCTAssertEqual(calls, ["A", "B", "B", "B", "B"])
+        XCTAssertTrue(TestAudioCDN.fixture.withLock { $0.paths.contains("/B/5") })
 
         // The same seek message as a wheel release advances the playing track without another tap.
         try player.apply("previous", item: last, seconds: nil)
@@ -653,7 +692,46 @@ private final class TestAudioCDN: URLProtocol {
         try player.apply("seek", item: finalItem, seconds: duration)
         XCTAssertEqual(player.snapshot["position"] as? Double, duration)
         XCTAssertEqual(player.snapshot["state"] as? String, "ended", player.status)
-        XCTAssertEqual(calls, ["A", "B", "B", "B"])
+        XCTAssertEqual(calls, ["A", "B", "B", "B", "B"])
+
+        // A new selection has cached audio but no admitted URL. Hold the actual Graph response
+        // past the UI grace period, then confirm local decoding starts without a CDN read.
+        let cached = IndexedTrack(driveId: "library", itemId: "C", path: ["Music", "Album", "C"])
+        fillCache(cached)
+        holdLookups = true
+        _ = try await page.evaluateJavaScript("window.spinnerSeen = false")
+        let cold = IndexedTrack(driveId: "library", itemId: "D", path: ["Music", "Album", "D"])
+        try player.start(tracks: [cold, cached], startIndex: 1, delaySeconds: 0, nearEnd: false, forceRefresh: false)
+        try await waitForUI("document.querySelector('.footer-title')?.textContent === 'C' && !!document.querySelector('.audio-ranges > :nth-child(2) .lookup')")
+        _ = try await page.callAsyncJavaScript("await new Promise(resolve => setTimeout(resolve, 500))", arguments: [:], in: nil, contentWorld: .page)
+        releaseLookups()
+        try await waitForUI("window.readyTrack === 'C'")
+        let delayedSpinnerSeen = try await page.evaluateJavaScript("window.spinnerSeen") as? Bool
+        XCTAssertEqual(delayedSpinnerSeen, false, "A slow warm open must keep the time visible")
+        XCTAssertFalse(TestAudioCDN.fixture.withLock { $0.paths.contains { $0.hasPrefix("/C/") } })
+        // Reproduce Prev to a cold predecessor. Keep Graph pending until the spinner is
+        // visible, then watch the real drawer through the CDN reads and first scheduled PCM.
+        holdLookups = true
+        _ = try await page.evaluateJavaScript("document.querySelector('.scrubber-edge-button.left').click()")
+        try await waitForUI("document.querySelector('.footer-title')?.textContent === 'D' && !!document.querySelector('.scrubber-text.loading')")
+        _ = try await page.evaluateJavaScript("""
+            window.earlyClear = false;
+            window.addEventListener('oneplay-playback', function observe(e) {
+                const state = e.detail.snapshot.state;
+                if (state === 'playing') window.removeEventListener('oneplay-playback', observe);
+                else if (!document.querySelector('.scrubber-text.loading')) window.earlyClear = true;
+            });
+            """)
+        let waiting = XCTAttachment(image: try await page.takeSnapshot(configuration: nil))
+        waiting.name = "Cold Prev awaiting playback"
+        waiting.lifetime = .keepAlways
+        add(waiting)
+        releaseLookups()
+        try await waitForUI("window.readyTrack === 'D' && !document.querySelector('.scrubber-text.loading')")
+        let earlyClear = try await page.evaluateJavaScript("window.earlyClear") as? Bool
+        XCTAssertEqual(earlyClear, false, "No lookup, range, or local preparation step clears a visible spinner before playback")
+        XCTAssertTrue(TestAudioCDN.fixture.withLock { $0.paths.contains { $0.hasPrefix("/D/") } })
+
     }
 
     func testMediaReadsURLAndVersionFromOneDriveItem() async throws {
@@ -917,5 +995,87 @@ private final class TestAudioCDN: URLProtocol {
                           "https://graph.microsoft.com/beta/me", "https://graph.microsoft.com/v1.00/me"] {
             XCTAssertFalse(GraphTransport.isGraph(URL(string: malformed)!))
         }
+    }
+}
+
+extension AccountTests {
+    /// Use the installed shell and real reply bridge. A partial, document-owned upload
+    /// disappears with its page. The session and last completely committed order survive.
+    func testLargeQueueThroughWebKitAndDocumentLoss() async throws {
+        let account = try NativeAccount(recordFile: record, identity: TestIdentity()) { [self] request in
+            try response(request, status: request.url?.path == "/v1.0/me/drive" ? 200 : 404, data: drive)
+        }
+        let player = NativePlayback { _, _, _, _ in throw NativeAccountError.forbidden }
+        let controller = LibraryController(account: account, store: .nonPersistent(), player: player)
+        let host = try XCTUnwrap((UIApplication.shared.delegate as? AppDelegate)?.library)
+        host.addChild(controller)
+        host.view.addSubview(controller.view)
+        controller.didMove(toParent: host)
+        defer {
+            player.stop()
+            controller.detachPage()
+            controller.willMove(toParent: nil)
+            controller.view.removeFromSuperview()
+            controller.removeFromParent()
+        }
+        var page: WKWebView? = try await readyPage(in: controller)
+        _ = try await account.signIn(presenting: controller)
+        let metrics = try await page!.callAsyncJavaScript("""
+            const {attachNativePlayback} = await import('./dist/native-playback.js');
+            const {buildLibraryQueue} = await import('./dist/tracks.js');
+            const {createNativeLibrary} = await import('./dist/native-library.js');
+            const native = createNativeLibrary(window.webkit.messageHandlers.oneplay);
+            await native.loadAccountState('state');
+            const status = document.getElementById('status');
+            status.hidden = true;
+            const drawer = attachNativePlayback(native, document.getElementById('footer'), () => {}, () => {}, () => {});
+            const children = {};
+            for (let i = 0; i < 30000; i++) children['Track ' + i] = {id:String(i)};
+            const root = {type:'onedrive', key:'library', name:'Music', folder:{id:'r',children}, info:{driveId:'library'}};
+            const start = performance.now();
+            const queue = await buildLibraryQueue(['Music','library'],new Map([['library',root]]),[],new Set());
+            const built = performance.now();
+            await drawer.start(queue,0,true,'30m');
+            const committed = performance.now();
+            document.querySelector('.footer-gripper').click();
+            document.querySelector('.mode-label').click();
+            while (document.querySelector('.mode-label').textContent !== 'repeat') {
+                if (performance.now() - committed > 3000) throw Error('Mode did not reach the drawer');
+                await new Promise(r => setTimeout(r, 20));
+            }
+            const {snapshot} = await native.playback('snapshot');
+            await native.playback('beginQueue',{build:'partial',count:30000,session:snapshot.session,revision:1});
+            await native.playback('queueChunk',{build:'partial',offset:0,tracks:queue.tracks.slice(0,512)});
+            return {count:queue.tracks.length, buildMs:built-start, transferMs:committed-built};
+            """, arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertEqual((metrics as? [String: Any])?["count"] as? Int, 30_000)
+        print("30k queue simulator metrics \(metrics ?? "")")
+        _ = try await page!.callAsyncJavaScript("await Promise.all(document.querySelector('.expansion').getAnimations().map(a => a.finished))",
+                                               arguments: [:], in: nil, contentWorld: .page)
+        let screenshot = try await page!.takeSnapshot(configuration: nil)
+        let image = XCTAttachment(image: screenshot)
+        image.name = "Live queue and Repeat mode"
+        image.lifetime = .keepAlways
+        add(image)
+        let session = try XCTUnwrap(player.snapshot["session"] as? String)
+        controller.detachPage()
+        page = nil
+        controller.loadPage()
+        let replacement = try XCTUnwrap(controller.webView)
+        let ready = ContinuousClock.now + .seconds(10)
+        while (replacement.url != BundledShell.page || replacement.isLoading), ContinuousClock.now < ready {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let restored = try await replacement.callAsyncJavaScript("""
+            const post = args => window.webkit.messageHandlers.oneplay.postMessage({op:'playback',version:1,...args});
+            let rejected = false;
+            try { await post({action:'queueChunk',build:'partial',offset:512,tracks:[{driveId:'d',itemId:'i',path:['Music','d','i'],sourceRootKey:'d',key:'i'}]}); }
+            catch { rejected = true; }
+            const {snapshot} = await post({action:'snapshot'});
+            return {rejected, session:snapshot.session, mode:snapshot.mode};
+            """, arguments: [:], in: nil, contentWorld: .page) as? [String: Any]
+        XCTAssertEqual(restored?["session"] as? String, session)
+        XCTAssertEqual(restored?["mode"] as? String, "repeat")
+        XCTAssertEqual(restored?["rejected"] as? Bool, true)
     }
 }

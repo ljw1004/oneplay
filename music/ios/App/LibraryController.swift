@@ -11,6 +11,9 @@ import WebKit
     private var account: NativeAccount?
     private(set) var player: NativePlayback?
     private var playbackSequence = 0
+    /// Only one document can stage a queue. Every append checks its build ID and offset.
+    private var selectionIntent: String?
+    private var staged: (id: String, count: Int, tracks: [IndexedTrack])?
     #if DEBUG
     private var showingAudioRanges = false
     #endif
@@ -155,7 +158,17 @@ import WebKit
         }
     }
 
+    /// Bridge data is untrusted even when the sender is the bundled web document.
+    private func decodeEntries(_ values: [[String: Any]]) throws -> [IndexedTrack] {
+        let tracks = try JSONDecoder().decode([IndexedTrack].self, from: JSONSerialization.data(withJSONObject: values))
+        guard tracks.allSatisfy({ ($0.path?.count ?? 0) >= 3 && !($0.key ?? "").isEmpty &&
+            !($0.sourceRootKey ?? "").isEmpty && !$0.driveId.isEmpty && !$0.itemId.isEmpty }) else { throw NativeAccountError.invalidRequest }
+        return tracks
+    }
+
     func detachPage() {
+        staged = nil
+        selectionIntent = nil
         #if DEBUG
         showingAudioRanges = false
         #endif
@@ -221,12 +234,61 @@ import WebKit
                           let action = args["action"] as? String else { throw NativeAccountError.invalidRequest }
                     switch action {
                     case "snapshot": break
-                    case "start":
-                        guard let values = args["tracks"] as? [[String: Any]], let index = args["index"] as? Int
-                        else { throw NativeAccountError.invalidRequest }
-                        let tracks = try JSONDecoder().decode([IndexedTrack].self, from: JSONSerialization.data(withJSONObject: values))
-                        guard tracks.allSatisfy({ ($0.path?.count ?? 0) >= 3 }) else { throw NativeAccountError.invalidRequest }
-                        try player.start(tracks: tracks, startIndex: index, delaySeconds: 0, nearEnd: false, forceRefresh: false)
+                    case "intent":
+                        selectionIntent = args["intent"] as? String
+                        staged = nil
+                    case "fence":
+                        guard let session = args["session"] as? String, let revision = args["revision"] as? Int else { throw NativeAccountError.invalidRequest }
+                        player.fence(session: session, revision: revision)
+                    case "allow":
+                        guard let root = args["root"] as? String else { throw NativeAccountError.invalidRequest }
+                        player.updateAccess(connected: nil, denied: [], allowed: [root])
+                    case "access":
+                        guard let denied = args["denied"] as? [String] else { throw NativeAccountError.invalidRequest }
+                        player.updateAccess(connected: (args["connected"] as? [String]).map(Set.init), denied: Set(denied))
+                    case "timer":
+                        guard let setting = args["timer"] as? String else { throw NativeAccountError.invalidRequest }
+                        try player.changeTimer(setting)
+                    case "beginQueue":
+                        guard let id = args["build"] as? String, let count = args["count"] as? Int, count > 0 else {
+                            throw NativeAccountError.invalidRequest
+                        }
+                        staged = (id, count, [])
+                        if let session = args["session"] as? String, let revision = args["revision"] as? Int {
+                            player.fence(session: session, revision: revision)
+                        }
+                    case "queueChunk":
+                        guard let id = args["build"] as? String, staged?.id == id,
+                              let offset = args["offset"] as? Int, staged?.tracks.count == offset,
+                              let values = args["tracks"] as? [[String: Any]], !values.isEmpty,
+                              values.count <= 512, offset + values.count <= staged!.count else { throw NativeAccountError.invalidRequest }
+                        staged!.tracks += try decodeEntries(values)
+                    case "start", "revise":
+                        guard let folder = args["folder"] as? [String], let folderKey = args["folderKey"] as? String,
+                              !folderKey.isEmpty else { throw NativeAccountError.invalidRequest }
+                        let tracks: [IndexedTrack]
+                        if let build = args["build"] as? String {
+                            guard let pending = staged, pending.id == build, pending.count == pending.tracks.count else { throw NativeAccountError.invalidRequest }
+                            tracks = pending.tracks
+                        } else {
+                            guard let values = args["tracks"] as? [[String: Any]], values.count <= 512 else { throw NativeAccountError.invalidRequest }
+                            tracks = try decodeEntries(values)
+                        }
+                        staged = nil
+                        guard Set(tracks.compactMap(\.key)).count == tracks.count else { throw NativeAccountError.invalidRequest }
+                        if action == "start" {
+                            guard let intent = args["intent"] as? String, intent == selectionIntent,
+                                  player.sessionID == args["base"] as? String else {
+                                replyHandler(playbackSample(player, account), nil)
+                                return
+                            }
+                            guard let index = args["index"] as? Int else { throw NativeAccountError.invalidRequest }
+                            try player.start(tracks: tracks, startIndex: index, delaySeconds: 0, nearEnd: false, forceRefresh: false,
+                                             folder: folder, folderKey: folderKey, selected: args["selected"] as? Bool == true, timer: args["timer"] as? String, initialMode: (args["mode"] as? String).flatMap(QueueMode.init(rawValue:)))
+                        } else {
+                            guard let session = args["session"] as? String, let revision = args["revision"] as? Int else { throw NativeAccountError.invalidRequest }
+                            player.revise(session: session, revision: revision, folder: folder, tracks: tracks)
+                        }
                     default:
                         guard let item = args["item"] as? String else { throw NativeAccountError.invalidRequest }
                         try player.apply(action, item: item, seconds: args["seconds"] as? Double)
@@ -234,7 +296,9 @@ import WebKit
                     #if DEBUG
                     showingAudioRanges = args["debugRanges"] as? Bool == true
                     #endif
-                    reply = playbackSample(player, account)
+                    var sample = playbackSample(player, account)
+                    if action == "intent" { sample["base"] = player.sessionID }
+                    reply = sample
                 case "request":
                     reply = try await account.request(message: args)
                 case "chunk", "abort":

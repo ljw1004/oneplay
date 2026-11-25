@@ -36,6 +36,7 @@ import { readGraphJson, type AuthFetch } from './auth.js';
  *  throwing stubs so accidental I/O paths fail fast. */
 export interface FavoritesDeps {
     authFetch: AuthFetch;
+    fenceQueueEdit?: () => Promise<void> | undefined;
     dbGet<T>(key: string): Promise<T | undefined>;
     dbPut(key: string, value: unknown): Promise<void>;
 }
@@ -216,7 +217,7 @@ export interface Favorites {
  * Creates the favorites module. The onChange callback is called after every
  * mutation so the tree can re-render.
  */
-export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favorites {
+export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync') => void | Promise<void>): Favorites {
     let favorites: Favorite[] = [];
     let updatedAt = 0;
     /** Stashed originals for _testOnlySuppressSave restore. */
@@ -487,9 +488,9 @@ export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favo
         if (changed) {
             favorites = newFavorites;
             updatedAt = Date.now();
-            await saveLocal();
-            onChange();
+            await saveLocal(true);
             scheduleOneDriveUploadFireAndForget();
+            await onChange('sync');
         }
     };
 
@@ -500,7 +501,8 @@ export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favo
 
     /** Persist to IndexedDB only (fast, awaited by callers).
      *  INVARIANT: callers must set updatedAt before calling. */
-    const saveLocal = async (): Promise<void> => {
+    const saveLocal = async (queueEdit = false): Promise<void> => {
+        if (queueEdit && deps.fenceQueueEdit) await deps.fenceQueueEdit();
         const data = toData();
         await deps.dbPut(IDB_KEY, data).catch(logCatch('favorites:dbPut'));
     };
@@ -549,7 +551,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favo
             favorites = cached.favorites.filter(isValid).map(normalize);
             updatedAt = cached.updatedAt || 0;
             log(`favorites: loaded ${favorites.length} from cache (updatedAt=${updatedAt})`);
-            onChange();
+            await onChange();
         }
     };
 
@@ -570,11 +572,12 @@ export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favo
             const server: FavoritesData = await readGraphJson(r, 'favorites:onedrive-load');
             if (!server || !Array.isArray(server.favorites)) return;
             if ((server.updatedAt || 0) > updatedAt) {
+                if (deps.fenceQueueEdit) await deps.fenceQueueEdit();
                 favorites = server.favorites.filter(isValid).map(normalize);
                 updatedAt = server.updatedAt;
                 await deps.dbPut(IDB_KEY, toData()).catch(logCatch('favorites:dbPut-server'));
                 log(`favorites: adopted server version (updatedAt=${updatedAt}, ${favorites.length} items)`);
-                onChange();
+                await onChange('sync');
             }
         }).catch(logCatch('favorites:onedrive-load'));
     };
@@ -598,8 +601,8 @@ export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favo
             favorites.push(fav);
             updatedAt = Date.now();
             await saveLocal();
-            onChange();
             scheduleOneDriveUploadFireAndForget();
+            await onChange();
             return true;
         },
 
@@ -612,9 +615,9 @@ export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favo
                 return filtered.length === f.members.length ? f : { ...f, members: filtered };
             });
             updatedAt = Date.now();
-            await saveLocal();
-            onChange();
+            await saveLocal(true);
             scheduleOneDriveUploadFireAndForget();
+            await onChange();
         },
 
         wouldCreateCycle,
@@ -667,8 +670,8 @@ export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favo
             favorites = favorites.map(f => f.id === id ? { ...f, name: trimmed } : f);
             updatedAt = Date.now();
             await saveLocal();
-            onChange();
             scheduleOneDriveUploadFireAndForget();
+            await onChange();
         },
 
         async addMembers(playlistId, members) {
@@ -691,9 +694,9 @@ export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favo
                 f.id === playlistId ? { ...f, members: [...existing, ...toAdd] } : f,
             );
             updatedAt = Date.now();
-            await saveLocal();
-            onChange();
+            await saveLocal(true);
             scheduleOneDriveUploadFireAndForget();
+            await onChange();
         },
 
         async removeMembers(playlistId, indices) {
@@ -707,9 +710,9 @@ export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favo
                 f.id === playlistId ? { ...f, members: newMembers } : f,
             );
             updatedAt = Date.now();
-            await saveLocal();
-            onChange();
+            await saveLocal(true);
             scheduleOneDriveUploadFireAndForget();
+            await onChange();
         },
 
         async setHasPrivatePlayback(id, value) {
@@ -720,8 +723,8 @@ export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favo
             );
             updatedAt = Date.now();
             await saveLocal();
-            onChange();
             scheduleOneDriveUploadFireAndForget();
+            await onChange();
         },
 
         async setMode(id, mode) {
@@ -732,8 +735,8 @@ export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favo
             );
             updatedAt = Date.now();
             await saveLocal();
-            onChange();
             scheduleOneDriveUploadFireAndForget();
+            await onChange();
         },
 
         async setOfflinePin(id, pin) {
@@ -744,8 +747,8 @@ export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favo
             );
             updatedAt = Date.now();
             await saveLocal();
-            onChange();
             scheduleOneDriveUploadFireAndForget();
+            await onChange();
         },
 
         _testOnlySuppressSave(suppress) {

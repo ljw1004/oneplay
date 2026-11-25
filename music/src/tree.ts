@@ -86,7 +86,7 @@ export interface TreeView {
     /** Opens the track's logical parent and scrolls its row into view if needed. */
     revealTrack(path: FolderPath): void;
     /** Update playback indicators (track SVG, folder highlighting, play glyph). */
-    setPlaybackInfo(info: PlaybackInfo | undefined): void;
+    setPlaybackInfo(info: PlaybackInfo | undefined, advanced?: boolean): void;
     /** Update select mode rendering state. Checkboxes appear on selectable rows
      *  when active; selectedPaths uses JSON.stringify(path) as keys. */
     setSelectMode(active: boolean, selectedPaths: ReadonlySet<string>): void;
@@ -179,6 +179,8 @@ export function createTree(
 ): TreeView {
     const breadcrumbsEl = container.querySelector<HTMLElement>('#breadcrumbs')!;
     const childrenEl = container.querySelector<HTMLElement>('#children')!;
+    const trackRow = (path: FolderPath) => childrenEl.querySelector<HTMLElement>(
+        `.tree-row.file[data-path="${CSS.escape(JSON.stringify(path))}"]`);
     const trail = document.createElement('div');
     trail.className = 'folder-trail';
     const search = document.createElement('button');
@@ -434,12 +436,25 @@ export function createTree(
             const parent = path.slice(0, -1);
             if (!pathEquals(parent, selectedPath)) view.setSelectedPath(parent);
             view.closeSearchMode();
-            const key = CSS.escape(JSON.stringify(path));
-            childrenEl.querySelector(`[data-path="${key}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+            trackRow(path)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
         },
-        setPlaybackInfo(info) {
+        setPlaybackInfo(info, advanced = false) {
+            // Sample the outgoing row before render replaces it. The children list is clipped
+            // by the breadcrumbs and drawer. A covered row cannot grant permission to navigate.
+            const row = advanced && info && playbackInfo && !pathEquals(info.track, playbackInfo.track)
+                && !searchModeOpen && !selectModeActive && !document.querySelector('.modal-backdrop, .action-dropdown')
+                ? trackRow(playbackInfo.track) : undefined;
+            let follow = false;
+            if (row) {
+                const bounds = row.getBoundingClientRect();
+                const list = childrenEl.getBoundingClientRect();
+                const top = Math.max(bounds.top, list.top, 0);
+                const logTop = document.querySelector('#log-panel.visible')?.getBoundingClientRect().top;
+                follow = top < Math.min(bounds.bottom, list.bottom, logTop ?? window.innerHeight);
+            }
             playbackInfo = info;
             render();
+            if (follow && info) view.revealTrack(info.track);
         },
         setSelectMode(active, paths) {
             selectModeActive = active;

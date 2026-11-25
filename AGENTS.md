@@ -64,6 +64,7 @@ Agents can and should get opinions from other agents:
 
 The agent is responsible for fully validating every change, end-to-end, autonomously. The human should not have to prompt for testing, deployment, or production verification — the agent must pursue these proactively.
 
+- Install verified OnePlay builds on LuPhone13 directly, including when the app is running or playing audio. The owner has given standing approval.
 - **Deploy before integration tests**: once changes compile, run `npm run deploy` before running Playwright integration tests. This lets the human start manual testing on production immediately while automation runs.
 - **Test before presenting to the human**: if you've made changes, they must be built, tested via Playwright, and verified (including screenshots) before telling the human it's done or asking them to look at it. You don't need to test after every individual edit — but you must test before handing off.
 - **Always verify production**: at milestone end, run Playwright against https://unto.me/oneplay/music/. The milestone is not done until production is verified.

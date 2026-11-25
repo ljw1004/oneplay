@@ -168,6 +168,15 @@ Try silent acquisition first and coalesce concurrent renewal. Surface interactio
 
 ### Phase 5. Connect the shared playback UI to the Swift session
 
+**Current slice — live Swift queue and play modes.** The library describes the selected folder or playlist and sends revisions as it changes. Swift owns the active occurrences, traversal order, modes, timer and prepared successor for the lifetime of the app process. Locking the phone or recreating the web view preserves this session. A reattached view reads the current native snapshot.
+
+**Next slice — playback persistence.** This slice has two acceptance tests.
+
+- Restore the live queue after full process termination, including its playback folder, order, current occurrence, mode and position. Reopen paused and start audio on explicit Play.
+- Implement per-favorite **Remember my spot**. Save the outgoing favorite’s position and playback context, resume a surviving bookmark on folder Play, and honor explicit track selection and fresh Shuffle. Cover row shifts, deletion, legacy bookmarks and account isolation.
+
+The background/restore and bookmark contracts below specify acceptance for these slices. Durable audio downloads remain a separate milestone.
+
 Use the real library and native Graph transport accepted in phase 4. Start with one end-to-end path: tap a real track in the tree, let Swift play it, then destroy and recreate the web view and show the actual track and position. Capture the commands and events from the proven native engine (including a natural advance while detached). Use the phase 4 WebKit transport to carry that exchange. Validate it on the phone before expanding the protocol to large queues, edit races or timers. The contracts below describe the required outcomes; revise the message shape if the measured engine needs a different one. Design for the two working implementations. Connect the Swift session to the same footer, wheel, playlist navigation and settings the listener uses in the PWA. The browser continues through its phase 3 browser code. Implement the common queue/edit behavior below in both players. Review the UI on live account data; synthetic fixtures cover deterministic races and scale.
 
 | Integration point | Phase 5 work using the phase 3 browser boundaries |
@@ -374,6 +383,14 @@ The simulator reproduced a 53-request cold seek on the real OneDrive recording. 
 **Build 21 validation.** Sol-6.2 High reviewed the cellular successor lookup, the seek range policy, and the final fixes. The reader releases a fully delivered range before URLSession finishes reporting metrics. A Graph denial also fences a URL held by a waiting successor or retiring reader. The signed Release build passed. The simulator suite passed 30 tests and skipped the opt-in live album test. Cellular measurements used a controlled origin on the Mac. Physical cellular listening remains open. [Seek results and request timings](AUDIO-FETCHING.md#build-21-cellular-seeks-and-earlier-successor-lookup)
 
 **Build 15 validation.** The signed iOS Release target built, and the Debug app launched in the simulator. XCTest passed 26 tests, with the opt-in handset test skipped. The 30k-library sign-out check now allows separate time for WebKit store deletion before waiting for the clean signed-out screen. The transport harness passed three consecutive runs. All 152 web unit tests and all 96 localhost integration tests passed. Production web build 263 passed 95 of 96 in the full run; the first-time-indexing display check timed out at 1.5 seconds and passed on its isolated retry. Sol-6.2 High reviewed the fetching implementation, transport tests and listener interaction inventory.
+
+**Build 23 — live queue and play modes.** The bundled library supplies stable occurrence keys for physical folders and nested favorites. Swift owns the audible cursor, canonical and shuffled orders, playback mode and monotonic timer. A fresh web view samples this session. Structural favorite edits fence the old successor before local save and wait for a native commit before updating the tree. If a change needs to retract scheduled PCM, the player can briefly rebuffer the current song at its sampled position.
+
+Simulator coverage includes natural and manual boundaries in all five modes, stale controls on single-track Repeat, numeric expiry and resume, removal of the playing row, source revocation, a fenced end without a web view, and WebKit replacement during a partial 30,000-entry upload. In the final simulator run the 30,000-entry walk took 140 ms and the WebKit transfer and commit took 709 ms. The suite passed 35 tests and skipped the opt-in live-account audition. All 155 TypeScript unit tests passed. Playwright exercised the wheel and the five mode labels against local and production modules using controlled media. These timings exclude OneDrive and time to audible playback. Sol-6.2 High reviewed successor invalidation, timer races, share-access changes, selection races and edit acknowledgements. Build 23 was installed and launched on LuPhone13. Physical lock-screen listening on the new build remains an owner check. Cold-restart restoration and per-favorite positions are specified in the next slice at the beginning of phase 5. [Interaction checklist](INTERACTIONS.md#player-queue-and-wheel) · [Queue and renderer design](ARCHITECTURE.md)
+
+**Build 27.** The native player warms the opening of the manual Next track once the current recording has three seconds queued, on both cellular and Wi-Fi. One and end-of-track Timer keep their natural stop. The simulator exercised early Next two seconds into a long track at two MP3 bitrates. [Fetching policy and timings](AUDIO-FETCHING.md#build-27-early-next-measurements)
+
+**Build 28.** A cached opening now starts an unindexed MP3 without reading the entire file for its duration. [Phone incident and blocked-network verification](AUDIO-FETCHING.md#build-28-cellular-next-on-an-unindexed-mp3)
 
 ### Later gates
 

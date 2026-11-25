@@ -40,6 +40,7 @@ export interface RemoveImpact {
 }
 
 export interface Shares {
+    hasLoadedMembership?(): boolean;
     getAll(): readonly ShareRecordPersisted[];
     loadFromCache(): Promise<void>;
     pullFromOneDrive(): Promise<void>;
@@ -108,6 +109,7 @@ async function extractGraphErrorMessage(
 }
 
 export function createShares(deps: SharesDeps, onChange: () => void): Shares {
+    let loadedMembership = false;
     let shares: ShareRecordPersisted[] = [];
     let updatedAt = 0;
     const deniedByRootKey = new Map<string, string>();
@@ -150,10 +152,12 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
 
     return {
         getAll: () => shares,
+        hasLoadedMembership: () => loadedMembership,
 
         async loadFromCache() {
             const cached = await deps.dbGet<SharesData>(IDB_KEY).catch(() => undefined);
             if (!cached || !Array.isArray(cached.shares)) return;
+            loadedMembership = true;
             shares = sortByAddedAt(cached.shares.map(normalizeShare));
             updatedAt = cached.updatedAt || 0;
             onChange();
@@ -168,6 +172,7 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
                     }
                     const server: SharesData = await readGraphJson(r, 'shares:onedrive-load');
                     if (!server || !Array.isArray(server.shares)) return;
+                    loadedMembership = true;
                     if ((server.updatedAt || 0) <= updatedAt) return;
                     shares = sortByAddedAt(server.shares.map(normalizeShare));
                     updatedAt = server.updatedAt;
@@ -256,6 +261,7 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
                 addedAt: now,
                 updatedAt: now,
             };
+            loadedMembership = true;
             shares = sortByAddedAt([...shares, record]);
             updatedAt = now;
             await saveLocal();

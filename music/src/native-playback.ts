@@ -1,7 +1,9 @@
 import type { NativeLibrary } from './native-library.js';
 import { createPlaybackUi, timeString } from './playback-ui.js';
 import type { FolderPath } from './tree.js';
-import type { PlaybackInfo } from './playback.js';
+import type { LibraryQueue } from './tracks.js';
+import type { TimerDuration } from './settings.js';
+import type { PlaybackMode, PlaybackInfo } from './playback.js';
 
 interface RangeBar {
     readonly name?: string;
@@ -13,9 +15,18 @@ interface RangeBar {
 
 interface NativeSample {
     readonly bars?: RangeBar[];
+    readonly mode?: PlaybackMode;
+    readonly session?: string;
+    readonly folder?: FolderPath;
+    readonly folderKey?: string;
+    readonly revision?: number;
+    readonly fenced?: boolean;
+    readonly title?: string;
     readonly item?: string;
+    readonly targetRevision?: number;
+    readonly advanced?: boolean;
     readonly path?: FolderPath;
-    readonly state?: 'loading' | 'positioning' | 'playing' | 'paused' | 'stalled' | 'error' | 'ended';
+    readonly state?: 'buffering' | 'positioning' | 'playing' | 'paused' | 'error' | 'ended';
     readonly position?: number;
     readonly duration?: number;
     readonly message?: string;
@@ -25,24 +36,55 @@ interface PlaybackReply { readonly sequence: number; readonly snapshot: NativeSa
 
 /** Swift owns the clock and queue. Each document paints only replies newer than its last sample. */
 export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
-    updateTree: (info: PlaybackInfo | undefined) => void, reveal: (path: FolderPath) => void,
-    showError: (message: string) => void) {
+    updateTree: (info: PlaybackInfo | undefined, advanced?: boolean) => void, reveal: (path: FolderPath) => void,
+    showError: (message: string) => void,
+    rebuild?: (folder: FolderPath, key: string) => Promise<LibraryQueue | undefined> | undefined,
+    getAccess?: () => {connected?: string[]; denied: string[]},
+    saveFavoriteMode?: (folder: FolderPath, mode: PlaybackMode) => Promise<void>) {
     footer.classList.add('native-player');
     let sample: NativeSample = {};
     let sequence = 0;
     let sampledAt = 0;
     const position = () => Math.min(sample.duration ?? 0, (sample.position ?? 0) +
         (sample.state === 'playing' ? (performance.now() - sampledAt) / 1000 : 0));
-    let positionTimer: number | undefined;
-    let positionWaitVisible = false;
-    let treeItem: string | undefined;
+    let bufferTimer: number | undefined;
+    let bufferWaitVisible = false;
+    let targetCommands = 0;
+    let treePath: string | undefined;
+    let issuedRevision = 0;
+    let buildGeneration = 0;
+    let refreshGeneration = 0;
+    let pendingSelection: {queue: LibraryQueue; key?: string; timer: TimerDuration; mode?: PlaybackMode} | undefined;
+    let intent: {id: string; base: Promise<string>} | undefined;
+    let pendingRevision = false;
+    let awaitingSave = false;
+    let publication: {done: Promise<void>; resolve: () => void} | undefined;
+    let refreshing: Promise<void> | undefined;
+    let refreshAgain = false;
+    let retrying = false;
+    let lastAccess: string | undefined;
     let treePhase: PlaybackInfo['phase'] | undefined;
-    function paintIndicators(): void {
-        const loading = sample.state === 'loading' || sample.state === 'stalled' || positionWaitVisible;
+    function paintIndicators(advanced = false, targetChanged = false): void {
+        // Only a sustained input wait can show the spinner. Once visible it covers local
+        // preparation between reads until Swift reports playable output for this target.
+        const canStartWait = !targetCommands && sample.state === 'buffering';
+        if (targetChanged || (sample.state !== 'positioning' && sample.state !== 'buffering')) bufferWaitVisible = false;
+        if (targetChanged || !canStartWait) {
+            window.clearTimeout(bufferTimer);
+            bufferTimer = undefined;
+        }
+        if (canStartWait && !bufferWaitVisible && bufferTimer === undefined) {
+            bufferTimer = window.setTimeout(() => {
+                bufferWaitVisible = true;
+                paintIndicators();
+            }, 250);
+        }
+        const loading = bufferWaitVisible;
         const phase = loading ? 'loading' : 'loaded';
-        if (treeItem !== sample.item || treePhase !== phase) {
-            updateTree(sample.path ? {folder: sample.path.slice(0, -1), track: sample.path, phase} : undefined);
-            treeItem = sample.item;
+        const path = JSON.stringify([sample.folder, sample.path]);
+        if (treePath !== path || treePhase !== phase) {
+            updateTree(sample.path ? {folder: sample.folder?.length ? sample.folder : sample.path.slice(0, -1), track: sample.path, phase} : undefined, advanced);
+            treePath = path;
             treePhase = phase;
         }
         ui.indicatorSvg.classList.toggle('loading', loading);
@@ -57,45 +99,65 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
         sample = reply.snapshot;
         sampledAt = performance.now();
         const path = sample.path;
-        footer.classList.toggle('visible', !!path);
-        if (sample.state !== 'positioning' || last.state !== 'positioning' || last.item !== sample.item ||
-            action === 'seek' || action === 'skip') {
-            window.clearTimeout(positionTimer);
-            positionWaitVisible = false;
-            // A quick reposition keeps the chosen time visible. A sustained wait still gets feedback.
-            if (sample.state === 'positioning') positionTimer = window.setTimeout(() => {
-                positionWaitVisible = true;
-                paintIndicators();
-            }, 250);
+        footer.classList.toggle('visible', !!sample.item);
+        ui.setModeLabelText(sample.mode ?? 'all');
+        ui.indicatorSvg.setAttribute('aria-disabled', String(!path));
+        if (last.session !== sample.session) {
+            issuedRevision = sample.revision ?? 0;
+            pendingRevision = !!sample.fenced;
+            awaitingSave = false;
+            publication?.resolve();
+            publication = undefined;
+            if (action !== 'start') refreshLibraryQueue().catch(() => { pendingRevision = true; });
         }
-        paintIndicators();
-        if (!path) return;
-        ui.titleEl.textContent = path[path.length - 1];
-        ui.setPlayPausePlaying(['playing', 'positioning', 'stalled', 'loading'].includes(sample.state ?? ''));
+        const itemChanged = last.item !== sample.item;
+        paintIndicators(sample.advanced && !!last.item && itemChanged && last.session === sample.session,
+            itemChanged || last.targetRevision !== sample.targetRevision);
+        if (!sample.item) return;
+        ui.titleEl.textContent = sample.title ?? path?.at(-1) ?? '';
+        ui.setPlayPausePlaying(['playing', 'positioning', 'buffering'].includes(sample.state ?? ''));
         if (strip && !strip.hidden && sample.bars) paintRanges(strip, sample);
         if (!ui.isScrubbing()) ui.scrubberTimeEl.textContent = sample.duration
-            ? `${timeString(position())} / ${timeString(sample.duration)}` : sample.state === 'positioning' ? '0:00' : '';
+            ? `${timeString(position())} / ${timeString(sample.duration)}` : '0:00';
         if (sample.state === 'error' && (last.item !== sample.item || last.state !== 'error'))
             showError(`${sample.message}. Tap Play to retry.`);
     }
 
-    async function send(action: string, args: Record<string, unknown> = {}): Promise<void> {
+    /** Defer a new spinner while a command is in flight. A rejected command keeps the current target's visible wait. */
+    async function applyAndPaint(action: string, args: Record<string, unknown>): Promise<PlaybackReply> {
+        const changesTarget = ['seek', 'skip', 'next', 'previous', 'play', 'pause', 'start'].includes(action);
+        if (changesTarget) { targetCommands++; paintIndicators(); }
         try {
             const debugRanges = !!strip && !strip.hidden && ui.isExpanded() && !document.hidden;
-            paint(await native.playback(action, {...args, debugRanges}) as PlaybackReply, action);
-        } catch {
-            if (action !== 'snapshot') showError('The player could not apply that command. Try again.');
+            const reply = await native.playback(action, {...args, debugRanges}) as PlaybackReply;
+            paint(reply, action);
+            return reply;
+        } finally {
+            if (changesTarget) { targetCommands--; paintIndicators(); }
         }
     }
 
+    async function send(action: string, args: Record<string, unknown> = {}): Promise<void> {
+        try { await applyAndPaint(action, args); }
+        catch { if (action !== 'snapshot') showError('The player could not apply that command. Try again.'); }
+    }
+
     const toggle = () => {
-        const action = ['playing', 'positioning', 'loading', 'stalled'].includes(sample.state ?? '') ? 'pause' : 'play';
+        const action = ['playing', 'positioning', 'buffering'].includes(sample.state ?? '') ? 'pause' : 'play';
         send(action, {item: sample.item});
         return action;
     };
     const ui = createPlaybackUi({
         footerEl: footer,
-        getMode: () => 'all',
+        getMode: () => sample.mode ?? 'all',
+        onModeCycleClick: async () => {
+            const {session, mode} = sample;
+            await send('cycleMode', {item: sample.item});
+            if (session === sample.session && mode !== sample.mode && sample.mode && sample.folder) {
+                try { await saveFavoriteMode?.(sample.folder, sample.mode); }
+                catch { showError('Could not save this favorite’s play mode.'); }
+            }
+        },
         getDuration: () => sample.duration || undefined,
         onScrubStart: () => {
             if (!sample.duration) return undefined;
@@ -124,13 +186,154 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
     async function refresh(): Promise<void> {
         if (document.hidden || reading) return;
         reading = true;
-        try { await send('snapshot'); } finally { reading = false; }
+        try {
+            await send('snapshot');
+            if (pendingRevision && !awaitingSave && !retrying && !pendingSelection && !refreshing) {
+                retrying = true;
+                try { await refreshLibraryQueue(); } catch { pendingRevision = true; } finally { retrying = false; }
+            }
+        } finally { reading = false; }
     }
     window.setInterval(refresh, 1000);
     document.addEventListener('visibilitychange', refresh);
     refresh();
+    /** Small albums commit in one message. The chunks of a large library are private
+     * to this document until commit. A newer intent invalidates the loop at its next await. */
+    async function transfer(queue: LibraryQueue, action: 'start' | 'revise', args: Record<string, unknown>): Promise<void> {
+        const generation = ++buildGeneration;
+        const {tracks, ...folder} = queue;
+        const commit = async (data: Record<string, unknown>) => {
+            const reply = await applyAndPaint(action, {...folder, ...args, ...data});
+            if (action === 'revise' && reply.snapshot.session === args.session) {
+                if (reply.snapshot.fenced) throw new Error('Edit is still pending');
+                if ((reply.snapshot.revision ?? 0) >= Number(args.revision)) {
+                    pendingRevision = false;
+                    publication?.resolve();
+                    publication = undefined;
+                }
+            }
+        };
+        try {
+            if (tracks.length <= 512) {
+                await commit({tracks});
+                return;
+            }
+            const build = crypto.randomUUID();
+            await native.playback('beginQueue', {build, count: tracks.length, ...args});
+            for (let offset = 0; offset < tracks.length; offset += 512) {
+                if (generation !== buildGeneration) return;
+                await native.playback('queueChunk', {build, offset, tracks: tracks.slice(offset, offset + 512)});
+            }
+            if (generation === buildGeneration) await commit({build});
+        } catch {
+            if (generation === buildGeneration) {
+                pendingRevision = action === 'revise';
+                showError('The player could not load this queue. Try again.');
+                if (action === 'revise') throw new Error('Queue revision was not acknowledged');
+            }
+        } finally {
+            if (generation === buildGeneration && action === 'start') pendingSelection = undefined;
+        }
+    }
+
+    /** Invalidate a slow build at the tap, before traversal yields to another event. */
+    function beginSelection(): void {
+        ++buildGeneration;
+        ++refreshGeneration;
+        pendingSelection = undefined;
+        const id = crypto.randomUUID();
+        const base = native.playback('intent', {intent: id})
+            .then(reply => (reply as {base: string}).base).catch(() => '');
+        intent = {id, base};
+    }
+
+    async function start(queue: LibraryQueue, index: number, selected: boolean, timer: TimerDuration, mode?: PlaybackMode): Promise<void> {
+        if (!intent) beginSelection();
+        const target = intent!;
+        const generation = buildGeneration;
+        ++refreshGeneration;
+        pendingSelection = {queue, key: selected ? queue.tracks[index].key : undefined, timer, mode};
+        const base = await target.base;
+        if (target !== intent || generation !== buildGeneration) return;
+        await transfer(queue, 'start', {intent: target.id, base, index, selected, timer, ...(mode && {mode})});
+        if (target === intent && !pendingSelection) intent = undefined;
+    }
+
+    /** The next durable library edit must not leave an obsolete successor playing under lock. */
+    async function fenceQueueEdit(): Promise<void> {
+        ++buildGeneration;
+        ++refreshGeneration;
+        while (sample.session && sample.folder?.[1]?.startsWith('fav:')) {
+            const session = sample.session;
+            const revision = ++issuedRevision;
+            const reply = await native.playback('fence', {session, revision}) as PlaybackReply;
+            paint(reply);
+            if (reply.snapshot.session === session && reply.snapshot.fenced && Number(reply.snapshot.revision) >= revision) {
+                pendingRevision = true;
+                awaitingSave = true;
+                return;
+            }
+        }
+    }
+
+    /** Concurrent publishers wait for the same final acknowledgment. Data arriving during
+     * a walk requests another projection before the callers publish their tree changes. */
+    function refreshLibraryQueue(saved = false): Promise<void> {
+        if (saved) awaitingSave = false;
+        if (saved && pendingRevision && !publication) {
+            let resume!: () => void;
+            const done = new Promise<void>(resolve => { resume = resolve; });
+            publication = {done, resolve: resume};
+        }
+        refreshAgain = true;
+        if (!refreshing) refreshing = Promise.resolve().then(async () => {
+            try {
+                while (refreshAgain) {
+                    refreshAgain = false;
+                    await projectLibrary();
+                }
+            } finally { refreshing = undefined; }
+        });
+        // A transient transfer failure or an unloaded share leaves the original edit
+        // waiting. A later projection wakes its publisher after Swift accepts the order.
+        const waiting = saved && publication;
+        return waiting ? refreshing.catch(() => { pendingRevision = true; }).then(() => waiting.done) : refreshing;
+    }
+
+    async function projectLibrary(): Promise<void> {
+        const refresh = ++refreshGeneration;
+        ++buildGeneration;
+        const access = getAccess?.();
+        const signature = JSON.stringify(access);
+        if (access && signature !== lastAccess) {
+            lastAccess = signature;
+            try { paint(await native.playback('access', access) as PlaybackReply); }
+            catch { lastAccess = undefined; if (pendingRevision) throw new Error('Source access is pending'); return; }
+        }
+        if (awaitingSave) return;
+        if (pendingSelection && rebuild) {
+            const {queue, key, timer, mode} = pendingSelection;
+            const latest = await rebuild(queue.folder, queue.folderKey);
+            if (refresh !== refreshGeneration || !latest) return;
+            const index = key ? latest.tracks.findIndex(t => t.key === key) : 0;
+            if (latest.tracks[index]) { await start(latest, index, !!key, timer, mode); return; }
+            ++buildGeneration;
+            pendingSelection = undefined;
+            showError('The selected track or folder is no longer available.');
+        }
+        if (!sample.session || !sample.folder?.length || !sample.folderKey || !rebuild) return;
+        const session = sample.session;
+        const queue = await rebuild(sample.folder, sample.folderKey);
+        if (refresh !== refreshGeneration || session !== sample.session) return;
+        if (!queue && pendingRevision) throw new Error('Waiting for the playlist’s source index');
+        if (queue) await transfer(queue, 'revise', {session: sample.session, revision: ++issuedRevision});
+    }
     return {
-        start: (tracks: {driveId: string; itemId: string; path: FolderPath}[], index: number) => send('start', {tracks, index}),
+        start, beginSelection, fenceQueueEdit,
+        refreshLibraryQueue,
+        confirmShare: (root: string) => send('allow', {root}),
+        setTimer: (timer: TimerDuration) => send('timer', {timer}),
+        currentFolder: () => sample.folder,
         collapse: () => ui.setExpanded(false),
         setDebugEnabled(enabled: boolean): void {
             if (!strip || strip.hidden === !enabled) return;

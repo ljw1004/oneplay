@@ -12,6 +12,7 @@ block = 65536
 tail_requested = Event()
 metered_request = Event()
 stalled_fixture = Event()
+opening_cancelled = Event()
 
 
 class Fixture(BaseHTTPRequestHandler):
@@ -30,6 +31,13 @@ class Fixture(BaseHTTPRequestHandler):
             self.end_headers()
             for offset in range(lo, hi+1, block):
                 self.wfile.write(bytes([offset // block]) * block)
+                if self.path == '/window-next-cancel' and offset == 0:
+                    # Another request from the reopened decoder releases the abandoned response.
+                    if not opening_cancelled.wait(5):
+                        stalled_fixture.set()
+                    return
+                if self.path == '/window-next-cancel' and lo == block:
+                    opening_cancelled.set()
                 if self.path == '/window-wifi' and offset == 0:
                     # Full-response buffering deadlocks here. The decoder needs the head, then the tail.
                     if not tail_requested.wait(5):
@@ -252,14 +260,69 @@ import Foundation
             again.cancelAndDrain()
             specPool.clear()
         }
+        // The manual Next opening is available before the rolling window reaches it.
+        // Two HTTP reads cover the metered prefix and independent tail; reopening is cache-only.
+        let earlyPool = MediaPool()
+        let earlySize = Int64(12*65536)
+        let inspecting = DispatchSemaphore(value: 0)
+        let openingWindow = MediaRanges.SuccessorWindow { inspecting.signal(); return MediaRanges.openingPrefix }
+        let opening = try MediaRanges(location("window-next-opening", size: earlySize), drive:"d", item:"next",
+                                      pool:earlyPool, speculative:true, successorWindow: openingWindow, trace:{ _ in })
+        let headByte = try opening.read(0, 1)
+        let tailByte = try opening.read(earlySize-1, 1)
+        precondition(headByte == Data([0]) && tailByte == Data([11]) && opening.specBytes == 5*65536)
+        // A high-bitrate decoder can be parked at the first block past the opening when Next is tapped.
+        while inspecting.wait(timeout: .now()) == .success {}
+        let retired = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            do { _ = try opening.read(MediaRanges.openingPrefix, 1); fatalError("Read past early prefix") }
+            catch is CancellationError { retired.signal() }
+            catch { fatalError(error.localizedDescription) }
+        }
+        precondition(inspecting.wait(timeout: .now()+3) == .success)
+        opening.cancelAndDrain()
+        precondition(retired.wait(timeout: .now()+3) == .success)
+        openingWindow.releaseAtJoin()
+        let manual = try MediaRanges(location("window-next-opening", size:earlySize), drive:"d", item:"next",
+                                     pool:earlyPool, speculative:false, trace:{ _ in })
+        for block in 0..<4 {
+            let value = try manual.read(Int64(block)*65536, 1)
+            precondition(value == Data([UInt8(block)]))
+        }
+        let finalByte = try manual.read(earlySize-1, 1)
+        precondition(finalByte == tailByte)
+        manual.cancelAndDrain()
+        // Tap Next after the first block arrives, while the other three blocks are still pending.
+        let partialPool = MediaPool()
+        let partialWindow = MediaRanges.SuccessorWindow { MediaRanges.openingPrefix }
+        let pending = try MediaRanges(location("window-next-cancel", size:earlySize), drive:"d", item:"next",
+                                      pool:partialPool, speculative:true, successorWindow: partialWindow, trace:{ _ in })
+        let finished = DispatchGroup()
+        finished.enter()
+        DispatchQueue.global().async {
+            defer { finished.leave() }
+            _ = try? pending.read(0, 1)
+        }
+        let deadline = Date().addingTimeInterval(3)
+        while partialPool.read(pending.file, at:0) == nil && Date() < deadline { Thread.sleep(forTimeInterval:0.01) }
+        precondition(partialPool.read(pending.file, at:0) != nil)
+        pending.cancelAndDrain()
+        partialWindow.releaseAtJoin()
+        precondition(finished.wait(timeout:.now()+3) == .success && pending.specBytes >= 65536)
+        let afterTap = try MediaRanges(location("window-next-cancel", size:earlySize), drive:"d", item:"next",
+                                       pool:partialPool, speculative:false, trace:{ _ in })
+        let retained = try afterTap.read(0, 1)
+        let missing = try afterTap.read(65536, 1)
+        precondition(retained == Data([0]) && missing == Data([1]))
+        afterTap.cancelAndDrain()
         // A sparse current track leaves 1 MB before EOF. The unmetered successor may fill the remaining
         // 5 MB, even when Core Audio scans beyond the narrow preparation budget before producing PCM.
         let windowPool = MediaPool(unmeteredWiFi: { true })
         let b = Int64(MediaRanges.block)
         var allowance: Int64 = 5_000_000
+        let growingWindow = MediaRanges.SuccessorWindow { allowance }
         let next = try MediaRanges(location("window-successor", size: 128*b), drive: "d", item: "next",
-                                   pool: windowPool, speculative: true, wifiOnly: { true },
-                                   successorPrefix: { allowance }, trace: { _ in })
+                                   pool: windowPool, speculative: true, successorWindow: growingWindow, trace: { _ in })
         _ = try next.read(0, 1)
         _ = try next.read(allowance/b*b-1, 1)
         _ = try next.read(128*b-1, 1) // independent tail, charged once
@@ -267,6 +330,7 @@ import Foundation
         try next.extendWindow(from: 0, to: allowance)
         _ = try next.read(allowance/b*b-1, 1)
         precondition(windowPool.read(next.file, at: allowance/b*b) == nil && next.specBytes == b)
+        growingWindow.releaseAtJoin()
         next.promote()
         let retainedHead = try next.read(0, 1)
         precondition(retainedHead == Data([0]))
@@ -322,6 +386,8 @@ import Foundation
     switched = [r for p, r in requests if p == '/window-switch']
     assert switched[0] == f'bytes=0-{11*block-1}'
     assert len(switched) == 2 and switched[1] in (f'bytes={block}-{2*block-1}', f'bytes={block}-{5*block-1}'), switched
+    assert [r for p, r in requests if p == '/window-next-cancel'] == [f'bytes=0-{4*block-1}', f'bytes={block}-{5*block-1}']
+    assert [r for p, r in requests if p == '/window-next-opening'] == [f'bytes=0-{4*block-1}', f'bytes={11*block}-{12*block-1}']
     assert [r for p, r in requests if p == '/window-successor'] == [
         f'bytes=0-{76*block-1}', f'bytes={127*block}-{128*block-1}', f'bytes={76*block}-{91*block-1}']
     sought = [r for p, r in requests if p == '/window-seek']

@@ -134,6 +134,8 @@
 
 ## Media playback and MediaSession
 
+- An exact-duration query can turn a streaming MP3 open into a full-file scan. Test cached startup with an unindexed file and withhold every middle byte until audio plays. Indexed synthetic files miss this failure. [Phone trace and decoder measurements](music/ai/AUDIO-FETCHING.md#build-28-cellular-next-on-an-unindexed-mp3)
+
 - A streaming regression test can hold back a response after its first block until the decoder asks for a distant tail. This proves incremental delivery without a timing threshold. Surface fixture timeouts on the main test thread so a closed socket cannot accidentally pass the test. [Transport checks](experiments/ios-playback/tools/check-ranges.py)
 
 - Measure decoder reads, HTTP ranges, connection reuse and time to first PCM separately. On a slow link an MP3 opening its tail can stall behind a single whole-file transfer. A cached seek can also become cold when replacing the decoder discards its compressed bytes. [iOS and PWA traces](experiments/ios-playback/Evidence/phase5/BUFFERING.md)

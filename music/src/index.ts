@@ -13,7 +13,7 @@ import { createPlayback, type Playback, type PlaybackMode, isValidMode } from '.
 import { createFavorites, type Favorites } from './favorites.js';
 import { createSelect, type Select } from './select.js';
 import { createDownloads, type Downloads, classifyOfflineBadgeState } from './downloads.js';
-import { collectPhysicalTracks, resolveFolderFromPath, resolveTrackIds } from './tracks.js';
+import { buildLibraryQueue, collectPhysicalTracks, resolveFolderFromPath, resolveTrackIds } from './tracks.js';
 import {
     runSearchSingleWalk,
     runSearchIncrementalRefinement,
@@ -176,6 +176,7 @@ auth.onEvidenceChange = (newState, prevState) => {
 
 let tree: TreeView | undefined;
 let playback: Playback | undefined;
+let nativeLibraryGeneration = 0;
 let nativePlayer: ReturnType<typeof attachNativePlayback> | undefined;
 let favorites: Favorites | undefined;
 let select: Select | undefined;
@@ -235,6 +236,11 @@ const sync = createIndexSync({
     accountData,
     getTree: () => tree,
     getPlayback: () => playback,
+    onPlaybackRootsChange: () => {
+        ++nativeLibraryGeneration;
+        nativePlayer?.refreshLibraryQueue().catch(logCatch('queue refresh'));
+    },
+    onShareAccessConfirmed: root => nativePlayer?.confirmShare(root),
     getFavorites: () => favorites,
     getSelect: () => select,
     getSettings: () => settings,
@@ -493,6 +499,7 @@ function openSettingsPage(): void {
             timerDuration = next;
             localStorage.setItem('oneplay_music_timer_duration', next);
             playback?.setTimerDuration(next);
+            nativePlayer?.setTimer(next);
         },
         onThemeChange: (next) => {
             themePreference = next;
@@ -547,7 +554,7 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
 
             tree.onTrackClick = (path) => playback!.playTrack(path, accountData);
             tree.onPlayClick = (path) => { playback!.playFolder(path, accountData).catch(logCatch('playFolder')); };
-            playback.onPlaybackChange = (info) => tree!.setPlaybackInfo(info);
+            playback.onPlaybackChange = tree.setPlaybackInfo;
             playback.onPlayBlockedNoPlayableTracks = () => {
                 alert('No offline tracks are available here.');
             };
@@ -558,31 +565,47 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
                 tree!.revealTrack(info.track);
             };
         } else if (native) {
+            const denied = () => shares?.getDeniedRootKeys() ?? new Set<string>();
+            const describe = (folder: readonly string[], key?: string) =>
+                favorites && buildLibraryQueue(folder, new Map(tree!.getRoots()), [...favorites.getAll()], denied(), key);
             nativePlayer = attachNativePlayback(native, document.getElementById('footer')!,
-                info => tree!.setPlaybackInfo(info), path => {
+                tree.setPlaybackInfo, path => {
                     if (settings?.isOpen()) closeSettingsPage();
                     tree!.revealTrack(path);
-                }, showToastMessage);
-            const playAlbum = async (folderPath: readonly string[], selected?: string) => {
+                }, showToastMessage, describe, () => ({...(shares?.hasLoadedMembership?.() && {connected: shares.getAll().map(s => s.rootKey)}), denied: [...denied()]}), async (folder, mode) => {
+                    const favorite = favorites?.getAll().find(f => folder[1] === 'fav:' + f.id);
+                    if (favorite?.hasPrivatePlayback) await favorites!.setMode(favorite.id, mode);
+                });
+            let selection = 0;
+            const playAlbum = async (folderPath: readonly string[], trackPath?: readonly string[]) => {
                 const evidence = native.getEvidence();
                 if (evidence === 'evidence:not-online' || evidence === 'evidence:signed-out') {
                     showToastMessage('Connect to OneDrive to play this track.');
                     return;
                 }
-                const root = accountData.get(folderPath[1]);
-                const folder = resolveFolderFromPath(folderPath, accountData);
-                if (!root || !folder || shares?.getDeniedRootKeys().has(folderPath[1])) {
-                    showToastMessage('Choose a track in a OneDrive album folder.');
-                    return;
+                const intent = ++selection;
+                nativePlayer!.beginSelection();
+                let generation = nativeLibraryGeneration;
+                let queue = await describe(folderPath);
+                let index = trackPath ? queue?.tracks.findIndex(t =>
+                    t.path.length === trackPath.length && t.path.every((part, i) => part === trackPath[i])) : 0;
+                const tappedKey = trackPath && index !== undefined ? queue?.tracks[index]?.key : undefined;
+                // Keep the identity from the tapped tree even if its row moves during a large walk.
+                while (intent === selection && queue && generation !== nativeLibraryGeneration) {
+                    generation = nativeLibraryGeneration;
+                    queue = await describe(queue.folder, queue.folderKey);
+                    index = trackPath ? queue?.tracks.findIndex(t => t.key === tappedKey) : 0;
                 }
-                const tracks = sortedFolderChildren(folder).filter(([, isFolder]) => !isFolder).map(([name]) => ({
-                    path: [...folderPath, name], driveId: root.driveId, itemId: folder.children[name].id,
-                }));
-                const index = selected ? tracks.findIndex(track => track.path.at(-1) === selected) : 0;
-                if (!tracks[index]) { showToastMessage('No tracks in this folder.'); return; }
-                await nativePlayer!.start(tracks, index);
+                if (intent !== selection) return;
+                if (!queue || index === undefined || !queue.tracks[index]) { showToastMessage('No playable tracks in this folder.'); return; }
+                const favorite = favorites?.getAll().find(f => folderPath[1] === 'fav:' + f.id);
+                const mode = favorite ? (favorite.hasPrivatePlayback && isValidMode(favorite.mode) ? favorite.mode : 'all') : undefined;
+                await nativePlayer!.start(queue, index, !!trackPath, timerDuration, mode);
             };
-            tree.onTrackClick = path => playAlbum(path.slice(0, -1), path[path.length - 1]);
+            tree.onTrackClick = path => {
+                const folder = nativePlayer!.currentFolder();
+                return playAlbum(folder?.length && folder.every((part, i) => part === path[i]) ? folder : path.slice(0, -1), path);
+            };
             tree.onPlayClick = path => playAlbum(path);
         }
 
@@ -815,9 +838,11 @@ async function ensureFavorites(): Promise<void> {
     if (ensureFavoritesPromise) return ensureFavoritesPromise;
 
     ensureFavoritesPromise = (async () => {
-        favorites = createFavorites({ authFetch: auth.fetch, dbGet, dbPut }, () => {
+        const publishFavorites = async () => {
             // onChange: sync favorite roots into tree and re-render
             if (tree) {
+                ++nativeLibraryGeneration;
+                await nativePlayer?.refreshLibraryQueue(true);
                 tree.setFavorites(favorites!);
                 if (select) select.setRoots(tree.getRoots());
                 // Update playback context so logical path resolution uses fresh data
@@ -825,6 +850,16 @@ async function ensureFavorites(): Promise<void> {
                 // Recompute offline state (favorites may have changed offlinePin)
                 computeAndPushOfflineState();
             }
+        };
+        favorites = createFavorites({authFetch: auth.fetch, dbGet, dbPut, fenceQueueEdit: () => {
+            ++nativeLibraryGeneration;
+            return nativePlayer?.fenceQueueEdit();
+        }}, origin => {
+            const published = publishFavorites();
+            // A remote edit may reference a share whose index this same sync still has to load.
+            // Keep its tree publication pending while the sync proceeds with that prerequisite.
+            if (origin === 'sync' && nativePlayer) { published.catch(logCatch('publish synced favorite')); return; }
+            return published;
         });
 
         await favorites.loadFromCache();

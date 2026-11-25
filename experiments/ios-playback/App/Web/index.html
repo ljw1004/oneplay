@@ -1,0 +1,14 @@
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<p id="result">Checking the bundled module…</p>
+<script>
+(async () => {
+    const result = { origin: location.origin };
+    try {
+        const fixture = await import('./fixture.js');
+        result.module = fixture.marker;
+        await fixture.checkStorage(result);
+    } catch (e) { result.error = String(e); }
+    document.querySelector('#result').textContent = JSON.stringify(result);
+    webkit.messageHandlers.storage.postMessage(result);
+})();
+</script>

@@ -132,6 +132,8 @@
 
 ## Media playback and MediaSession
 
+- **Check both sides of a recorded audio join independently.** A queue transition callback can arrive on time while the output has a gap. Align waveforms on both sides against an independent edit on the same route. Periodic fades need an onset or a level check to disambiguate repeated cycles.
+
 - **Reset media element state before async track switches to prevent stale event races.**
 - **Drive play/pause UI from media events, not optimistic click updates.**
 - **Do not auto-advance on media errors.** Stop, surface failure, and preserve user control.
@@ -161,3 +163,5 @@
 - **Isolate destructive auth/token tests in throwaway browser profiles.** Shared profiles should stay usable for manual workflows.
 - **Neutralize service-worker interference in integration harnesses.** Unregister/stub as needed to avoid stale shell or reload side effects.
 - **Budget explicit waits for real production startup work.** Token refresh and first render can require deterministic grace time.
+
+- On a USB-connected iPhone, the status-bar setting alone does not establish which route carried a test download. Record URLSession transaction metrics per request, including the cellular flag, across the whole run. A native PCM tap can measure joins under lock without requiring the listener to time a screen recording. See the [M17 device measurements](music/ai/PLAN-M17-ios.md#gate-2-measurements-on-luphone13-2026-11-24).

@@ -10,7 +10,8 @@
  * - Startup terminal UI/deadline policy (owned by index-startup.ts).
  * - App composition/tree-playback-select wiring (owned by index.ts).
  */
-import type { Auth, EvidenceState } from './auth.js';
+import { readGraphJson, type Auth, type EvidenceState } from './auth.js';
+import type { NativeLibrary } from './native-library.js';
 import { dbGet, dbPut, dbDelete, dbClear } from './db.js';
 import { log, logError, logCatch, errorMessage, errorDetail } from './logger.js';
 import {
@@ -19,14 +20,13 @@ import {
     type AccountInfo,
     type IndexProgress,
     type MusicFolder,
-    isMusicFolder,
-    SCHEMA_VERSION,
+    isCurrentIndex,
     fetchAccountInfo,
     buildIndex,
 } from './indexer.js';
 import type { TreeView } from './tree.js';
 import type { Playback } from './playback.js';
-import type { Favorites, RootsMap } from './favorites.js';
+import type { Favorites } from './favorites.js';
 import type { Select } from './select.js';
 import type {
     SettingsView,
@@ -41,13 +41,13 @@ type SearchReason = 'share-roots';
 
 interface ShareProbeResult {
     readonly share: ShareRecordPersisted;
-    readonly status: 'ok' | 'denied' | 'failed';
+    readonly status: 'ok' | 'denied' | 'failed' | 'skipped';
     readonly driveItem?: MusicDriveItem;
     readonly failureMessage?: string;
 }
 
 export interface IndexSyncDeps {
-    readonly auth: Auth;
+    readonly auth: Auth | NativeLibrary;
     readonly startupErrorMessage: string;
     readonly accountData: Map<string, { folder: MusicFolder; driveId: string }>;
     readonly getTree: () => TreeView | undefined;
@@ -163,39 +163,15 @@ function readTestSettingsShareRowsFromHook(): SettingsShareRow[] | undefined {
             id: x.id,
             label: x.label,
             deniedReason: typeof x.deniedReason === 'string' ? x.deniedReason : undefined,
-            removeImpactTracks: typeof x.removeImpactTracks === 'number' ? x.removeImpactTracks : 0,
-            removeImpactFavorites: typeof x.removeImpactFavorites === 'number' ? x.removeImpactFavorites : 0,
+            getRemoveImpact: () => ({
+                uniqueTrackCount: x.removeImpactTracks ?? 0, affectedFavoriteCount: x.removeImpactFavorites ?? 0,
+            }),
         }));
 }
 
-function buildItemIdMapForRoot(driveId: string, folder: MusicFolder): Map<string, { driveId: string; path: string[] }> {
-    const map = new Map<string, { driveId: string; path: string[] }>();
-    const walk = (f: MusicFolder, currentPath: string[]): void => {
-        map.set(f.id, { driveId, path: currentPath });
-        for (const [name, child] of Object.entries(f.children)) {
-            const childPath = [...currentPath, name];
-            if (isMusicFolder(child)) walk(child, childPath);
-            else map.set(child.id, { driveId, path: childPath });
-        }
-    };
-    walk(folder, []);
-    return map;
-}
-
-function buildPerRootIdMaps(roots: RootsMap):
-Map<string, Map<string, { driveId: string; path: string[] }>> {
-    const result = new Map<string, Map<string, { driveId: string; path: string[] }>>();
-    for (const [key, root] of roots) {
-        if (root.type === 'onedrive') {
-            result.set(key, buildItemIdMapForRoot(root.info.driveId, root.folder));
-        } else if (root.type === 'share' && root.folder) {
-            result.set(key, buildItemIdMapForRoot(root.driveId, root.folder));
-        }
-    }
-    return result;
-}
-
 export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
+    const native = 'state' in deps.auth ? deps.auth : undefined;
+    const browserAuth = 'handleOauthRedirect' in deps.auth ? deps.auth : undefined;
     let savedInfoRef: AccountInfo | undefined;
     let cachedDataRef: MusicData | undefined;
     let isInitialStartup = false;
@@ -206,6 +182,13 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
     const shareCachedDataByShareId = new Map<string, MusicData>();
     const shareReindexingByShareId = new Map<string, boolean>();
     const shareIndexProgressByShareId = new Map<string, IndexProgress | undefined>();
+
+    // Builds run sequentially. Disconnect aborts reads and waits for any dispatched cache
+    // write before deletion. Reconnecting the same share waits for that deletion in turn.
+    let shareBuild: { recordID: string; cancel: AbortController; done: Promise<void> } | undefined;
+    const deletingShareCaches = new Map<string, Promise<void>>();
+    const stillConnected = (record: ShareRecordPersisted): boolean =>
+        deps.getShares()?.getAll().some(s => s.id === record.id) === true;
 
     let pullTimer: ReturnType<typeof setTimeout> | undefined;
     let pullInFlightPromise: Promise<void> | undefined;
@@ -331,7 +314,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         }
         await Promise.all(records.map(async (share) => {
             const cached = await dbGet<MusicData>(indexShareKey(share.shareId)).catch(() => undefined);
-            if (cached && typeof cached === 'object' && cached.kind === 'MusicData') {
+            if (stillConnected(share) && !deletingShareCaches.has(share.shareId) && cached?.kind === 'MusicData') {
                 shareCachedDataByShareId.set(share.shareId, cached);
             }
         }));
@@ -344,28 +327,12 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         const favorites = getFavorites();
         const tree = getTree();
         if (!shares || !favorites || !tree) return [];
-        return shares.getAll().map((share) => {
-            const impact = shares.computeRemoveImpact(share.rootKey, favorites, tree.getRoots());
-            return {
-                id: share.id,
-                label: share.name,
-                deniedReason: shareDeniedReasonText(shares.getDeniedReason(share.rootKey)),
-                removeImpactTracks: impact.uniqueTrackCount,
-                removeImpactFavorites: impact.affectedFavoriteCount,
-            };
-        });
-    };
-
-    const healFavoritesFromLoadedRoots = async (
-        removedRootKeys: ReadonlySet<string> = new Set(),
-    ): Promise<void> => {
-        const favorites = getFavorites();
-        const tree = getTree();
-        if (!favorites || !tree) return;
-        const roots = tree.getRoots();
-        const perRootMaps = buildPerRootIdMaps(roots);
-        const denied = getShares()?.getDeniedRootKeys() ?? new Set<string>();
-        await favorites.heal(perRootMaps, roots, denied, removedRootKeys);
+        return shares.getAll().map(share => ({
+            id: share.id,
+            label: share.name,
+            deniedReason: shareDeniedReasonText(shares.getDeniedReason(share.rootKey)),
+            getRemoveImpact: () => shares.computeRemoveImpact(share.rootKey, favorites, tree.getRoots()),
+        }));
     };
 
     const removeShareRemoteCacheBestEffort = async (shareId: string): Promise<void> => {
@@ -373,7 +340,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         await deps.auth.fetch(
             `https://graph.microsoft.com/v1.0/me/drive/special/approot:/${namespace}`,
             false,
-            { method: 'DELETE' },
+            { method: 'DELETE', timeoutMs: 30_000 },
         ).catch(logCatch('remove share remote cache'));
     };
 
@@ -384,7 +351,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         const freshInfo = await fetchAccountInfo(deps.auth.fetch);
         if (freshInfo === 'network') {
             logError('failed to fetch account info (network)');
-            deps.auth.transition('no-evidence');
+            browserAuth?.transition('no-evidence');
             if (wasInitialStartup) log('auto-redirect: skipped (no connectivity)');
             if (wasInitialStartup && !cachedData) {
                 log('startup: account info fetch returned network with no cache');
@@ -395,13 +362,21 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         }
         if (freshInfo === 'auth') {
             logError('failed to fetch account info (auth)');
-            deps.auth.transition('evidence:signed-out');
-            const evidence = deps.auth.reconcileEvidenceFromNavigator('index-sync:auto-redirect:tokens-expired');
-            if (shouldAutoRedirect(wasInitialStartup, true, evidence)) {
+            browserAuth?.transition('evidence:signed-out');
+            const evidence = browserAuth?.reconcileEvidenceFromNavigator('index-sync:auto-redirect:tokens-expired');
+            if (browserAuth && evidence && shouldAutoRedirect(wasInitialStartup, true, evidence)) {
                 log('auto-redirect: redirecting (tokens expired)');
-                await deps.auth.attemptSilentRedirect();
+                await browserAuth.attemptSilentRedirect();
                 return undefined;
             }
+            if (!cachedData) deps.renderSignInButtonIntoStatus();
+            return undefined;
+        }
+        // Native owns the drive pairing. No web account update, cache deletion, or
+        // favorites/share pull may run for details belonging to another drive.
+        if (native && native.state.driveID !== freshInfo.driveId) {
+            logError('account details: rejected a different OneDrive account');
+            setLatestIndexFailureFromMessageAndPushUi('OneDrive', 'Reconnect with the account used for this library.');
             if (!cachedData) deps.renderSignInButtonIntoStatus();
             return undefined;
         }
@@ -411,7 +386,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
     const writeFreshAccountInfoIntoStateAndSetSignedIn = (freshInfo: AccountInfo): void => {
         localStorage.setItem('account_info', JSON.stringify(freshInfo));
         savedInfoRef = freshInfo;
-        deps.auth.transition('evidence:signed-in');
+        browserAuth?.transition('evidence:signed-in');
     };
 
     const clearCacheAndAccountDataIfDriveChanged = async (
@@ -445,26 +420,23 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
             { cache: 'no-store' }, // Recursive size can change without a new folder ETag.
         );
         if (!musicR.ok) {
-            const text = await musicR.text().catch(() => '');
-            logError(`music folder fetch failed: ${musicR.status} ${text}`);
+            logError(`music folder fetch failed: ${musicR.status}`);
             if (!cachedData) deps.showError(`Cannot access Music folder: ${musicR.status}`);
             return undefined;
         }
-        return musicR.json();
+        return readGraphJson(musicR, 'music folder');
     };
 
     const refreshIndexIfNeeded = async (
         freshInfo: AccountInfo,
         musicDriveItem: MusicDriveItem,
         cachedData: MusicData | undefined,
-    ): Promise<void> => {
-        if (cachedData
-            && cachedData.size === musicDriveItem.size
-            && cachedData.schemaVersion === SCHEMA_VERSION) {
+    ): Promise<MusicFolder | undefined> => {
+        if (isCurrentIndex(cachedData, musicDriveItem)) {
             log('cache is current, no re-index needed');
             log(`index end: primary status=up-to-date driveId=${freshInfo.driveId}`);
             writeIndexLastUpdatedNow();
-            return;
+            return cachedData.folder;
         }
 
         const tree = getTree();
@@ -491,6 +463,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
                 deps.auth.fetch,
                 freshInfo.driveId,
                 'primary',
+                native?.followContent,
             );
             await dbPut(indexKey(freshInfo.driveId), data).catch(logCatch('dbPut'));
             deps.showTree(freshInfo, data);
@@ -499,7 +472,8 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
             log(`index end: primary status=ok driveId=${freshInfo.driveId} tracks=${data.count} durationMs=${Date.now() - indexStartedAt}`);
             writeIndexLastUpdatedNow();
             deps.computeAndPushOfflineState();
-            deps.auth.transition('evidence:signed-in');
+            browserAuth?.transition('evidence:signed-in');
+            return data.folder;
         } catch (e) {
             latestIndexProgress = undefined;
             updateSettingsIndexSection();
@@ -508,6 +482,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
             setLatestIndexFailureFromErrorAndPushUi('OneDrive', e);
             if (isReindex && cachedData) deps.showTree(freshInfo, cachedData, false);
             if (!cachedData) deps.showError('Indexing failed. Please try again.');
+            return undefined;
         }
     };
 
@@ -524,20 +499,25 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
                     { cache: 'no-store' }, // Recursive size can change without a new folder ETag.
                 );
                 const durationMs = Date.now() - startedAt;
+                if (!stillConnected(share)) return { share, status: 'skipped' };
                 if (!r.ok) {
+                    if (native && r.status === 401 && r.headers.has('X-OnePlay-Account-Error')) {
+                        // MSAL lost the account. Keep this share's last permission state and cached tracks.
+                        log(`share probe requires reconnect (${durationMs}ms, status=401)`);
+                        return { share, status: 'failed' };
+                    }
                     if (r.status === 401 || r.status === 403 || r.status === 404) {
                         shares.setDeniedState(share.rootKey, deniedReasonFromStatus(r.status));
                         log(`share probe denied: ${share.name} (${durationMs}ms, status=${r.status})`);
                         return { share, status: 'denied' };
                     }
-                    const responseText = await r.text().catch(() => '');
-                    const condensed = responseText.trim().replace(/\s+/g, ' ').slice(0, 160);
-                    const failureMessage = condensed ? `${r.status}: ${condensed}` : `Status ${r.status}`;
-                    logError(`share probe failed: ${share.name} status=${r.status} detail=${condensed || '<empty>'}`);
+                    const failureMessage = `Status ${r.status}`;
+                    logError(`share probe failed: ${share.name} status=${r.status}`);
                     setLatestIndexFailureFromMessageAndPushUi(share.name, `Probe failed (${failureMessage})`);
                     return { share, status: 'failed', failureMessage };
                 }
-                const item = await r.json();
+                const item = await readGraphJson(r, 'share probe');
+                if (!stillConnected(share)) return { share, status: 'skipped' };
                 if (!item?.folder) {
                     shares.setDeniedState(share.rootKey, 'Shared folder is no longer accessible');
                     return { share, status: 'denied' };
@@ -546,6 +526,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
                 log(`share probe ok: ${share.name} (${durationMs}ms)`);
                 return { share, status: 'ok', driveItem: item };
             } catch (e) {
+                if (!stillConnected(share)) return { share, status: 'skipped' };
                 logCatch(`share probe ${share.name}`)(e);
                 const failureMessage = errorMessage(e);
                 setLatestIndexFailureFromMessageAndPushUi(share.name, `Probe failed (${failureMessage})`);
@@ -555,11 +536,14 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         return new Map(results.map((r) => [r.share.shareId, r]));
     };
 
-    const refreshShareIndexesSequentially = async (probes: Map<string, ShareProbeResult>): Promise<void> => {
+    const refreshShareIndexesSequentially = async (probes: Map<string, ShareProbeResult>, currentFolders: Map<string, MusicFolder>): Promise<void> => {
         const shares = getShares();
         if (!shares || !getTree()) return;
         for (const share of shares.getAll()) {
+            const deleting = deletingShareCaches.get(share.shareId);
+            if (deleting) await deleting;
             const probe = probes.get(share.shareId);
+            if (!stillConnected(share) || probe?.share.id !== share.id) continue;
             const driveItem = probe?.driveItem;
             if (!driveItem || probe?.status !== 'ok') {
                 log(`index end: share status=skipped share=${share.name} reason=${probe?.status ?? 'no-probe'}`);
@@ -569,7 +553,8 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
             }
 
             const cached = shareCachedDataByShareId.get(share.shareId);
-            if (cached && cached.size === driveItem.size && cached.schemaVersion === SCHEMA_VERSION) {
+            if (isCurrentIndex(cached, driveItem)) {
+                currentFolders.set(share.rootKey, cached.folder);
                 log(`index end: share status=up-to-date share=${share.name}`);
                 shareReindexingByShareId.set(share.shareId, false);
                 shareIndexProgressByShareId.set(share.shareId, undefined);
@@ -582,8 +567,9 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
             updateSettingsIndexSection();
 
             const buildStartedAt = Date.now();
-            log(`index start: share share=${share.name} shareId=${share.shareId}`);
-            try {
+            log(`index start: share share=${share.name}`);
+            const cancel = new AbortController();
+            const done = (async () => {
                 const data = await buildIndex(
                     driveItem,
                     (p) => {
@@ -593,25 +579,38 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
                     deps.auth.fetch,
                     share.driveId,
                     shareCacheNamespace(share.shareId),
+                    native?.followContent,
+                    cancel.signal,
                 );
+                if (!stillConnected(share)) return;
                 await dbPut(indexShareKey(share.shareId), data).catch(logCatch('dbPut share index'));
+                if (!stillConnected(share)) return;
                 shareCachedDataByShareId.set(share.shareId, data);
+                currentFolders.set(share.rootKey, data.folder);
                 const buildDurationMs = Date.now() - buildStartedAt;
                 log(`index end: share status=ok share=${share.name} tracks=${data.count} durationMs=${buildDurationMs}`);
+            })();
+            shareBuild = { recordID: share.id, cancel, done };
+            try {
+                await done;
             } catch (e) {
+                if (cancel.signal.aborted || !stillConnected(share)) continue;
                 logError(`index end: share status=failed share=${share.name} durationMs=${Date.now() - buildStartedAt}`);
                 const fallbackStack = e instanceof Error && typeof e.stack === 'string' && e.stack.trim()
                     ? undefined
                     : (new Error('Captured stack for share index failure logging')).stack;
                 logError(
-                    `share index failed label=${share.name} shareId=${share.shareId} `
-                    + `rootKey=${share.rootKey}: ${errorDetail(e)}`
+                    `share index failed label=${share.name} `
+                    + `${errorDetail(e)}`
                     + (fallbackStack ? `\n${fallbackStack}` : ''),
                 );
                 setLatestIndexFailureFromErrorAndPushUi(share.name, e);
             } finally {
-                shareReindexingByShareId.set(share.shareId, false);
-                shareIndexProgressByShareId.set(share.shareId, undefined);
+                shareBuild = undefined;
+                if (stillConnected(share)) {
+                    shareReindexingByShareId.set(share.shareId, false);
+                    shareIndexProgressByShareId.set(share.shareId, undefined);
+                }
                 syncShareRootsIntoTreeAndPlayback();
                 updateSettingsIndexSection();
             }
@@ -630,21 +629,23 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         if (!freshInfo) return;
         writeFreshAccountInfoIntoStateAndSetSignedIn(freshInfo);
 
-        const evidence = deps.auth.reconcileEvidenceFromNavigator('index-sync:auto-redirect:token-refresh');
-        if (shouldAutoRedirect(wasInitialStartup, false, evidence)) {
+        const evidence = browserAuth?.reconcileEvidenceFromNavigator('index-sync:auto-redirect:token-refresh');
+        if (browserAuth && evidence && shouldAutoRedirect(wasInitialStartup, false, evidence)) {
             log('auto-redirect: redirecting (token refresh)');
-            await deps.auth.attemptSilentRedirect();
+            await browserAuth.attemptSilentRedirect();
             return;
         }
 
-        const cacheForThisAccount = await clearCacheAndAccountDataIfDriveChanged(savedInfo, freshInfo, cachedData);
+        const cacheForThisAccount = browserAuth
+            ? await clearCacheAndAccountDataIfDriveChanged(savedInfo, freshInfo, cachedData)
+            : cachedData;
         showTreeFromCachedDataIfPresent(freshInfo, cacheForThisAccount);
 
         await getFavorites()?.pullFavoritesFromOneDrive();
         await getShares()?.pullFromOneDrive();
         await loadShareIndexesFromCacheIntoState();
         syncShareRootsIntoTreeAndPlayback();
-        deps.auth.transition('evidence:signed-in');
+        browserAuth?.transition('evidence:signed-in');
 
         const [musicDriveItem, shareProbes] = await Promise.all([
             fetchMusicFolderMetadataOrShowError(cacheForThisAccount),
@@ -653,11 +654,14 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         setSettingsCheckingForUpdatesInFlight(false);
         if (!musicDriveItem) return;
         log(`music folder: ${musicDriveItem.name}, size=${musicDriveItem.size}`);
-        await refreshIndexIfNeeded(freshInfo, musicDriveItem, cacheForThisAccount);
+        const currentFolders = new Map<string, MusicFolder>();
+        const primary = await refreshIndexIfNeeded(freshInfo, musicDriveItem, cacheForThisAccount);
+        if (primary) currentFolders.set(freshInfo.driveId, primary);
         getTree()?.setSyncing(false);
-        await refreshShareIndexesSequentially(shareProbes);
+        await refreshShareIndexesSequentially(shareProbes, currentFolders);
         syncShareRootsIntoTreeAndPlayback();
-        await healFavoritesFromLoadedRoots();
+        const tree = getTree();
+        if (tree) await getFavorites()?.heal(tree.getRoots(), currentFolders);
     };
 
     const pullMusicFolderFromOneDrive = async (
@@ -725,7 +729,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
     };
 
     const requestStartupPullIfEvidenceAllows = async (): Promise<void> => {
-        const evidence = deps.auth.reconcileEvidenceFromNavigator('index-sync:startup-pull-gate', { logUnchanged: true });
+        const evidence = browserAuth?.reconcileEvidenceFromNavigator('index-sync:startup-pull-gate', { logUnchanged: true }) ?? deps.auth.getEvidence();
         if (evidence === 'evidence:not-online') {
             log('skipping pull: evidence is not-online');
             return;
@@ -739,14 +743,30 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
     };
 
     const onShareRemoved = async (record: ShareRecordPersisted): Promise<void> => {
+        const writer = shareBuild?.recordID === record.id ? shareBuild : undefined;
+        writer?.cancel.abort();
+        const previous = deletingShareCaches.get(record.shareId);
+        const deletion = (async () => {
+            await previous;
+            // A write may already be in Graph's hands or an open IDB transaction.
+            // Its result (including failure) is owned by the build above.
+            await writer?.done.catch(() => {});
+            shareCachedDataByShareId.delete(record.shareId);
+            shareReindexingByShareId.delete(record.shareId);
+            shareIndexProgressByShareId.delete(record.shareId);
+            await dbDelete(indexShareKey(record.shareId)).catch(logCatch('share index delete'));
+            await removeShareRemoteCacheBestEffort(record.shareId);
+        })();
+        deletingShareCaches.set(record.shareId, deletion);
+        try { await deletion; }
+        finally {
+            if (deletingShareCaches.get(record.shareId) === deletion) deletingShareCaches.delete(record.shareId);
+        }
+        if (getShares()?.getAll().some(s => s.rootKey === record.rootKey)) return;
         getShares()?.setDeniedState(record.rootKey, undefined);
-        shareCachedDataByShareId.delete(record.shareId);
-        shareReindexingByShareId.delete(record.shareId);
-        shareIndexProgressByShareId.delete(record.shareId);
-        await dbDelete(indexShareKey(record.shareId)).catch(logCatch('share index delete'));
-        await removeShareRemoteCacheBestEffort(record.shareId);
         syncShareRootsIntoTreeAndPlayback();
-        await healFavoritesFromLoadedRoots(new Set([record.rootKey]));
+        const tree = getTree();
+        if (tree) await getFavorites()?.heal(tree.getRoots(), new Map(), record.rootKey);
         deps.computeAndPushOfflineState();
         updateSettingsIndexSection();
     };

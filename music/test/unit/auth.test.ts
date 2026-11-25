@@ -280,3 +280,22 @@ describe('auth oauth redirect code-exchange failure handling', () => {
         });
     });
 });
+
+it('preserves caller abort on a response body after headers arrive', async () => {
+    await withAuthTestEnv(true, async () => {
+        const cancel = new AbortController();
+        let streamSignal: AbortSignal | undefined;
+        globalThis.fetch = async (_url, options) => {
+            const signal = options!.signal!;
+            streamSignal = signal;
+            return new Response(new ReadableStream({ start(stream) {
+                signal.addEventListener('abort', () => stream.error(signal.reason), { once: true });
+            } }));
+        };
+        const response = await createAuth().fetch('https://graph.microsoft.com/v1.0/$batch', false,
+            { signal: cancel.signal, timeoutMs: 10_000 });
+        cancel.abort();
+        assert.equal(streamSignal?.aborted, true);
+        await assert.rejects(response.text(), { name: 'AbortError' });
+    });
+});

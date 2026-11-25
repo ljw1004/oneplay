@@ -54,6 +54,17 @@ export type AuthFetch = (
     options?: AuthFetchOptions,
 ) => Promise<Response>;
 
+/** JSON parsers can quote parts of a signed URL or a token in their exceptions.
+ * Retain the request operation and status before the error reaches any caller or log. */
+export async function readGraphJson(response: Response, operation: string): ReturnType<Response['json']> {
+    const text = await response.text().catch((error): never => {
+        if (isAbortError(error)) throw error;
+        throw new Error(`${operation}: body unreadable status=${response.status}`);
+    });
+    try { return JSON.parse(text); }
+    catch { throw new Error(`${operation}: invalid JSON status=${response.status}`); }
+}
+
 /** True when a thrown value represents intentional cancellation. */
 export const isAbortError = (e: unknown): boolean =>
     e instanceof Error && e.name === 'AbortError';
@@ -157,20 +168,19 @@ const base64UrlEncode = (array: Uint8Array): string =>
  * Converts an exception into a synthetic Response (503). Allows callers to
  * have a single error-handling path for both network failures and HTTP errors.
  */
-const errorResponse = (url: string, e: unknown): Response => {
-    const message = `${e instanceof Error ? e.message : String(e)} (${url})`;
-    return new Response(message, { status: 503, statusText: 'Cannot make request' });
+const errorResponse = (): Response => {
+    return new Response('Network unavailable', { status: 503, statusText: 'Cannot make request' });
 };
 
 /** Synthetic timeout response used when wrapper-level timeoutMs elapses. */
-const timeoutResponse = (url: string, timeoutMs: number): Response =>
-    new Response(`Timeout after ${timeoutMs}ms (${url})`, {
+const timeoutResponse = (timeoutMs: number): Response =>
+    new Response(`Timeout after ${timeoutMs}ms`, {
         status: 504,
         statusText: 'Request timed out',
     });
 
 /** Awaitable delay that can be canceled by an AbortSignal. */
-async function waitForMsWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+export async function waitForMsWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
     if (!signal) {
         await new Promise<void>((resolve) => setTimeout(resolve, ms));
         return;
@@ -208,27 +218,28 @@ async function myFetch(url: string, retryOn429: boolean, options?: AuthFetchOpti
         if (callerSignal?.aborted) throw createAbortError();
         let timedOut = false;
         const mergedController = new AbortController();
-        const onCallerAbort = callerSignal ? () => mergedController.abort() : undefined;
-        if (callerSignal && onCallerAbort) callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+        // A Response body may still be streaming after fetch returns its headers.
+        // Preserve the caller's signal on that stream for the lifetime of the body.
+        const fetchSignal = callerSignal && timeoutMs !== undefined
+            ? AbortSignal.any([callerSignal, mergedController.signal])
+            : callerSignal ?? mergedController.signal;
         const timeoutId = timeoutMs === undefined ? undefined : setTimeout(() => {
             timedOut = true;
             mergedController.abort();
         }, timeoutMs);
         try {
-            const r = await fetch(url, { ...requestInit, signal: mergedController.signal });
+            const r = await fetch(url, { ...requestInit, signal: fetchSignal });
             if (timeoutId !== undefined) clearTimeout(timeoutId);
-            if (callerSignal && onCallerAbort) callerSignal.removeEventListener('abort', onCallerAbort);
             if ((r.status !== 429 && r.status !== 503) || !retryOn429) return r;
-            log(`${r.status}: will retry ${url}`);
+            log(`${r.status}: will retry request`);
             await waitForMsWithAbort(r.status === 429 ? 2000 : 10000, callerSignal);
         } catch (e) {
             if (timeoutId !== undefined) clearTimeout(timeoutId);
-            if (callerSignal && onCallerAbort) callerSignal.removeEventListener('abort', onCallerAbort);
             if (isAbortError(e)) {
-                if (timedOut && !callerSignal?.aborted) return timeoutResponse(url, timeoutMs ?? 0);
+                if (timedOut && !callerSignal?.aborted) return timeoutResponse(timeoutMs ?? 0);
                 throw e;
             }
-            return errorResponse(url, e);
+            return errorResponse();
         }
     }
 }
@@ -310,12 +321,11 @@ const exchangeCodeForToken = async (
         timeoutMs: 10000,
     });
     if (!r.ok) {
-        const body = await r.text().catch(() => '');
-        if (r.status === 504) return `exchangeCodeForToken: timeout ${body}`;
-        return `exchangeCodeForToken: HTTP ${r.status} ${body}`;
+        if (r.status === 504) return 'exchangeCodeForToken: timeout';
+        return `exchangeCodeForToken: HTTP ${r.status}`;
     }
     const data = await r.json().catch((e: unknown) => e);
-    if (data instanceof Error) return `exchangeCodeForToken: parse ${data.message}`;
+    if (data instanceof Error) return 'exchangeCodeForToken: parse invalid JSON';
     if (typeof data !== 'object' || data === null) return 'exchangeCodeForToken: parse non-object token response';
     const accessToken = (data as { access_token?: unknown }).access_token;
     const refreshToken = (data as { refresh_token?: unknown }).refresh_token;
@@ -407,23 +417,22 @@ export function createAuth(): Auth {
             });
 
             if (!refreshResult.ok) {
-                const body = await refreshResult.text();
                 // Only sentinel tokens on client errors (4xx). Server errors (5xx)
                 // and transient failures should not force sign-out — the refresh
                 // token may still be valid on retry.
                 if (refreshResult.status >= 400 && refreshResult.status < 500) {
-                    const sentinel = `null: ${refreshResult.status} failed to refresh - ${body}`;
-                    logError(`token refresh failed (4xx, sentineling): ${refreshResult.status} ${body}`);
+                    const sentinel = `null: ${refreshResult.status} failed to refresh`;
+                    logError(`token refresh failed (4xx, sentineling): ${refreshResult.status}`);
                     localStorage.setItem('access_token', sentinel);
                     localStorage.setItem('refresh_token', sentinel);
                 } else {
-                    logError(`token refresh failed (transient): ${refreshResult.status} ${body}`);
+                    logError(`token refresh failed (transient): ${refreshResult.status}`);
                 }
                 return refreshResult;
             }
 
             log('refreshed!');
-            const tokenData = await refreshResult.json();
+            const tokenData = await readGraphJson(refreshResult, 'refresh token');
             localStorage.setItem('access_token', tokenData.access_token);
             localStorage.setItem('refresh_token', tokenData.refresh_token);
             // Successful refresh proves tokens are valid — clear auto-redirect
@@ -433,7 +442,7 @@ export function createAuth(): Auth {
             localStorage.removeItem('oneplay_music_redirect_result');
         } catch (e) {
             if (isAbortError(e)) throw e;
-            return errorResponse(url, e);
+            return errorResponse();
         } finally {
             AUTH_REFRESH_SIGNAL.signal();
         }
@@ -445,24 +454,19 @@ export function createAuth(): Auth {
 
     const auth: Auth = {
         async fetch(url, retryOn429, options) {
-            try {
-                const onlineBeforeFetch = navigator.onLine;
-                const evidenceBeforeFetch = auth.reconcileEvidenceFromNavigator(
-                    `authFetch:init:${url}`,
-                    onlineBeforeFetch ? { suppressLog: true } : { logUnchanged: true },
-                );
-                if (evidenceBeforeFetch === 'evidence:not-online') {
-                    const offlineResponse = errorResponse(url, 'navigator.onLine=false before fetch');
-                    auth.provideEvidenceFromHttpStatus(offlineResponse.status, `authFetch:skip-offline:${url}`);
-                    return offlineResponse;
-                }
-                const r = await rawAuthFetch(url, retryOn429, options);
-                auth.provideEvidenceFromHttpStatus(r.status, `authFetch:${url}`);
-                return r;
-            } catch (e) {
-                if (isAbortError(e)) throw e;
-                throw e;
+            const onlineBeforeFetch = navigator.onLine;
+            const evidenceBeforeFetch = auth.reconcileEvidenceFromNavigator(
+                'authFetch:init',
+                onlineBeforeFetch ? { suppressLog: true } : { logUnchanged: true },
+            );
+            if (evidenceBeforeFetch === 'evidence:not-online') {
+                const offlineResponse = errorResponse();
+                auth.provideEvidenceFromHttpStatus(offlineResponse.status, 'authFetch:skip-offline');
+                return offlineResponse;
             }
+            const r = await rawAuthFetch(url, retryOn429, options);
+            auth.provideEvidenceFromHttpStatus(r.status, 'authFetch');
+            return r;
         },
 
         getEvidence: () => evidence,
@@ -535,7 +539,6 @@ export function createAuth(): Auth {
             });
             const url = `${AUTHORIZE_URL}?${params}`;
             log(`signIn: redirect_uri=${redirectUri()} scope=${GRAPH_SCOPES}`);
-            log(`signIn: full URL = ${url}`);
             location.href = url;
         },
 
@@ -551,10 +554,7 @@ export function createAuth(): Auth {
             const params = new URLSearchParams(window.location.search);
             const code = params.get('code');
             const error = params.get('error');
-            const errorDesc = params.get('error_description');
-            const errorSubcode = params.get('error_subcode');
-            /** Human-readable error summary combining all error params from Entra. */
-            const errorSummary = [error, errorDesc, errorSubcode].filter(Boolean).join(' | ') || null;
+            const errorSummary = error && /^[a-z_]{1,64}$/.test(error) ? error : error ? 'authorization_failed' : null;
 
             // Exchange code for tokens if we got one
             const authResult = code === null ? undefined : await (async () => {

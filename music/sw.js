@@ -22,6 +22,7 @@ const APP_SHELL = [
     './assets/bigicon.png',
     './dist/index.js',
     './dist/auth.js',
+    './dist/native-library.js',
     './dist/db.js',
     './dist/downloads.js',
     './dist/favorites.js',

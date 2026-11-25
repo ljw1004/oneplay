@@ -2,7 +2,41 @@ const URL = globalThis.__ONEPLAY_TEST_URL;
 
 module.exports = {
 
-    // -- Startup --------------------------------------------------------------
+    /** A request that completes after Reload appears cannot replace it with indexing or the tree. */
+    async "startup: late account details preserve the deadline UI"(page) {
+        await configureStartupScenario(page, { signedIn: true, hangFirstTimeIndexBatch: true,
+            holdAccountDetails: true, startupDeadlineMs: 120 });
+        await page.goto(URL, { waitUntil: "domcontentloaded" });
+        await page.locator(".startup-error").waitFor();
+        await page.waitForFunction(() => typeof window._testReleaseDetails === "function");
+        await page.evaluate(() => window._testReleaseDetails());
+        await page.waitForFunction(() => window._testStartedBatch);
+        assert(await page.locator(".startup-error").isVisible(), "Late indexing replaced Reload");
+    },
+
+    /** All cached roots participate in the first validation of a restored shared-folder path. */
+    async "startup: offline share restores folder and scroll"(page) {
+        await page.route(URL + "seed-share", r => r.fulfill({ contentType: "text/html", body: "<title>Seed</title>" }));
+        await page.goto(URL + "seed-share");
+        await page.evaluate(async () => {
+            const { dbPut } = await import("./dist/db.js");
+            const share = { id: "row", name: "Shared Music", rootKey: "share:abc", shareId: "abc", driveId: "shared", rootItemId: "folder" };
+            const path = ["OnePlay Music", share.rootKey, "Album"];
+            const tracks = Object.fromEntries(Array.from({length:80}, (_, i) => [i + ".mp3", { id: String(i) }]));
+            await dbPut("shares", { shares: [share] });
+            await dbPut("index-share:abc", { kind: "MusicData", count: 80, folder: { id: "s", children: { Album: { id: "a", children: tracks } } } });
+            await dbPut("index:primary", { kind: "MusicData", count: 0, folder: { id: "p", children: {} } });
+            localStorage.account_info = JSON.stringify({ driveId:"primary", displayName:"OneDrive" });
+            localStorage.oneplay_music_view = JSON.stringify({ path, expanded:false });
+            localStorage.oneplay_music_scroll = JSON.stringify({ [JSON.stringify(path)]: { top:180 } });
+        });
+        await page.addInitScript(() => Object.defineProperty(navigator, "onLine", {get: () => false}));
+        await page.goto(URL, {waitUntil:"domcontentloaded"});
+        await page.locator("#tree-container:visible").waitFor();
+        assert(await page.locator("#children .tree-row").count() === 80, "Cached shared album disappeared");
+        assert(await page.locator("#children").evaluate(el => el.scrollTop) === 180, "Saved share scroll was lost");
+    },
+
 
     /** Signed-out + no cache reaches sign-in terminal UI without hanging on placeholder. */
     async "startup: no-auth no-cache shows sign-in terminal"(page) {

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleURLTypes</key><array><dict><key>CFBundleURLSchemes</key><array><string>msauth.$(PRODUCT_BUNDLE_IDENTIFIER)</string></array></dict></array>
+<key>UIBackgroundModes</key><array><string>audio</string></array>
+<key>UIApplicationSceneManifest</key><dict><key>UIApplicationSupportsMultipleScenes</key><false/><key>UISceneConfigurations</key><dict><key>UIWindowSceneSessionRoleApplication</key><array><dict><key>UISceneDelegateClassName</key><string>$(PRODUCT_MODULE_NAME).SceneDelegate</string></dict></array></dict></dict>
+</dict></plist>

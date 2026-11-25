@@ -7,9 +7,9 @@
 
 import { type Favorites, type RootsMap, isFavRef, type Favorite } from './favorites.js';
 import { type MusicFolder, isMusicFolder, walkFolder } from './indexer.js';
-import { log, logCatch, logError, errorMessage } from './logger.js';
+import { log, logCatch, logError } from './logger.js';
 import { resolveWalkableRootForItemRef } from './roots.js';
-import { type AuthFetch } from './auth.js';
+import { readGraphJson, type AuthFetch } from './auth.js';
 
 export interface SharesDeps {
     authFetch: AuthFetch;
@@ -86,24 +86,10 @@ function collectTrackKeysFromFolder(
     }
 }
 
-async function readResponseBodyForLog(response: Response): Promise<string> {
-    try {
-        const text = await response.clone().text();
-        return text || '<empty>';
-    } catch (e) {
-        const msg = errorMessage(e);
-        return `<unreadable body: ${msg}>`;
-    }
-}
-
-async function logAddFromUrlResponse(
-    step: 'meta' | 'driveItem' | 'special-music',
-    response: Response,
-): Promise<void> {
-    const body = await readResponseBodyForLog(response);
-    const msg = `shares:addFromUrl:${step} response url=${response.url} status=${response.status} ok=${response.ok} body=${body}`;
-    if (response.ok) log(msg);
-    else logError(msg);
+/** Graph responses can contain reusable share links. Only the stage and HTTP status enter diagnostics. */
+function logAddFromUrlResponse(step: string, response: Response): void {
+    const write = response.ok ? log : logError;
+    write(`shares:addFromUrl:${step} status=${response.status}`);
 }
 
 async function extractGraphErrorMessage(
@@ -180,7 +166,7 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
                         if (r.status !== 404) logError(`shares: OneDrive load failed: ${r.status}`);
                         return;
                     }
-                    const server: SharesData = await r.json();
+                    const server: SharesData = await readGraphJson(r, 'shares:onedrive-load');
                     if (!server || !Array.isArray(server.shares)) return;
                     if ((server.updatedAt || 0) <= updatedAt) return;
                     shares = sortByAddedAt(server.shares.map(normalizeShare));
@@ -194,7 +180,7 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
         async addFromUrl(url, signal) {
             const trimmed = url.trim();
             if (!trimmed) throw new Error('Share URL is required');
-            log(`shares:addFromUrl start url=${trimmed}`);
+            log('shares:addFromUrl start');
             const token = encodeShareUrlToken(trimmed);
 
             const metaR = await deps.authFetch(
@@ -202,7 +188,7 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
                 false,
                 { headers: { Prefer: 'redeemSharingLink' }, signal },
             );
-            await logAddFromUrlResponse('meta', metaR);
+            logAddFromUrlResponse('meta', metaR);
             if (!metaR.ok) {
                 throw new Error(await extractGraphErrorMessage(
                     metaR,
@@ -221,14 +207,14 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
                 false,
                 { headers: { Prefer: 'redeemSharingLink' }, signal },
             );
-            await logAddFromUrlResponse('driveItem', itemR);
+            logAddFromUrlResponse('driveItem', itemR);
             if (!itemR.ok) {
                 throw new Error(await extractGraphErrorMessage(
                     itemR,
                     `Cannot read shared item (${itemR.status})`,
                 ));
             }
-            const item = await itemR.json();
+            const item = await readGraphJson(itemR, 'share item');
             if (!item?.folder) throw new Error('Only folder shares are supported');
 
             const driveIdRaw = item.parentReference?.driveId;
@@ -243,14 +229,14 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
                     false,
                     { signal },
                 );
-                await logAddFromUrlResponse('special-music', musicR);
+                logAddFromUrlResponse('special-music', musicR);
                 if (!musicR.ok) {
                     throw new Error(await extractGraphErrorMessage(
                         musicR,
                         'Whole-drive share must expose Music folder',
                     ));
                 }
-                rootItem = await musicR.json();
+                rootItem = await readGraphJson(musicR, 'shared music folder');
                 if (!rootItem?.folder) throw new Error('Music special folder is not accessible');
             }
 
@@ -275,7 +261,7 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
             await saveLocal();
             onChange();
             scheduleOneDriveUploadFireAndForget();
-            log(`shares:addFromUrl success shareId=${record.shareId} rootKey=${record.rootKey} driveId=${record.driveId}`);
+            log('shares:addFromUrl success');
             return record;
         },
 

@@ -23,6 +23,16 @@ The boundary rule: UI components do not own network concerns. Network and
 persistence live in domain modules or are orchestrated by `src/index.ts`.
 
 
+### Bundled iOS library
+
+The Xcode target under `ios/` compiles the same TypeScript and serves the selected shell files at `oneplay://app/music/index.html`. Each main document gets one WKWebView and one bridge. A reload or WebKit process exit cancels its library requests and releases unread response files. The native account and player live outside the view. The hosted PWA keeps its service worker, browser PKCE client and HTML audio player.
+
+Swift pairs an MSAL home account with its Graph drive ID. Startup reads that pairing locally, and the page can render the corresponding IndexedDB index before sync. Swift owns account verification, access-token renewal and network evidence. The page receives Graph responses through `native-library.ts`. Large bodies stay in a temporary file while the page acknowledges 256 KiB chunks. The batch indexer's content follow uses the transport that received the redirect.
+
+Swift records auth and media-renewal diagnostics independently of the Debug switch. It atomically queues up to 200 sanitized events on the device, then signals the bundled page. The page pulls after its last rendered ID on a signal or foreground return. Each new page starts with an empty cursor and replays the retained window. Swift keeps the durable copy through delivery. The 📋 panel exposes the last 200 Swift events separately from the 300 JS entries. Sign-out clears the native queue and the WebKit store.
+
+Sign-out records cleanup and the device theme before it yields. Startup completes pending cleanup before loading a page. The marker survives until playback, temporary files, the account's WebKit data and private Keychain credentials have been cleared. Indexed MP3 playback uses the signed target's range decoder. The Debug build provides listening checks from a selected recording or the Files picker. Wiring the shared footer to Swift belongs to phase 5.
+
 ## Module map
 
 - **index.html** — All HTML + CSS. Single `<script type="module">` loads `dist/index.js`. DOM elements: `#status`, `#tree-container` (`#breadcrumbs`, `#children`), `#settings-container`, `#player` (audio), `#footer`, `#action-bar`, `#select-cancel`, `#log-panel`.
@@ -30,7 +40,7 @@ persistence live in domain modules or are orchestrated by `src/index.ts`.
   - **src/index-startup.ts** — Startup terminal/deadline controller. Owns startup race/latch and startup terminal rendering helpers (sign-in/error/deadline).
   - **src/index-sync.ts** — Sync orchestrator. Owns pull single-flight, periodic/online scheduling, account/share probe/index refresh, and settings sync status projection.
 - **src/auth.ts** — OAuth2 PKCE against Microsoft Entra. Exports `authFetch()` — the authenticated fetch wrapper used by every module that talks to Graph API.
-- **src/indexer.ts** — Builds the music index by walking OneDrive via batched Graph API. Per-folder cache files on OneDrive enable Merkle-based incremental re-indexing.
+- **src/indexer.ts** — Builds the music index by walking OneDrive via batched Graph API. Per-folder cache files on OneDrive enable incremental re-indexing by folder path.
 - **src/db.ts** — Key-value wrapper around IndexedDB. Two stores: "data" (index and favorites cache) and "audio" (offline audio blobs).
 - **src/tree.ts** — Renders the hierarchical folder/file view with breadcrumb navigation. The only module that touches `#breadcrumbs` and `#children` DOM elements.
 - **src/playback.ts** — Playback orchestrator. Owns playback state machine and audio element side effects.
@@ -132,19 +142,11 @@ user's OneDrive Music folder.
   - MusicFolder { id, children: { [name]: MusicFolder | MusicFile } }
     - MusicFile { id }
 
-**Merkle property**: OneDrive computes each folder's `size` as the total bytes
-of all descendant files. If any file changes anywhere in a subtree, the `size`
-changes propagate up. Comparing cached `size` against live `size` answers "has
-anything changed?" without traversal. This is how we know when to re-index.
-
-The primary and shared-root probes use `cache: 'no-store'` to obtain that
-live size. Graph can return 304 for a folder's old ETag even when its
-recursive byte count has changed.
-
-**Refresh can report “up to date” for several minutes after a file change.**
-OneDrive's recursive byte count can lag behind an upload or deletion. Refresh
-reads the total Graph currently reports and skips rebuilding while it matches
-the cached index. A later refresh picks up the change once the total differs.
+The primary and shared-root probes request fresh metadata with `cache: 'no-store'`.
+Build 251's schema 1 uses a root `index.json` in each cache namespace. A subfolder's
+filename joins its path segments with underscores, so `A/B` and `A_B` both map to
+`A_B.json` by design. Reuse uses the schema version and recursive byte count.
+OneDrive can take several minutes to propagate that size to ancestors.
 
 In a OneDrive Personal test on 2026-11-24, Graph still reported the old Music
 total 2m 31s after creating `Music/Pop/Queen/alpha.mp3`. The saved Queen index
@@ -185,6 +187,10 @@ human-readable name (the member's folder/file name or referenced favorite's
 name). All code that displays a path segment to the user calls this function.
 
 ### Healing
+
+An ItemRef can be rewritten or removed only after sync confirms its own root's
+current, complete index or the user explicitly disconnects that root. An old
+visible cache or an inaccessible share cannot establish that a track was deleted.
 
 When the index is refreshed, favorites are healed:
 1. ItemRefs are matched first by path (prefer stable location), then by
@@ -432,8 +438,8 @@ pulls are suppressed in signed-out/not-online states.
 
 ### OneDrive/Graph indexing contracts
 
-- Indexing retries use a poison-pill counter with idempotent full-retry
-  semantics; retry/abandon decisions are always logged with counts.
+- Each folder gets one children listing with `$top=10000`. The indexer consumes that page. This per-folder limit is deliberate. [Original indexing decisions](PLAN-M3.md#learnings-from-example-code)
+- Index requests bound their retry and backoff time. Whole-index rebuilds stop after three consecutive failures without batch progress or six attempts in all. A share disconnect waits for a dispatched cache write to settle before deleting the share cache.
 
 ### Settings, shares, and refresh UI contracts
 

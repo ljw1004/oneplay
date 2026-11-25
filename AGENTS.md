@@ -15,6 +15,7 @@ We are working on the music app, unless otherwise stated.
 
 ## Cross-cutting issues
 
+- Changes to the music index’s core data structures, algorithms, persisted format, schema version, encoding, or filenames require the project owner’s explicit sign-off. Schema 1 uses readable path-based filenames. The collision between `A/B` and `A_B` is intentional.
 - Everything should typecheck clean
 - Offline-first architecture: the app always launches from local data (IndexedDB) and is immediately usable. All network calls are background and non-blocking. The network is assumed unreliable at all times — partial connectivity (unauthenticated WiFi, weak cellular) is the norm, not the exception. This principle applies from M3 onward: the index loads from cache first, the tree renders from cache, playback uses cached audio when available, and network failures are surfaced to the user without blocking the UI.
 - Scale-aware: the music library may contain up to 30k tracks in deep directory hierarchies. Every component that touches the index or tree must handle this without blocking the UI thread. The breadcrumb+children design helps (only a small slice is visible at a time), but search results, recursive track counting, and indexing must all be designed with this scale in mind.

@@ -34,6 +34,7 @@ export interface IndexStartupController {
     attachSwControllerChangeReloadListener(): void;
     getStartupTerminalUiState(): Exclude<StartupTerminalState, 'deadline'> | undefined;
     isStartupTerminalUiRendered(): boolean;
+    hasReachedDeadline(): boolean;
     renderStartupErrorIntoStatusAndWireReload(message: string): void;
     showError(message: string): void;
     renderSignInButtonIntoStatus(): void;
@@ -42,15 +43,15 @@ export interface IndexStartupController {
 
 export function createIndexStartup(deps: IndexStartupDeps): IndexStartupController {
     let swControllerChangeListenerAttached = false;
-    let startupTerminated = false;
+    let terminalState: StartupTerminalState | undefined;
     let startupDeadlineGuardActive = false;
     let startupDeadlineBypassedForFirstTimeIndexing = false;
 
     const statusEl = (): HTMLElement => document.getElementById('status')!;
 
     const markStartupTerminalState = (state: StartupTerminalState): void => {
-        if (startupTerminated) return;
-        startupTerminated = true;
+        if (terminalState) return;
+        terminalState = state;
         const message = `startup complete: ${state}`;
         if (state === 'error' || state === 'deadline') logError(message);
         else log(message);
@@ -103,8 +104,8 @@ export function createIndexStartup(deps: IndexStartupDeps): IndexStartupControll
         if (treeContainer instanceof HTMLElement && !treeContainer.hidden) return 'tree';
         const status = document.getElementById('status');
         if (!(status instanceof HTMLElement)) return undefined;
-        if (status.querySelector('button.signin-btn')) return 'sign-in';
         if (status.querySelector('.error-msg, .startup-error')) return 'error';
+        if (status.querySelector('button.signin-btn')) return 'sign-in';
         return undefined;
     };
 
@@ -113,6 +114,7 @@ export function createIndexStartup(deps: IndexStartupDeps): IndexStartupControll
 
     const renderStartupErrorIntoStatusAndWireReload = (message: string): void => {
         const status = statusEl();
+        if (terminalState === 'deadline' && status.querySelector('.startup-error')) return;
         const treeContainer = document.getElementById('tree-container');
         const settingsContainer = document.getElementById('settings-container');
         if (treeContainer instanceof HTMLElement) treeContainer.hidden = true;
@@ -133,6 +135,7 @@ export function createIndexStartup(deps: IndexStartupDeps): IndexStartupControll
     };
 
     const showError = (message: string): void => {
+        if (terminalState === 'deadline') return;
         const treeContainer = document.getElementById('tree-container');
         const settingsContainer = document.getElementById('settings-container');
         if (treeContainer instanceof HTMLElement) treeContainer.hidden = true;
@@ -160,7 +163,7 @@ export function createIndexStartup(deps: IndexStartupDeps): IndexStartupControll
 
     const onBodyLoad = async (startupInner: () => Promise<void>): Promise<void> => {
         log(`====== APP LAUNCH v${deps.appVersionLabel} ========`);
-        startupTerminated = false;
+        terminalState = undefined;
         startupDeadlineGuardActive = true;
         startupDeadlineBypassedForFirstTimeIndexing = false;
         const deadlineMs = startupDeadlineMs();
@@ -168,7 +171,7 @@ export function createIndexStartup(deps: IndexStartupDeps): IndexStartupControll
 
         const startupPromise = startupInner().catch((e) => {
             logError(`startup: unhandled error: ${errorDetail(e)}`);
-            if (startupTerminated) return;
+            if (terminalState) return;
             markStartupTerminalState('error');
             renderStartupErrorIntoStatusAndWireReload(deps.startupErrorMessage);
         });
@@ -181,7 +184,7 @@ export function createIndexStartup(deps: IndexStartupDeps): IndexStartupControll
                 startupPromise.then(() => 'startup' as const),
                 deadlinePromise,
             ]);
-            if (winner === 'deadline' && !startupTerminated) {
+            if (winner === 'deadline' && !terminalState) {
                 if (startupDeadlineBypassedForFirstTimeIndexing) {
                     log(`startup: deadline ignored (${deadlineMs}ms) while first-time indexing continues`);
                 } else {
@@ -192,7 +195,7 @@ export function createIndexStartup(deps: IndexStartupDeps): IndexStartupControll
             }
         } finally {
             startupDeadlineGuardActive = false;
-            if (startupTerminated) return;
+            if (terminalState) return;
             if (winner === 'deadline' && startupDeadlineBypassedForFirstTimeIndexing) return;
             const terminal = getStartupTerminalUiState();
             if (terminal) {
@@ -212,6 +215,7 @@ export function createIndexStartup(deps: IndexStartupDeps): IndexStartupControll
         attachSwControllerChangeReloadListener,
         getStartupTerminalUiState,
         isStartupTerminalUiRendered,
+        hasReachedDeadline: () => terminalState === 'deadline',
         renderStartupErrorIntoStatusAndWireReload,
         showError,
         renderSignInButtonIntoStatus,

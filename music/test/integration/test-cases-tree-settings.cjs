@@ -674,6 +674,18 @@ module.exports = {
         });
     },
 
+    /** A network transition leaves a focused native select attached to the same document. */
+    async "settings: evidence preserves active controls"(page) {
+        await openSettingsPage(page);
+        const retained = await page.evaluate(() => {
+            const select = document.querySelector(".settings-theme-select");
+            select.focus();
+            window._testAuth.transition("evidence:signed-out");
+            return document.activeElement === select && document.querySelector(".settings-pill-reconnect")?.textContent === "Reconnect...";
+        });
+        assert(retained, "Evidence rebuilt the focused Settings control or left an obsolete account action");
+    },
+
     /** Shared section is empty by default; only Add-share action is visible in M13. */
     async "settings: shared section defaults to add-only"(page) {
         await page.evaluate(() => { window._testSettingsShareRows = []; });

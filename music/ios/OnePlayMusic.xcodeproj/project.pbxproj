@@ -1,0 +1,325 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A043 /* MSAL in Frameworks */ = {isa = PBXBuildFile; productRef = A042 /* MSAL */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A027 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = AA0000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = AA0000000000000000000004;
+			remoteInfo = OnePlayMusic;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		A006 /* OnePlayMusic.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; path = OnePlayMusic.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A007 /* OnePlayMusicTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = OnePlayMusicTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A028 /* Project.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Project.xcconfig; sourceTree = "<group>"; };
+		A029 /* App.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = App.xcconfig; sourceTree = "<group>"; };
+		A030 /* Tests.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Tests.xcconfig; sourceTree = "<group>"; };
+		A031 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A032 /* App.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = App.entitlements; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		A020 /* App */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = App;
+			sourceTree = "<group>";
+		};
+		A021 /* Tests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Tests;
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A025 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A043 /* MSAL in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A002 = {
+			isa = PBXGroup;
+			children = (
+				A020 /* App */,
+				A021 /* Tests */,
+				A003 /* Products */,
+				A028 /* Project.xcconfig */,
+				A029 /* App.xcconfig */,
+				A030 /* Tests.xcconfig */,
+				A031 /* Info.plist */,
+				A032 /* App.entitlements */,
+			);
+			sourceTree = "<group>";
+		};
+		A003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A006 /* OnePlayMusic.app */,
+				A007 /* OnePlayMusicTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		AA0000000000000000000004 /* OnePlayMusic */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A011 /* Build configuration list for PBXNativeTarget "OnePlayMusic" */;
+			buildPhases = (
+				A022 /* Sources */,
+				A025 /* Frameworks */,
+				A044 /* Resources */,
+				A023 /* Compile and bundle OnePlay */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				A020 /* App */,
+			);
+			name = OnePlayMusic;
+			packageProductDependencies = (
+				A042 /* MSAL */,
+			);
+			productName = OnePlayMusic;
+			productReference = A006 /* OnePlayMusic.app */;
+			productType = "com.apple.product-type.application";
+		};
+		AA0000000000000000000005 /* OnePlayMusicTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A012 /* Build configuration list for PBXNativeTarget "OnePlayMusicTests" */;
+			buildPhases = (
+				A024 /* Sources */,
+				A033 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				A026 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				A021 /* Tests */,
+			);
+			name = OnePlayMusicTests;
+			productName = OnePlayMusicTests;
+			productReference = A007 /* OnePlayMusicTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		AA0000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+			};
+			buildConfigurationList = A010 /* Build configuration list for PBXProject "OnePlayMusic" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A002;
+			packageReferences = (
+				A041 /* XCRemoteSwiftPackageReference "microsoft-authentication-library-for-objc" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = A003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				AA0000000000000000000004 /* OnePlayMusic */,
+				AA0000000000000000000005 /* OnePlayMusicTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A033 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A044 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A023 /* Compile and bundle OnePlay */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+				"$(SRCROOT)/ShellInputs.xcfilelist",
+			);
+			inputPaths = (
+				"$(SRCROOT)/package-shell.sh",
+				"$(SRCROOT)/ShellInputs.xcfilelist",
+				"$(SRCROOT)/../tsconfig.json",
+				"$(SRCROOT)/../package.json",
+				"$(SRCROOT)/../package-lock.json",
+				"$(SRCROOT)/Project.xcconfig",
+			);
+			name = "Compile and bundle OnePlay";
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Web",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$SRCROOT/package-shell.sh\"";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A022 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A024 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		A026 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = AA0000000000000000000004 /* OnePlayMusic */;
+			targetProxy = A027 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		A013 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A028 /* Project.xcconfig */;
+			buildSettings = {
+				ENABLE_TESTABILITY = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		A014 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A028 /* Project.xcconfig */;
+			buildSettings = {
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
+		A015 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A029 /* App.xcconfig */;
+			buildSettings = {
+			};
+			name = Debug;
+		};
+		A016 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A029 /* App.xcconfig */;
+			buildSettings = {
+			};
+			name = Release;
+		};
+		A017 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A030 /* Tests.xcconfig */;
+			buildSettings = {
+			};
+			name = Debug;
+		};
+		A018 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A030 /* Tests.xcconfig */;
+			buildSettings = {
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A010 /* Build configuration list for PBXProject "OnePlayMusic" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A013 /* Debug */,
+				A014 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A011 /* Build configuration list for PBXNativeTarget "OnePlayMusic" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A015 /* Debug */,
+				A016 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A012 /* Build configuration list for PBXNativeTarget "OnePlayMusicTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A017 /* Debug */,
+				A018 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		A041 /* XCRemoteSwiftPackageReference "microsoft-authentication-library-for-objc" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/AzureAD/microsoft-authentication-library-for-objc";
+			requirement = {
+				kind = exactVersion;
+				version = 2.18.1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A042 /* MSAL */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A041 /* XCRemoteSwiftPackageReference "microsoft-authentication-library-for-objc" */;
+			productName = MSAL;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = AA0000000000000000000001 /* Project object */;
+}

@@ -26,7 +26,7 @@ import { type MusicFolder, type MusicFile, isMusicFolder, walkFolder, sortedFold
 import { type PlaybackMode, isValidMode } from './playback.js';
 import { log, logError, logCatch } from './logger.js';
 import { resolveWalkableRootForItemRef } from './roots.js';
-import { type AuthFetch } from './auth.js';
+import { readGraphJson, type AuthFetch } from './auth.js';
 
 // ---------------------------------------------------------------------------
 // Dependency injection (for testability — see LEARNINGS.md "DI over extraction")
@@ -162,10 +162,9 @@ export interface Favorites {
 
     /** Heal broken references after index refresh. Persists if changes were made. */
     heal(
-        idMapsByRootKey: Map<string, Map<string, { driveId: string; path: string[] }>>,
         roots: RootsMap,
-        deniedRootKeys?: ReadonlySet<string>,
-        removedRootKeys?: ReadonlySet<string>,
+        currentFolders: ReadonlyMap<string, MusicFolder>,
+        removedRootKey?: string,
     ): Promise<void>;
 
     /** Persist to IndexedDB and OneDrive. */
@@ -386,40 +385,19 @@ export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favo
      * 4. If neither — broken. Remove shortcuts entirely; remove playlist members.
      */
     const heal = async (
-        idMapsByRootKey: Map<string, Map<string, { driveId: string; path: string[] }>>,
         roots: RootsMap,
-        deniedRootKeys: ReadonlySet<string> = new Set(),
-        removedRootKeys: ReadonlySet<string> = new Set(),
+        currentFolders: ReadonlyMap<string, MusicFolder>,
+        removedRootKey?: string,
     ): Promise<void> => {
         let changed = false;
-        const hasDeniedShare = [...deniedRootKeys].some((key) => key.startsWith('share:'));
+        const pathsByFolder = new Map<MusicFolder, Map<string, string[]>>();
 
         const healRef = (ref: ItemRef): ItemRef | undefined => {
-            if (ref.sourceRootKey && removedRootKeys.has(ref.sourceRootKey)) {
-                log(`favorites: removing ref from removed root ${ref.sourceRootKey}`);
-                return undefined;
-            }
-            if (ref.sourceRootKey && deniedRootKeys.has(ref.sourceRootKey)) return ref;
-
-            // Try resolving at the stored path
+            if (removedRootKey && ref.sourceRootKey === removedRootKey) return undefined;
             const root = resolveWalkableRootForItemRef(ref, roots);
-            if (!root) {
-                if (ref.sourceRootKey) {
-                    const idMap = idMapsByRootKey.get(ref.sourceRootKey);
-                    const byId = idMap?.get(ref.itemId);
-                    if (byId) {
-                        changed = true;
-                        log(`favorites: heal by ID ${ref.itemId} → ${byId.path.join('/')}`);
-                        return { ...ref, path: byId.path };
-                    }
-                    if (hasDeniedShare && ref.sourceRootKey.startsWith('share:')) return ref;
-                    log(`favorites: broken ref (unresolved root) itemId=${ref.itemId}`);
-                    return undefined;
-                }
-                // Legacy refs without sourceRootKey stay unchanged when root
-                // fallback is unresolved or ambiguous.
-                return ref;
-            }
+            // Only this pull's complete, verified folder can establish absence.
+            // Offline, denied, failed and concurrently replaced roots keep their references.
+            if (!root || currentFolders.get(root.key) !== root.folder) return ref;
             let current: MusicFolder | MusicFile = root.folder;
             let resolved = true;
             for (const seg of ref.path) {
@@ -439,16 +417,27 @@ export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favo
                 return { ...ref, itemId: current.id };
             }
 
-            // Not found at path — try heal by ID
-            const idMap = idMapsByRootKey.get(root.key);
-            const byId = idMap?.get(ref.itemId);
-            if (byId) {
-                changed = true;
-                log(`favorites: heal by ID ${ref.itemId} → ${byId.path.join('/')}`);
-                return { ...ref, path: byId.path };
+            // Most references still resolve at their stored path. Build the reverse
+            // map at most once per root and only after a path actually disappears.
+            let paths = pathsByFolder.get(root.folder);
+            if (!paths) {
+                const byId = new Map<string, string[]>();
+                const visit = (item: MusicFolder | MusicFile, path: string[]): void => {
+                    byId.set(item.id, path);
+                    if (isMusicFolder(item)) {
+                        for (const [name, child] of Object.entries(item.children)) visit(child, [...path, name]);
+                    }
+                };
+                visit(root.folder, []);
+                pathsByFolder.set(root.folder, byId);
+                paths = byId;
             }
-
-            if (ref.sourceRootKey && hasDeniedShare && ref.sourceRootKey.startsWith('share:')) return ref;
+            const path = paths.get(ref.itemId);
+            if (path) {
+                changed = true;
+                log(`favorites: heal by ID ${ref.itemId} → ${path.join('/')}`);
+                return { ...ref, path };
+            }
 
             // Broken
             log(`favorites: broken ref driveId=${ref.driveId} itemId=${ref.itemId} path=${ref.path.join('/')}`);
@@ -458,50 +447,42 @@ export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favo
         // Two-pass healing: first determine which favorites survive, then build
         // the healed list. This prevents forward-reference FavRefs from being
         // removed simply because the target appears later in the array.
-        const survivingIds = new Set(favorites.map(fav => {
-            if (fav.kind === 'playlist') return fav.id; // playlists always survive
-            return healRef(fav.target) ? fav.id : undefined;
-        }).filter((id): id is string => id !== undefined));
+        const surviving = favorites.flatMap((fav): Favorite[] => {
+            if (fav.kind === 'playlist') return [fav];
+            const target = healRef(fav.target);
+            if (target) return [target === fav.target ? fav : { ...fav, target }];
+            changed = true;
+            log(`favorites: removing broken shortcut "${fav.name}"`);
+            return [];
+        });
+        const survivingIds = new Set(surviving.map(fav => fav.id));
 
-        const newFavorites: Favorite[] = [];
-        for (const fav of favorites) {
-            if (fav.kind === 'shortcut') {
-                const healed = healRef(fav.target);
-                if (!healed) {
-                    changed = true;
-                    log(`favorites: removing broken shortcut "${fav.name}"`);
-                    continue;
-                }
-                newFavorites.push(healed === fav.target ? fav : { ...fav, target: healed });
-            } else {
-                // Playlist: heal each ItemRef member, remove broken ones
-                const newMembers: PlaylistMember[] = [];
-                for (const m of fav.members) {
-                    if (isFavRef(m)) {
-                        // FavRef: keep if target survived healing (checked against
-                        // survivingIds to handle both forward and backward refs).
-                        if (survivingIds.has(m.favId)) {
-                            newMembers.push(m);
-                        } else {
-                            changed = true;
-                            log(`favorites: removing broken FavRef to ${m.favId}`);
-                        }
+        const newFavorites = surviving.map((fav): Favorite => {
+            if (fav.kind === 'shortcut') return fav;
+            // Playlist: heal each ItemRef member, remove broken ones
+            const newMembers: PlaylistMember[] = [];
+            for (const m of fav.members) {
+                if (isFavRef(m)) {
+                    // FavRef: keep if target survived healing (checked against
+                    // survivingIds to handle both forward and backward refs).
+                    if (survivingIds.has(m.favId)) {
+                        newMembers.push(m);
                     } else {
-                        const healed = healRef(m);
-                        if (healed) {
-                            newMembers.push(healed);
-                        } else {
-                            changed = true;
-                        }
+                        changed = true;
+                        log(`favorites: removing broken FavRef to ${m.favId}`);
+                    }
+                } else {
+                    const healed = healRef(m);
+                    if (healed) {
+                        newMembers.push(healed);
+                    } else {
+                        changed = true;
                     }
                 }
-                newFavorites.push(
-                    newMembers.length === fav.members.length && newMembers.every((m, i) => m === fav.members[i])
-                        ? fav
-                        : { ...fav, members: newMembers },
-                );
             }
-        }
+            return newMembers.length === fav.members.length && newMembers.every((m, i) => m === fav.members[i])
+                ? fav : { ...fav, members: newMembers };
+        });
 
         if (changed) {
             favorites = newFavorites;
@@ -586,10 +567,11 @@ export function createFavorites(deps: FavoritesDeps, onChange: () => void): Favo
                 if (r.status !== 404) logError(`favorites: OneDrive load failed: ${r.status}`);
                 return;
             }
-            const server: FavoritesData = await r.json();
+            const server: FavoritesData = await readGraphJson(r, 'favorites:onedrive-load');
             if (!server || !Array.isArray(server.favorites)) return;
             if ((server.updatedAt || 0) > updatedAt) {
-                favorites = server.favorites.filter(isValid).map(normalize);                updatedAt = server.updatedAt;
+                favorites = server.favorites.filter(isValid).map(normalize);
+                updatedAt = server.updatedAt;
                 await deps.dbPut(IDB_KEY, toData()).catch(logCatch('favorites:dbPut-server'));
                 log(`favorites: adopted server version (updatedAt=${updatedAt}, ${favorites.length} items)`);
                 onChange();

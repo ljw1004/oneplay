@@ -166,30 +166,15 @@ describe('cycle detection', () => {
 // ---------------------------------------------------------------------------
 
 describe('healing', () => {
-    /** Builds the idToPath map matching the test tree. */
-    function buildIdMap(): Map<string, { driveId: string; path: string[] }> {
-        const m = new Map<string, { driveId: string; path: string[] }>();
-        m.set('root', { driveId: DRIVE_ID, path: [] });
-        m.set('rock', { driveId: DRIVE_ID, path: ['Rock'] });
-        m.set('album1', { driveId: DRIVE_ID, path: ['Rock', 'album1'] });
-        m.set('file1', { driveId: DRIVE_ID, path: ['Rock', 'album1', 'track1.mp3'] });
-        m.set('file2', { driveId: DRIVE_ID, path: ['Rock', 'album1', 'track2.mp3'] });
-        m.set('album2', { driveId: DRIVE_ID, path: ['Rock', 'album2'] });
-        m.set('file3', { driveId: DRIVE_ID, path: ['Rock', 'album2', 'track3.mp3'] });
-        m.set('jazz', { driveId: DRIVE_ID, path: ['Jazz'] });
-        m.set('file4', { driveId: DRIVE_ID, path: ['Jazz', 'standards.mp3'] });
-        return m;
-    }
-
-    const buildPerRootMaps = (): Map<string, Map<string, { driveId: string; path: string[] }>> =>
-        new Map([[DRIVE_ID, buildIdMap()]]);
+    const currentPrimary = (roots: RootsMap) =>
+        new Map([[DRIVE_ID, (roots.get(DRIVE_ID) as Extract<Root, { type: 'onedrive' }>).folder]]);
 
     it('healthy ref: matching path+id is unchanged', async () => {
         const { favs, changeCount } = makeFavs();
         const roots = buildTestRoots();
         await favs.add(shortcut('s1', 'Rock', itemRef(['Rock'], 'rock', true)));
         const before = favs.getAll()[0] as Shortcut;
-        await favs.heal(buildPerRootMaps(), roots);
+        await favs.heal(roots, currentPrimary(roots));
         const after = favs.getAll()[0] as Shortcut;
         // Unchanged — same object reference
         assert.equal(after, before);
@@ -202,7 +187,7 @@ describe('healing', () => {
         const roots = buildTestRoots();
         // Shortcut points to ['Rock'] but with wrong itemId
         await favs.add(shortcut('s1', 'Rock', itemRef(['Rock'], 'wrong-id', true)));
-        await favs.heal(buildPerRootMaps(), roots);
+        await favs.heal(roots, currentPrimary(roots));
         const after = favs.getAll()[0] as Shortcut;
         assert.equal(after.target.itemId, 'rock');
         assert.deepEqual(after.target.path, ['Rock']);
@@ -213,7 +198,7 @@ describe('healing', () => {
         const roots = buildTestRoots();
         // Shortcut points to a stale path, but itemId still in the index
         await favs.add(shortcut('s1', 'Rock', itemRef(['OldRock'], 'rock', true)));
-        await favs.heal(buildPerRootMaps(), roots);
+        await favs.heal(roots, currentPrimary(roots));
         const after = favs.getAll()[0] as Shortcut;
         assert.deepEqual(after.target.path, ['Rock']);
         assert.equal(after.target.itemId, 'rock');
@@ -223,7 +208,7 @@ describe('healing', () => {
         const { favs } = makeFavs();
         const roots = buildTestRoots();
         await favs.add(shortcut('s1', 'Gone', itemRef(['NoSuch'], 'no-such-id', true)));
-        await favs.heal(buildPerRootMaps(), roots);
+        await favs.heal(roots, currentPrimary(roots));
         assert.equal(favs.getAll().length, 0);
     });
 
@@ -235,7 +220,7 @@ describe('healing', () => {
             itemRef(['Ghost'], 'ghost-id', false),         // broken
             itemRef(['Jazz'], 'jazz', true),               // healthy
         ]));
-        await favs.heal(buildPerRootMaps(), roots);
+        await favs.heal(roots, currentPrimary(roots));
         const pl = favs.getAll()[0] as Playlist;
         assert.equal(pl.members.length, 2);
     });
@@ -244,9 +229,9 @@ describe('healing', () => {
         const { favs } = makeFavs();
         const roots = buildTestRoots();
         await favs.add(shortcut('s1', 'Rock', itemRef(['OldRock'], 'rock', true)));
-        await favs.heal(buildPerRootMaps(), roots);
+        await favs.heal(roots, currentPrimary(roots));
         const first = favs.getAll()[0] as Shortcut;
-        await favs.heal(buildPerRootMaps(), roots);
+        await favs.heal(roots, currentPrimary(roots));
         const second = favs.getAll()[0] as Shortcut;
         // After second heal, nothing changed — same reference
         assert.equal(second, first);
@@ -259,7 +244,7 @@ describe('healing', () => {
             itemRef(['Rock'], 'rock', true),
             favRef('deleted-fav'),  // no favorite with this ID
         ]));
-        await favs.heal(buildPerRootMaps(), roots);
+        await favs.heal(roots, currentPrimary(roots));
         const pl = favs.getAll()[0] as Playlist;
         assert.equal(pl.members.length, 1);
     });
@@ -280,15 +265,12 @@ describe('healing', () => {
             ...itemRef(['Rock'], 'wrong-id', true),
             sourceRootKey: 'share:s1',
         }));
-        const perRoot = new Map<string, Map<string, { driveId: string; path: string[] }>>([
-            ['share:s1', buildIdMap()],
-        ]);
-        await favs.heal(perRoot, roots);
+        await favs.heal(roots, new Map([['share:s1', (baseRoot as Extract<Root, { type: 'onedrive' }>).folder]]));
         const sc = favs.getAll()[0] as Shortcut;
         assert.equal(sc.target.sourceRootKey, 'share:s1');
     });
 
-    it('preserves unresolved denied share refs', async () => {
+    it('preserves a cloud favorite if the share index failed to load', async () => {
         const { favs } = makeFavs();
         const roots = buildTestRoots();
         await favs.add(shortcut('s1', 'Denied', {
@@ -298,10 +280,23 @@ describe('healing', () => {
             isFolder: true,
             sourceRootKey: 'share:s1',
         }));
-        await favs.heal(new Map(), roots, new Set(['share:s1']));
+        await favs.heal(roots, currentPrimary(roots));
         const sc = favs.getAll()[0] as Shortcut;
         assert.equal(sc.target.sourceRootKey, 'share:s1');
         assert.equal(sc.target.itemId, 'missing');
+    });
+
+    it('a stale visible share cannot remove or rewrite favorite members', async () => {
+        const { favs, changeCount } = makeFavs();
+        const roots = buildTestRoots();
+        const [folder] = currentPrimary(roots).values();
+        roots.set('share:s1', { type: 'share', key: 'share:s1', name: 'Share', driveId: DRIVE_ID, folder, reindexing: false });
+        const member = { ...itemRef(['Rock'], 'current-cloud-id', true), sourceRootKey: 'share:s1' };
+        await favs.add(playlist('mix', 'Mix', [member]));
+        const before = changeCount();
+        await favs.heal(roots, currentPrimary(roots));
+        assert.equal(changeCount(), before);
+        assert.deepEqual((favs.getAll()[0] as Playlist).members, [member]);
     });
 
     it('removes refs bound to explicitly removed share root', async () => {
@@ -314,7 +309,7 @@ describe('healing', () => {
             isFolder: true,
             sourceRootKey: 'share:s1',
         }));
-        await favs.heal(new Map(), roots, new Set(), new Set(['share:s1']));
+        await favs.heal(roots, new Map(), 'share:s1');
         assert.equal(favs.getAll().length, 0);
     });
 });

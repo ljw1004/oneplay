@@ -470,10 +470,12 @@ async function configureStartupScenario(page, options) {
                 if (!url.includes("graph.microsoft.com/v1.0")) return nativeFetch(input, init);
                 if (url.includes("/v1.0/me/drive?")
                     && url.includes("$select=id,owner")) {
-                    return Promise.resolve(new Response(JSON.stringify({
+                    const reply = new Response(JSON.stringify({
                         id: "startup-test-drive-id",
                         owner: { user: { displayName: "Startup Test Drive" } },
-                    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+                    }), { status: 200, headers: { "Content-Type": "application/json" } });
+                    if (opts.holdAccountDetails) return new Promise(resolve => { window._testReleaseDetails = () => resolve(reply); });
+                    return Promise.resolve(reply);
                 }
                 if (url.includes("/v1.0/me/drive/special/music?")
                     && url.includes("$select=name,id,cTag,eTag,size,lastModifiedDateTime,folder")) {
@@ -488,7 +490,10 @@ async function configureStartupScenario(page, options) {
                         folder: { childCount: 1 },
                     }), { status: 200, headers: { "Content-Type": "application/json" } }));
                 }
-                if (url.includes("/v1.0/$batch")) return new Promise(() => {});
+                if (url.includes("/v1.0/$batch")) {
+                    window._testStartedBatch = true;
+                    return new Promise(() => {});
+                }
                 return Promise.resolve(new Response("", { status: 404 }));
             };
         }

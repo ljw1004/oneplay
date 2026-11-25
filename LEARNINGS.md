@@ -11,6 +11,7 @@
 
 - **Every warning is harmful.** Warnings indicate mismatch between intent and reality; either fix immediately or stop and design a clean fix.
 - **Don't guess; inspect first.** Confirm reality from code/runtime state before recommending changes.
+- **Get the owner’s explicit sign-off before changing the music index’s core data structures or algorithms.** Read the original design first. The single-page folder listing, schema-and-size cache reuse, and readable filenames with accepted collisions are deliberate tradeoffs. If a review or synthetic test challenges one, bring the owner the evidence and the proposed change before modifying or deploying it. [Original indexing decisions](music/ai/PLAN-M3.md#learnings-from-example-code)
 - **Derive contracts from essential data flow.** Identify the minimum data required for correct output; remove extra inputs and document staleness/invariant implications.
 - **Recover intent before deleting code.** Assume dead-looking code had a purpose; verify whether that purpose is now met elsewhere before removal.
 - **Generalize local cleanups into pattern audits.** A good fix in one site is a signal to scan similar call paths for consistency and quality.
@@ -35,6 +36,7 @@
 
 - **Cancelable async work needs real cancellation plumbing.** A visible Cancel button is honest only when it can abort in-flight work via `AbortSignal`.
 - **User cancel and timeout are different contracts.** User cancel is control flow (`AbortError`); timeout is an operational failure path.
+- **Cancel a waiter separately from a shared operation.** A cancelled reader should release its worker even when another caller still needs the same token refresh. Account cleanup must wait for the underlying SDK callback if it can still write credentials.
 - **Protect startup from hangs with a terminal-state latch.** Define structural terminal states and ensure only the first terminal render wins.
 - **Use single-flight coordinators for shared refresh/init paths.** UI disable states alone do not prevent race conditions.
 - **For idempotent async init, guard with an in-flight promise.** `if (ready)` checks alone are unsafe under concurrent callers.

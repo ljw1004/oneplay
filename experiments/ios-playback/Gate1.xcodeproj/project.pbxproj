@@ -5,11 +5,11 @@
  objectVersion = 56;
  objects = {
   A001 = {isa = PBXProject; mainGroup = A002; productRefGroup = A003; targets = (A004); buildConfigurationList = A010; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; knownRegions = (en, Base); projectDirPath = ""; projectRoot = ""; };
-  A002 = {isa = PBXGroup; children = (A020,A021,A022,A023,A024,A040,A041,A042,A043,A025,A003); sourceTree = "<group>"; };
+  A002 = {isa = PBXGroup; children = (A020,A021,A022,A023,A024,A040,A041,A042,A043,A025,A044,A003); sourceTree = "<group>"; };
   A003 = {isa = PBXGroup; children = (A005); name = Products; sourceTree = "<group>"; };
   A004 = {isa = PBXNativeTarget; name = Gate1; productName = Gate1; productReference = A005; productType = "com.apple.product-type.application"; buildConfigurationList = A011; buildPhases = (A006,A007); buildRules = (); dependencies = (); };
   A005 = {isa = PBXFileReference; explicitFileType = wrapper.application; path = Gate1.app; sourceTree = BUILT_PRODUCTS_DIR; };
-  A006 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A030,A050,A051,A052,A053,A031,A034); runOnlyForDeploymentPostprocessing = 0; };
+  A006 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A030,A050,A051,A052,A053,A031,A034,A054); runOnlyForDeploymentPostprocessing = 0; };
   A007 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A032,A033); runOnlyForDeploymentPostprocessing = 0; };
   A010 = {isa = XCConfigurationList; buildConfigurations = (A012,A013); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
   A011 = {isa = XCConfigurationList; buildConfigurations = (A014,A015); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
@@ -23,7 +23,7 @@
   A023 = {isa = PBXFileReference; lastKnownFileType = folder; path = Media; sourceTree = "<group>"; };
   A024 = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Probe.xcconfig; sourceTree = SOURCE_ROOT; };
   A025 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/Splice.swift; sourceTree = "<group>"; };
-  A040 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/RangeDecoder.swift; sourceTree = "<group>"; };
+  A040 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../../music/ios/App/RangeDecoder.swift; sourceTree = "<group>"; };
   A050 = {isa = PBXBuildFile; fileRef = A040; };
   A041 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/MeteredSource.swift; sourceTree = "<group>"; };
   A051 = {isa = PBXBuildFile; fileRef = A041; };
@@ -32,6 +32,8 @@
   A043 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/CellularScreen.swift; sourceTree = "<group>"; };
   A053 = {isa = PBXBuildFile; fileRef = A043; };
   A034 = {isa = PBXBuildFile; fileRef = A025; };
+  A044 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../../music/ios/App/MediaRanges.swift; sourceTree = "<group>"; };
+  A054 = {isa = PBXBuildFile; fileRef = A044; };
   A030 = {isa = PBXBuildFile; fileRef = A020; };
   A031 = {isa = PBXBuildFile; fileRef = A021; };
   A032 = {isa = PBXBuildFile; fileRef = A022; };

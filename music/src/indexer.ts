@@ -3,31 +3,22 @@
  *
  * Builds a complete tree of all folders and audio files in the user's OneDrive
  * Music folder, using a work-queue with batch Graph API requests. Per-folder
- * cache files in the OneDrive App folder enable fast re-indexing: completed
- * subtrees are reused when their `size` hasn't changed (Merkle property).
- *
- * MERKLE PROPERTY: OneDrive computes each folder's `size` as the total bytes
- * of all files in all descendant folders. If ANY file anywhere in a subtree is
- * added, removed, or modified, the `size` changes propagate up to every
- * ancestor. Comparing a cached MusicData's `size` against the live folder
- * `size` therefore answers "has anything changed in this entire subtree?"
- * without traversing it. This is the basis for cache validation: if size +
- * schemaVersion match, the cached subtree is reused as-is. This property also
- * enables resumability — if indexing is interrupted, completed subtrees have
- * their cache files on OneDrive, and on resume those subtrees pass the size
- * check and are skipped.
+ * cache files in the OneDrive App folder are part of a shared format. Reuse a
+ * schema-1 snapshot when the live folder's recursive byte size matches.
  *
  * Adapted from example/musicdata.ts and example/utils.ts.
  */
 
-import { log, logError, logCatch, errorDetail } from './logger.js';
-import { type AuthFetch } from './auth.js';
+import { log, logError, errorDetail } from './logger.js';
+import { readGraphJson, waitForMsWithAbort, type AuthFetch } from './auth.js';
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 export const SCHEMA_VERSION = 1;
+type ContentFollow = (location: string, signal: AbortSignal) => Promise<Response>;
+class IndexThrottleError extends Error {}
 const AUDIO_RE = /\.(mp3|m4a|flac|wav|aac|ogg|wma)$/i;
 
 // ---------------------------------------------------------------------------
@@ -132,6 +123,8 @@ interface BatchResponse {
 /** An item in the indexing work queue. */
 interface WorkItem {
     state: 'START' | 'END';
+    driveItem: MusicDriveItem;
+    parent?: WorkItem;
     requests: BatchRequest[];
     responses: { [id: string]: BatchResponse };
     data: MusicData;
@@ -145,10 +138,7 @@ interface WorkItem {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Cache filename for a folder path. Root → "index.json", otherwise segments
- * joined by underscore. Prioritizes human readability in the App folder.
- */
+/** Schema 1 names root and subtree caches by their path within the namespace. */
 const cacheFilename = (path: string[], cacheNamespace: string): string => {
     const ns = cacheNamespace.trim().replace(/^\/+|\/+$/g, '');
     const prefix = ns ? `${ns}/` : '';
@@ -158,8 +148,13 @@ const cacheFilename = (path: string[], cacheNamespace: string): string => {
 /** Counts all MusicFile nodes recursively under a folder. */
 export function countTracks(folder: MusicFolder): number {
     return Object.values(folder.children).reduce(
-        (n, child) => n + (isMusicFolder(child) ? countTracks(child) : 1), 0
+        (n, child) => n + (isMusicFolder(child) ? countTracks(child) : 1), 0,
     );
+}
+
+/** The shared cache contract uses schema version and recursive byte size for freshness. */
+export function isCurrentIndex(data: MusicData | undefined, folder: MusicDriveItem): data is MusicData {
+    return data?.schemaVersion === SCHEMA_VERSION && data.size === folder.size;
 }
 
 /**
@@ -183,7 +178,7 @@ export async function fetchAccountInfo(
         // (from errorResponse wrapping network exceptions) = no evidence.
         return (r.status >= 400 && r.status < 500) ? 'auth' : 'network';
     }
-    const data = await r.json();
+    const data = await readGraphJson(r, 'account details');
     return { driveId: data.id, displayName: data.owner?.user?.displayName ?? 'OneDrive' };
 }
 
@@ -193,14 +188,16 @@ export async function fetchAccountInfo(
 
 /** Creates a START WorkItem with requests for children listing and cache read. */
 function createStartWorkItem(
-    driveItem: any,
+    driveItem: MusicDriveItem,
     path: string[],
     folder: MusicFolder,
     driveId: string,
     cacheNamespace: string,
+    parent?: WorkItem,
 ): WorkItem {
     return {
         state: 'START',
+        driveItem, parent,
         requests: [
             {
                 id: `children-${driveItem.id}`,
@@ -239,12 +236,14 @@ function createStartWorkItem(
  * silently stored as 0-byte files. text/plain with base64 works correctly.
  */
 function createEndWorkItem(item: WorkItem): WorkItem {
-    const json = JSON.stringify(item.data);
+    const data = { ...item.data, count: countTracks(item.data.folder) };
+    const json = JSON.stringify(data);
     const utf8 = new TextEncoder().encode(json);
     const b64 = btoa(Array.from(utf8, b => String.fromCharCode(b)).join(''));
     return {
         ...item,
         state: 'END',
+        data,
         responses: {},
         requests: [{
             id: `write-${item.data.folder.id}`,
@@ -264,50 +263,37 @@ function createEndWorkItem(item: WorkItem): WorkItem {
  * Cleans up idiosyncrasies of the $batch response. Modifies in place.
  *
  * 1. 302 redirects: batch API doesn't auto-follow content downloads. We
- *    follow them with a plain fetch (the redirect URL contains a SAS token;
- *    an extra Bearer header is harmless).
+ *    follow them without Graph credentials via the transport that issued the batch.
  * 2. Base64-encoded JSON: when batch claims application/json but the body is
  *    a string, it's base64-of-utf8 JSON. Decode it.
  *
  * Adapted from example/utils.ts lines 41-62.
  */
-async function postprocessBatchResponse(response: any): Promise<void> {
-    const promises: Promise<void>[] = [];
-    for (const r of response.responses) {
-        if (r.status === 302) {
-            promises.push(
-                (async (): Promise<void> => {
-                    try {
-                        const location = typeof r.headers?.Location === 'string' ? r.headers.Location : '';
-                        const rr = await fetch(location);
-                        r.headers = {} as any;
-                        rr.headers.forEach((value: string, key: string) => r.headers[key] = value);
-                        r.status = rr.status;
-                        try {
-                            r.body = rr.headers.get('Content-Type')?.includes('application/json')
-                                ? await rr.json()
-                                : await rr.text();
-                        } catch (e) {
-                            logCatch('postprocessBatchResponse')(e);
-                        }
-                    } catch (e) {
-                        // Wrap redirect-follow network failures with batch context so
-                        // index logs include a concrete failing response id + URL.
-                        throw new Error(
-                            `batch redirect follow failed id=${String(r.id)} `
-                            + `location=${String(r.headers?.Location ?? '<missing>')} `
-                            + `detail=${errorDetail(e)}`
-                        );
-                    }
-                })()
-            );
-        } else if (r.headers?.['Content-Type']?.includes('application/json') && typeof r.body === 'string') {
-            r.body = JSON.parse(
-                new TextDecoder().decode(Uint8Array.from(atob(r.body), c => c.codePointAt(0)!))
-            );
+async function postprocessBatchResponse(response: any, followContent: ContentFollow, signal: AbortSignal): Promise<void> {
+    await Promise.all(response.responses.map(async (r: BatchResponse) => {
+        const redirect = r.status === 302;
+        const cacheRead = r.id.startsWith('cache-');
+        try {
+            if (redirect) {
+                const location = new Headers(r.headers).get('Location');
+                if (!location) throw new Error();
+                const rr = await followContent(location, signal);
+                r.status = rr.status;
+                r.body = rr.ok ? (cacheRead || rr.headers.get('Content-Type')?.includes('application/json')
+                    ? await rr.json() : await rr.text()) : undefined;
+            } else if (r.status === 200 && typeof r.body === 'string'
+                && new Headers(r.headers).get('Content-Type')?.includes('application/json')) {
+                r.body = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(r.body), c => c.charCodeAt(0))));
+            }
+        } catch {
+            signal.throwIfAborted();
+            // Neither a signed Location nor a parser error quoting response bytes belongs in diagnostics.
+            const message = `batch ${redirect ? 'redirect follow failed' : 'response invalid encoded JSON'} id=${r.id} status=${r.status}`;
+            if (!cacheRead) throw new Error(message);
+            log(message);
+            r.body = undefined; // The authoritative children listing still suffices for indexing.
         }
-    }
-    await Promise.all(promises);
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -328,15 +314,54 @@ async function buildIndexSingleAttempt(
     authFetch: AuthFetch,
     driveId: string,
     cacheNamespace: string,
+    followContent: ContentFollow,
+    cancel: AbortSignal | undefined,
     onBatchSuccess: (requestCount: number) => void,
 ): Promise<MusicData> {
-    const root: MusicFolder = { id: musicDriveItem.id, children: {} };
+    const root: MusicFolder = { id: musicDriveItem.id, children: Object.create(null) };
     const toProcess: WorkItem[] = [];
     const toFetch: WorkItem[] = [createStartWorkItem(musicDriveItem, [], root, driveId, cacheNamespace)];
-    const waiting = new Map<string, WorkItem>();
     const stats = { bytesFromCache: 0, bytesProcessed: 0, bytesTotal: musicDriveItem.size };
-    let trackCount = 0;
-    let got429recently = false;
+    /** Bound a logical request including body, cache redirects, and throttle backoff. A
+     * mixed batch can contain idempotent cache PUTs. Once dispatched, let that HTTP exchange
+     * finish before acknowledging disconnect so a subsequent DELETE follows its writer. */
+    async function sendBatch(requests: BatchRequest[]): Promise<{ responses: BatchResponse[] }> {
+        const deadline = AbortSignal.timeout(45_000);
+        const signal = cancel ? AbortSignal.any([cancel, deadline]) : deadline;
+        const httpSignal = requests.some(r => r.method === 'PUT') ? deadline : signal;
+        try {
+            for (let attempt = 1; ; attempt++) {
+                signal.throwIfAborted();
+                const r = await authFetch('https://graph.microsoft.com/v1.0/$batch', false, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ requests }), signal: httpSignal,
+                });
+                httpSignal.throwIfAborted();
+                const page = r.ok ? await readGraphJson(r, 'batch POST') : undefined;
+                signal.throwIfAborted(); // A dispatched PUT has now delivered its subresponse.
+                if (r.ok && !Array.isArray(page?.responses)) throw new Error(`batch POST missing responses[] status=${r.status}`);
+                const throttled = r.ok
+                    ? page.responses.find((sub: BatchResponse) => !sub.id.startsWith('cache-')
+                        && (sub.status === 429 || sub.status === 503))
+                    : undefined;
+                const status = throttled?.status ?? r.status;
+                if (status !== 429 && status !== 503) {
+                    if (!r.ok) throw new Error(`batch POST failed status=${status}`);
+                    await postprocessBatchResponse(page, followContent, signal);
+                    signal.throwIfAborted();
+                    return page;
+                }
+                if (attempt === 3) throw new IndexThrottleError(`batch POST still throttled status=${status} after ${attempt} attempts`);
+                const headers = throttled ? new Headers(throttled.headers) : r.headers;
+                const retryAfter = headers.get('Retry-After');
+                const delay = retryAfter !== null && /^\d+$/.test(retryAfter) ? Number(retryAfter) : status === 429 ? 2 : 10;
+                await waitForMsWithAbort(Math.min(delay, 45) * 1000, signal);
+            }
+        } catch (error) {
+            signal.throwIfAborted(); // Preserve the distinction between timeout and user cancellation.
+            throw error;
+        }
+    }
 
     const emitProgress = (item: WorkItem, extra?: string): void => {
         const pathStr = item.path.length === 0 ? 'Music' : item.path.join('/');
@@ -347,6 +372,7 @@ async function buildIndexSingleAttempt(
     };
 
     while (true) {
+        cancel?.throwIfAborted();
         const item = toProcess.shift();
 
         if (item && item.state === 'START') {
@@ -354,52 +380,27 @@ async function buildIndexSingleAttempt(
             const cacheResult = item.responses[`cache-${item.data.folder.id}`];
             const childrenResult = item.responses[`children-${item.data.folder.id}`];
 
-            // 429/503 on children listing: re-queue and delay
-            if (childrenResult.status === 429 || childrenResult.status === 503) {
-                toFetch.unshift({ ...item, responses: {} });
-                got429recently = true;
-                emitProgress(item, 'throttled');
-                continue;
+            if (childrenResult.status !== 200 || !Array.isArray(childrenResult.body?.value)) {
+                throw new Error(`children listing failed id=${childrenResult.id} status=${childrenResult.status}`);
             }
 
-            // Error on children listing
-            if (childrenResult.body?.error) {
-                logError(`children error: ${JSON.stringify(childrenResult.body.error)}`);
-                // Skip this folder rather than crashing — log and continue
-                continue;
-            }
-
-            // Cache hit: size and schemaVersion match → reuse entire subtree
-            if (cacheResult.status === 200
-                && cacheResult.body?.size === item.data.size
-                && cacheResult.body?.schemaVersion === SCHEMA_VERSION) {
+            if (cacheResult?.status === 200 && isCurrentIndex(cacheResult.body, item.driveItem)) {
                 stats.bytesFromCache += item.data.size;
-                trackCount += cacheResult.body.count;
-                // Graft cached folder into the shared root tree
-                if (item.path.length > 0) {
-                    const parentFolder = item.path.slice(0, -1).reduce(
-                        (f, name) => (f.children as any)[name] as MusicFolder, root
-                    );
-                    (parentFolder.children as any)[item.path[item.path.length - 1]] = cacheResult.body.folder;
-                }
-                toProcess.unshift({
-                    ...item, data: cacheResult.body, state: 'END', requests: [], responses: {},
-                });
+                toProcess.unshift({ ...item, data: cacheResult.body, state: 'END', requests: [], responses: {} });
                 emitProgress(item, 'cached');
                 continue;
             }
 
-            // Cache miss: enumerate children
+            // One $top=10000 listing per folder is the deliberate M3 indexing tradeoff.
             for (const child of childrenResult.body.value) {
                 if (child.folder) {
-                    const newFolder: MusicFolder = { id: child.id, children: {} };
+                    const newFolder: MusicFolder = { id: child.id, children: Object.create(null) };
                     (item.data.folder.children as any)[child.name] = newFolder;
-                    toFetch.push(createStartWorkItem(child, [...item.path, child.name], newFolder, item.driveId, item.cacheNamespace));
+                    toFetch.push(createStartWorkItem(child, [...item.path, child.name], newFolder, item.driveId, item.cacheNamespace, item));
                     item.remainingSubfolders++;
                 } else if (child.file && AUDIO_RE.test(child.name)) {
                     (item.data.folder.children as any)[child.name] = { id: child.id };
                     stats.bytesProcessed += child.size;
-                    trackCount++;
                 } else if (child.file) {
                     stats.bytesProcessed += child.size;
                 }
@@ -407,13 +408,10 @@ async function buildIndexSingleAttempt(
 
             // If no subfolders, this item is complete — upload cache
             if (item.remainingSubfolders === 0) {
-                (item.data as any).count = countTracks(item.data.folder);
                 toFetch.unshift(createEndWorkItem(item));
             } else {
                 // Sort alphabetically to finish subtrees faster
-                toFetch.sort((a, b) =>
-                    cacheFilename(a.path, a.cacheNamespace).localeCompare(cacheFilename(b.path, b.cacheNamespace)));
-                waiting.set(cacheFilename(item.path, item.cacheNamespace), item);
+                toFetch.sort((a, b) => a.path.join('/').localeCompare(b.path.join('/')));
             }
             emitProgress(item);
 
@@ -421,27 +419,11 @@ async function buildIndexSingleAttempt(
             // ==================== PROCESS END ====================
             emitProgress(item);
 
-            // Root folder done — return the complete index
-            if (item.path.length === 0) {
-                (item.data as any).count = trackCount;
-                return item.data;
-            }
-
-            // Merge into parent via shared mutable root
-            const parentFolder = item.path.slice(0, -1).reduce(
-                (f, name) => (f.children as any)[name] as MusicFolder, root
-            );
-            (parentFolder.children as any)[item.path[item.path.length - 1]] = item.data.folder;
-
-            // Decrement parent's remaining count; if done, push parent's END
-            const parentKey = cacheFilename(item.path.slice(0, -1), item.cacheNamespace);
-            const parentWorkItem = waiting.get(parentKey)!;
-            parentWorkItem.remainingSubfolders--;
-            if (parentWorkItem.remainingSubfolders === 0) {
-                waiting.delete(parentKey);
-                (parentWorkItem.data as any).count = countTracks(parentWorkItem.data.folder);
-                toFetch.unshift(createEndWorkItem(parentWorkItem));
-            }
+            // Every child completes exactly once, whether enumerated or read from cache.
+            const parent = item.parent;
+            if (!parent) return item.data;
+            (parent.data.folder.children as Record<string, MusicFolder | MusicFile>)[item.driveItem.name] = item.data.folder;
+            if (--parent.remainingSubfolders === 0) toFetch.unshift(createEndWorkItem(parent));
 
         } else {
             // ==================== FETCH BATCH ====================
@@ -454,63 +436,14 @@ async function buildIndexSingleAttempt(
                 thisFetch.push(next);
             }
 
-            if (got429recently) {
-                await new Promise(r => setTimeout(r, 10_000));
-                got429recently = false;
-            }
-
-            const batchResponse = await authFetch(
-                'https://graph.microsoft.com/v1.0/$batch',
-                true,
-                { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ requests }) },
-            );
-            if (!batchResponse.ok) {
-                const body = await batchResponse.text()
-                    .catch((readErr: unknown) => `<body unreadable: ${errorDetail(readErr)}>`);
-                const condensedBody = body.trim().replace(/\s+/g, ' ').slice(0, 240);
-                throw new Error(
-                    `batch POST failed status=${batchResponse.status} `
-                    + `statusText=${batchResponse.statusText || '<empty>'} `
-                    + `body=${condensedBody || '<empty>'}`
-                );
-            }
-
-            const rawBatchResult = await batchResponse.text().catch((readErr: unknown): never => {
-                throw new Error(
-                    `batch POST ok but body unreadable status=${batchResponse.status} `
-                    + `statusText=${batchResponse.statusText || '<empty>'} `
-                    + `detail=${errorDetail(readErr)}`
-                );
-            });
-            let batchResult: any;
-            try {
-                batchResult = JSON.parse(rawBatchResult);
-            } catch (parseErr) {
-                const snippet = rawBatchResult.trim().replace(/\s+/g, ' ').slice(0, 240);
-                throw new Error(
-                    `batch POST ok but invalid JSON status=${batchResponse.status} `
-                    + `statusText=${batchResponse.statusText || '<empty>'} `
-                    + `snippet=${snippet || '<empty>'} `
-                    + `detail=${errorDetail(parseErr)}`
-                );
-            }
-            if (!Array.isArray(batchResult?.responses)) {
-                const snippet = rawBatchResult.trim().replace(/\s+/g, ' ').slice(0, 240);
-                throw new Error(
-                    `batch POST ok but missing responses[] status=${batchResponse.status} `
-                    + `statusText=${batchResponse.statusText || '<empty>'} `
-                    + `snippet=${snippet || '<empty>'}`
-                );
-            }
-            await postprocessBatchResponse(batchResult);
+            if (!requests.length) throw new Error('Index queue exhausted before completing the root');
+            const batchResult = await sendBatch(requests);
             onBatchSuccess(requests.length);
 
             // Distribute responses to their WorkItems
             for (const r of batchResult.responses) {
                 const owner = thisFetch.find(w => w.requests.some(req => req.id === r.id))!;
                 owner.responses[r.id] = r;
-                // Check for 429/503 in individual responses
-                if (r.status === 429 || r.status === 503) got429recently = true;
             }
             toProcess.push(...thisFetch);
         }
@@ -522,8 +455,8 @@ async function buildIndexSingleAttempt(
  * with batch Graph API requests. Per-folder cache files in the App folder
  * enable fast subtree reuse.
  *
- * On any failure, retries the whole build with a poison counter: increment on
- * attempt failure, reset after any successful batch, and give up at 3.
+ * Ordinary failures retry the build up to six times. Three failures without
+ * successful batch progress stop it earlier. Abort and throttle deadlines propagate.
  */
 export async function buildIndex(
     musicDriveItem: MusicDriveItem,
@@ -531,6 +464,8 @@ export async function buildIndex(
     authFetch: AuthFetch,
     driveId: string,
     cacheNamespace: string,
+    followContent: ContentFollow = (url, signal) => fetch(url, { signal, credentials: 'omit' }),
+    signal?: AbortSignal,
 ): Promise<MusicData> {
     let poisonCount = 0;
     let attemptNo = 0;
@@ -543,28 +478,34 @@ export async function buildIndex(
                 authFetch,
                 driveId,
                 cacheNamespace,
+                followContent,
+                signal,
                 (requestCount) => {
                     if (poisonCount === 0) return;
                     poisonCount = 0;
                     log(
                         `index retry poison reset attempt=${attemptNo} `
-                        + `cacheNamespace=${cacheNamespace} requestCount=${requestCount}`
+                        + `index=${cacheNamespace === 'primary' ? 'primary' : 'share'} requestCount=${requestCount}`
                     );
                 },
             );
         } catch (e) {
+            signal?.throwIfAborted();
+            if (e instanceof IndexThrottleError || (e instanceof Error && e.name === 'TimeoutError')) throw e;
             poisonCount++;
-            const action = poisonCount >= 3 ? 'abandon' : 'retry';
+            // A repeatable failure after the same successful batch must still terminate.
+            const exhausted = poisonCount >= 3 || attemptNo >= 6;
+            const action = exhausted ? 'abandon' : 'retry';
             logError(
                 `index retry poison increment attempt=${attemptNo} action=${action} `
-                + `poison=${poisonCount}/3 cacheNamespace=${cacheNamespace} `
+                + `poison=${poisonCount}/3 index=${cacheNamespace === 'primary' ? 'primary' : 'share'} `
                 + `reason=retry-all-failures: ${errorDetail(e)}`
             );
-            if (poisonCount >= 3) {
+            if (exhausted) {
                 logError(
                     `index retry abandon poison=${poisonCount}/3 `
-                    + `cacheNamespace=${cacheNamespace} `
-                    + 'reason=3 consecutive failures'
+                    + `index=${cacheNamespace === 'primary' ? 'primary' : 'share'} `
+                    + (poisonCount >= 3 ? 'reason=3 consecutive failures' : 'reason=6 build attempts')
                 );
                 throw e;
             }

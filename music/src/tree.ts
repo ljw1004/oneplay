@@ -937,7 +937,9 @@ export function createTree(
      *   overflow:auto is restored on #children.
      */
     function render(animate = false): void {
-        if (searchModeOpen) return;
+        // showTree installs account and cached share roots, then favorites. An earlier
+        // render could invalidate a saved share path before its root is available.
+        if (!favoritesRef || searchModeOpen) return;
 
         // FLIP step 1: snapshot old row positions before DOM update
         const oldBounds: Record<string, DOMRect> = {};
@@ -1114,9 +1116,6 @@ export function createTree(
             try { localStorage.setItem('oneplay_music_scroll', JSON.stringify(obj)); } catch { /* quota */ }
         });
     });
-
-    // Initial render
-    render();
 
     return view;
 }

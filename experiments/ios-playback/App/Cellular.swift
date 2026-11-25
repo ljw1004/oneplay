@@ -317,7 +317,7 @@ final class CellularRun: @unchecked Sendable {
                 position(next,Double(max(0,min(clock,scheduled)-boundary))/Double(rate))
                 Thread.sleep(forTimeInterval: 0.015)
             }
-            nextSource.finishRenewal()
+            try nextSource.finishRenewal()
             trace("lookup end item=\(next) playerFrame=\(clock)")
             item = next; origin = boundary; source = nextSource; decoder = nextDecoder
             readPosition = Int64(prefixFrames)

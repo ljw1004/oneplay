@@ -13,7 +13,7 @@
  */
 import { type FolderPath } from './tree.js';
 import { log, logError, errorDetail } from './logger.js';
-import { type AuthFetch, type EvidenceState } from './auth.js';
+import { readGraphJson, type AuthFetch, type EvidenceState } from './auth.js';
 import { type PlaybackMode } from './playback.js';
 import { type TimerDuration } from './settings.js';
 import { cleanMediaSessionTitle } from './media-title.js';
@@ -40,7 +40,7 @@ export async function fetchDownloadUrl(
         logError(`fetchDownloadUrl: ${r.status}`);
         return undefined;
     }
-    const data = await r.json();
+    const data = await readGraphJson(r, 'playback URL');
     return data['@microsoft.graph.downloadUrl'];
 }
 
@@ -469,7 +469,7 @@ export class PlaybackUrlEngine {
                     this.urlCache.set(key, entry2);
                     return undefined;
                 }
-                const data = await r.json();
+                const data = await readGraphJson(r, 'playback URL');
                 const url: string = data['@microsoft.graph.downloadUrl'];
                 const now = Date.now();
                 const parsedExpiry = this.decodeTempauth(url);

@@ -1,16 +1,18 @@
 import { createAuth, isAbortError, type EvidenceState } from './auth.js';
+import { showModal } from './modal.js';
+import { connectBundledLibrary } from './native-library.js';
 import { dbGet, dbPut, dbClear } from './db.js';
-import { log, logError, logCatch, errorDetail } from './logger.js';
+import { log, logError, logCatch } from './logger.js';
 import { initWebLogger } from './logger-web.js';
 import {
-    type MusicData, type AccountInfo, type IndexProgress,
+    type MusicData, type AccountInfo, type IndexProgress, sortedFolderChildren,
 } from './indexer.js';
 import { createTree, type TreeView } from './tree.js';
 import { createPlayback, type Playback, type PlaybackMode, isValidMode } from './playback.js';
 import { createFavorites, type Favorites } from './favorites.js';
 import { createSelect, type Select } from './select.js';
 import { createDownloads, type Downloads, classifyOfflineBadgeState } from './downloads.js';
-import { collectPhysicalTracks, resolveTrackIds } from './tracks.js';
+import { collectPhysicalTracks, resolveFolderFromPath, resolveTrackIds } from './tracks.js';
 import {
     runSearchSingleWalk,
     runSearchIncrementalRefinement,
@@ -26,7 +28,7 @@ import { createShares, type Shares } from './shares.js';
 import { createIndexSync } from './index-sync.js';
 import { createIndexStartup } from './index-startup.js';
 
-initWebLogger();  // so that logger.ts will direct to the webpage
+const displayNativeLog = initWebLogger();
 
 /** Debug mode: shows evidence-state indicator and auto-reloads on SW update. */
 const SW_DEBUG = true;
@@ -155,12 +157,18 @@ function showFavoriteCustomizeToastOnce(): void {
 
 // Auth module (created once at module scope, before any network calls)
 
-const auth = createAuth();
+const native = connectBundledLibrary(displayNativeLog);
+const browserAuth = native ? undefined : createAuth();
+const auth = native ?? browserAuth!;
 auth.onEvidenceChange = (newState, prevState) => {
     log(`evidence: ${prevState} → ${newState}`);
+    if (native && tree) {
+        if (newState === 'evidence:not-online' || newState === 'evidence:signed-out') sync.cancelScheduledPull();
+        else if (prevState === 'evidence:not-online') sync.requestPullFromOneDrive('online').catch(logCatch('native online pull'));
+    }
     downloads?.handleEvidenceTransition();
     computeAndPushOfflineState();
-    if (settings?.isOpen()) openSettingsPage();
+    settings?.updateAuthAction(newState);
 };
 
 // Tree view + playback + favorites (singletons)
@@ -214,7 +222,7 @@ const startup = createIndexStartup({
     getDebugEnabled: () => debugEnabled,
     getTestStartupDeadlineMs: () => getTestHooksWindow()._testStartupDeadlineMs,
     onSignIn: () => {
-        auth.signIn().catch(logCatch('sign-in button'));
+        signInAndRefreshLibrary().catch(logCatch('sign-in button'));
     },
     renderIndexing: (progress) => renderIndexing(progress),
 });
@@ -233,7 +241,7 @@ const sync = createIndexSync({
     ensureShares: () => ensureShares(),
     showTree: (info, data, reindexing = false) => showTree(info, data, reindexing),
     showError: (message) => startup.showError(message),
-    renderSignInButtonIntoStatus: () => startup.renderSignInButtonIntoStatus(),
+    renderSignInButtonIntoStatus: showSignIn,
     renderStartupErrorIntoStatusAndWireReload: (message) => startup.renderStartupErrorIntoStatusAndWireReload(message),
     markStartupTerminalState: (state) => startup.markStartupTerminalState(state),
     enterFirstTimeIndexingAndBypassStartupDeadline: () => startup.enterFirstTimeIndexingAndBypassStartupDeadline(),
@@ -305,12 +313,89 @@ function setRuntimeDebugEnabled(next: boolean): void {
  * This is intentionally destructive and exists to exercise signed-out recovery paths.
  */
 function corruptAuthTokensAndTransitionSignedOutForDebug(): void {
+    if (!browserAuth) return;
     const stamp = new Date().toISOString();
     localStorage.setItem('access_token', `null: debug evidence glyph corrupt access_token ${stamp}`);
     localStorage.setItem('refresh_token', `null: debug evidence glyph corrupt refresh_token ${stamp}`);
     logError(`debug: corrupted access_token and refresh_token via evidence glyph (${stamp})`);
     // "evidence:not-signed-in" from older naming is represented as evidence:signed-out.
-    auth.transition('evidence:signed-out');
+    browserAuth?.transition('evidence:signed-out');
+}
+
+/** The local-file join check is available before the first sign-in and in airplane mode. */
+function showSignIn(): void {
+    if (startup.hasReachedDeadline()) return;
+    startup.renderSignInButtonIntoStatus();
+    if (!native?.state.debugPlayback) return;
+    const localFiles = document.createElement('button');
+    localFiles.textContent = 'Test local MP3 files…';
+    localFiles.addEventListener('click', () => showPlaybackTest());
+    statusEl().appendChild(localFiles);
+}
+
+/** A Debug build can audition local files or up to ten indexed MP3 siblings from the tapped row.
+ * Swift owns the schedule after Play, including every Graph call made under lock. */
+function showPlaybackTest(path?: readonly string[]): void {
+    if (!native?.state.debugPlayback) return;
+    const root = path && accountData.get(path[1]);
+    const folder = path && resolveFolderFromPath(path.slice(0, -1), accountData);
+    const names = folder ? sortedFolderChildren(folder)
+        .filter(([name, isFolder]) => !isFolder && /\.mp3$/i.test(name)).map(([name]) => name) : [];
+    const first = path ? names.indexOf(path[path.length - 1]) : -1;
+    if (path && (!root || !folder || first < 0 || shares?.getDeniedRootKeys().has(path[1]))) {
+        showToastMessage('Choose an MP3 in a OneDrive album folder.');
+        return;
+    }
+    const tracks = root && folder ? names.slice(first, first + 10)
+        .map(name => ({ driveId: root.driveId, itemId: folder.children[name].id })) : undefined;
+    showModal(path ? `Test playback from ${names[first]}` : 'Test local MP3 playback', (modal, close) => {
+        const add = (label: string, action: () => Promise<unknown>) => {
+            const button = document.createElement('button');
+            button.className = 'settings-pill';
+            button.textContent = label;
+            button.addEventListener('click', async () => {
+                close();
+                try { await action(); }
+                catch (error) {
+                    if (error instanceof Error && error.message === 'cancelled') return;
+                    showToastMessage('Could not start the playback test.');
+                    logError('Native playback test command failed');
+                }
+            });
+            modal.appendChild(button);
+        };
+        const play = (nearEnd: boolean, forceRefresh = false, delaySeconds = 0) => tracks
+            ? native.playIndexed(tracks, nearEnd, forceRefresh, delaySeconds)
+            : native.playLocal(nearEnd);
+        add('Play from beginning', () => play(false));
+        add('Play near first join', () => play(true));
+        if (tracks) for (const delay of [0, 5, 10]) {
+            add(delay ? `Force renewal, hold ${delay}s` : 'Force renewal now', () => play(true, true, delay));
+        }
+        add('Playback status', async () => showToastMessage(await native.readPlaybackStatus()));
+        add('Stop playback', native.stopPlayback);
+    });
+}
+
+/** Interactive native sign-in returns to the same page. Cached navigation survives reconnect. */
+async function signInAndRefreshLibrary(): Promise<void> {
+    if (!native) return browserAuth!.signIn();
+    const button = statusEl().querySelector<HTMLButtonElement>('button.signin-btn');
+    if (button) button.disabled = true;
+    try {
+        await native.loadAccountState('signIn');
+        if (!tree) renderIndexing({ fraction: 0, message: 'Opening your OneDrive library...' });
+        await sync.requestPullFromOneDrive('settings-refresh');
+        if (!tree && !startup.isStartupTerminalUiRendered()) startup.renderStartupErrorIntoStatusAndWireReload(STARTUP_ERROR_MESSAGE);
+    } catch (error) {
+        const outcome = error instanceof Error ? error.message : String(error);
+        if (!tree) showSignIn();
+        if (outcome !== 'cancelled') showToastMessage(outcome === 'wrongAccount'
+            ? 'Reconnect with the OneDrive account used for this library.'
+            : 'OneDrive sign-in failed. Please try again.');
+    } finally {
+        if (button) button.disabled = false;
+    }
 }
 
 /** Shows the settings page and keeps tree state untouched for exact restore on close. */
@@ -333,7 +418,8 @@ function openSettingsPage(): void {
                 await Promise.resolve(hooks._testSettingsSignOut());
                 return;
             }
-            await auth.signOut(async () => {
+            if (native) { await native.signOut(themePreference); return; }
+            await browserAuth!.signOut(async () => {
                 localStorage.removeItem('account_info');
                 clearM10State();
                 sync.cancelScheduledPull();
@@ -343,15 +429,14 @@ function openSettingsPage(): void {
         },
         onReconnect: () => {
             if (typeof hooks._testSettingsReconnect === 'function') return hooks._testSettingsReconnect();
-            return auth.signIn();
+            return signInAndRefreshLibrary();
         },
         onRefreshNow: () => {
             if (typeof hooks._testSettingsRefreshNow === 'function') return hooks._testSettingsRefreshNow();
             return sync.requestPullFromOneDrive('settings-refresh');
         },
         onAddShare: async (url, signal) => {
-            const trimmedUrl = url.trim();
-            log(`settings:add-share clicked url=${trimmedUrl}`);
+            log('settings:add-share clicked');
             if (typeof hooks._testSettingsAddShare === 'function') {
                 try {
                     await Promise.resolve(hooks._testSettingsAddShare(url, signal));
@@ -361,7 +446,7 @@ function openSettingsPage(): void {
                     if (signal?.aborted || isAbortError(e)) {
                         log('settings:add-share aborted via test hook');
                     } else {
-                        logError(`settings:add-share failed via test hook: ${errorDetail(e)}`);
+                        logError('settings:add-share failed via test hook');
                     }
                     throw e;
                 }
@@ -371,12 +456,12 @@ function openSettingsPage(): void {
                 const record = await shares.addFromUrl(url, signal);
                 sync.onShareAdded(record);
                 sync.requestPullFromOneDrive('settings-refresh').catch(logCatch('settings add share pull'));
-                log(`settings:add-share success shareId=${record.shareId} rootKey=${record.rootKey}`);
+                log('settings:add-share success');
             } catch (e) {
                 if (signal?.aborted || isAbortError(e)) {
                     log('settings:add-share aborted');
                 } else {
-                    logError(`settings:add-share failed: ${errorDetail(e)}`);
+                    logError('settings:add-share failed');
                 }
                 throw e;
             }
@@ -410,6 +495,7 @@ function openSettingsPage(): void {
             localStorage.setItem('oneplay_music_theme', next);
             applyTheme();
         },
+        onTestLocalPlayback: native?.state.debugPlayback ? () => showPlaybackTest() : undefined,
         theme: themePreference,
         onDebugToggle: (next) => setRuntimeDebugEnabled(next),
     });
@@ -429,6 +515,7 @@ function closeSettingsPage(): void {
  * Creates the tree and playback components on first call; updates data on subsequent calls.
  */
 function showTree(info: AccountInfo, data: MusicData, reindexing = false): void {
+    if (startup.hasReachedDeadline()) return;
     const status = statusEl();
     const treeEl = document.getElementById('tree-container')!;
     const settingsEl = document.getElementById('settings-container')!;
@@ -446,35 +533,39 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
             SW_DEBUG ? DEPLOY_COUNTER : '',
             SW_DEBUG ? EVIDENCE_GLYPHS : undefined);
         settings = createSettings(settingsEl);
-        playback = createPlayback(
-            document.getElementById('player') as HTMLAudioElement,
-            document.getElementById('footer')!,
-            auth.fetch,
-        );
-        playback.setTimerDuration(timerDuration);
+        if (browserAuth) {
+            playback = createPlayback(
+                document.getElementById('player') as HTMLAudioElement,
+                document.getElementById('footer')!,
+                auth.fetch,
+            );
+            playback.setTimerDuration(timerDuration);
 
-        tree.onTrackClick = (path) => playback!.playTrack(path, accountData);
-        tree.onPlayClick = (path) => { playback!.playFolder(path, accountData).catch(logCatch('playFolder')); };
-        playback.onPlaybackChange = (info) => tree!.setPlaybackInfo(info);
-        playback.onPlayBlockedNoPlayableTracks = () => {
-            alert('No offline tracks are available here.');
-        };
-        playback.onChevronClick = () => {
-            const info = playback!.getInfo();
-            if (!info) return;
-            if (settings?.isOpen()) closeSettingsPage();
-            tree!.revealTrack(info.track);
-        };
+            tree.onTrackClick = (path) => playback!.playTrack(path, accountData);
+            tree.onPlayClick = (path) => { playback!.playFolder(path, accountData).catch(logCatch('playFolder')); };
+            playback.onPlaybackChange = (info) => tree!.setPlaybackInfo(info);
+            playback.onPlayBlockedNoPlayableTracks = () => {
+                alert('No offline tracks are available here.');
+            };
+            playback.onChevronClick = () => {
+                const info = playback!.getInfo();
+                if (!info) return;
+                if (settings?.isOpen()) closeSettingsPage();
+                tree!.revealTrack(info.track);
+            };
+        } else if (native?.state.debugPlayback) {
+            tree.onTrackClick = showPlaybackTest;
+        }
 
         // M10: persist view state on path or expanded changes
         tree.onPathChange = (path) => {
             try {
-                const exp = playback!.getInfo() ? (document.getElementById('footer')!.classList.contains('expanded')) : false;
+                const exp = playback?.getInfo() ? (document.getElementById('footer')!.classList.contains('expanded')) : false;
                 localStorage.setItem('oneplay_music_view', JSON.stringify({ path, expanded: exp }));
             } catch { /* quota */ }
         };
         tree.onFavoriteRootTap = () => showFavoriteCustomizeToastOnce();
-        playback.onExpandedChange = (exp) => {
+        if (playback) playback.onExpandedChange = (exp) => {
             const path = tree!.getSelectedPath();
             try {
                 localStorage.setItem('oneplay_music_view', JSON.stringify({ path, expanded: exp }));
@@ -588,7 +679,17 @@ function isPathDeniedByShare(
 }
 
 function computeAndPushOfflineState(): void {
-    if (!favorites || !tree || !downloads) return;
+    if (!tree || !favorites) return;
+    if (!downloads) {
+        if (native && prevEvidence !== native.getEvidence()) {
+            prevEvidence = native.getEvidence();
+            tree.setEvidence(prevEvidence, () => false);
+            tree.render();
+            invalidateSearchData();
+            runSearchAndPushIntoTree('offline-state');
+        }
+        return;
+    }
     const roots = tree.getRoots();
     const allFavs = favorites.getAll();
     const deniedRoots = shares?.getDeniedRootKeys() ?? new Set<string>();
@@ -736,7 +837,7 @@ function wireFavoritesUi(): void {
         select = createSelect(treeEl, actionBarEl, cancelBtnEl, favorites, tree, tree.getRoots());
 
         select.onEnterSelect = () => {
-            playback!.collapse();
+            playback?.collapse();
             document.body.classList.add('select-mode');
         };
         select.onExitSelect = () => {
@@ -765,12 +866,12 @@ function wireFavoritesUi(): void {
     }
 
     // Initialize downloads module (once, after favorites + tree + playback + select)
-    if (!downloads) {
+    if (!downloads && browserAuth) {
         downloads = createDownloads({
             authFetch: auth.fetch,
             getEvidence: () => auth.getEvidence(),
-            provideEvidenceFromHttpStatus: (status, reason) => auth.provideEvidenceFromHttpStatus(status, reason),
-            provideEvidenceFromError: (error, reason) => auth.provideEvidenceFromError(error, reason),
+            provideEvidenceFromHttpStatus: (status, reason) => browserAuth.provideEvidenceFromHttpStatus(status, reason),
+            provideEvidenceFromError: (error, reason) => browserAuth.provideEvidenceFromError(error, reason),
         });
         downloads.onStateChange = () => {
             computeAndPushOfflineState();
@@ -791,6 +892,7 @@ function wireFavoritesUi(): void {
  * Called repeatedly as progress updates arrive.
  */
 function renderIndexing(progress: IndexProgress): void {
+    if (startup.hasReachedDeadline()) return;
     const el = statusEl();
     const pct = Math.round(progress.fraction * 100);
 
@@ -852,15 +954,15 @@ async function startupInner(): Promise<void> {
     } else {
         sync.setLastIndexUpdatedAt(undefined);
     }
-    auth.reconcileEvidenceFromNavigator('startup:init', { logUnchanged: true });
+    browserAuth?.reconcileEvidenceFromNavigator('startup:init', { logUnchanged: true });
 
     // -- M11b: online/offline event listeners (wired early, before any pull) --
-    window.addEventListener('offline', () => {
-        auth.reconcileEvidenceFromNavigator('window:offline');
+    if (browserAuth) window.addEventListener('offline', () => {
+        browserAuth.reconcileEvidenceFromNavigator('window:offline');
         sync.cancelScheduledPull();
     });
-    window.addEventListener('online', () => {
-        auth.reconcileEvidenceFromNavigator('window:online');
+    if (browserAuth) window.addEventListener('online', () => {
+        browserAuth.reconcileEvidenceFromNavigator('window:online');
         sync.requestPullFromOneDrive('online').catch(logCatch('online pull'));
     });
     // Backstop: visibilitychange catches missed online events (PWA/iOS)
@@ -875,8 +977,8 @@ async function startupInner(): Promise<void> {
                 appResumeLogArmed = false;
             }
             const before = auth.getEvidence();
-            const after = auth.reconcileEvidenceFromNavigator('document:visibilitychange');
-            if (before === 'evidence:not-online' && after !== 'evidence:not-online') {
+            const after = browserAuth?.reconcileEvidenceFromNavigator('document:visibilitychange');
+            if (after && before === 'evidence:not-online' && after !== 'evidence:not-online') {
                 sync.requestPullFromOneDrive('online').catch(logCatch('visible pull'));
             }
         }
@@ -885,8 +987,8 @@ async function startupInner(): Promise<void> {
     // reconcile once more at first visible opportunity before any startup pull gate.
     if (document.visibilityState === 'visible') {
         const before = auth.getEvidence();
-        const after = auth.reconcileEvidenceFromNavigator('startup:visible');
-        if (before === 'evidence:not-online' && after !== 'evidence:not-online') {
+        const after = browserAuth?.reconcileEvidenceFromNavigator('startup:visible');
+        if (after && before === 'evidence:not-online' && after !== 'evidence:not-online') {
             sync.requestPullFromOneDrive('online').catch(logCatch('visible pull'));
         }
     }
@@ -894,8 +996,9 @@ async function startupInner(): Promise<void> {
     matchMedia('(prefers-color-scheme:dark)').addEventListener('change', () => applyTheme());
 
     // 1. Process OAuth redirect (if any)
-    const authResult = await auth.handleOauthRedirect();
-    if (authResult.error) logError(`auth error: ${authResult.error}`);
+    if (native) await native.loadAccountState('state'); // Local admission only. Cached rendering precedes Graph.
+    const authResult = await browserAuth?.handleOauthRedirect();
+    if (authResult?.error) logError(`auth error: ${authResult.error}`);
 
     // --- Service worker registration (before any early returns so offline
     //     shell caching works for signed-out/first-time users too) ---
@@ -904,7 +1007,7 @@ async function startupInner(): Promise<void> {
     //     causing InvalidStateError. The `load` event fires after subresources
     //     are loaded, by which time the provider is always initialized.
     const registerSw = (): void => {
-        if (!('serviceWorker' in navigator)) return;
+        if (native || !('serviceWorker' in navigator)) return;
         startup.attachSwControllerChangeReloadListener();
         navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' })
             .catch(logCatch('sw-register'));
@@ -919,6 +1022,10 @@ async function startupInner(): Promise<void> {
             return raw ? JSON.parse(raw) : undefined;
         } catch { return undefined; }
     })();
+    if (native && savedInfo && savedInfo.driveId !== native.state.driveID) {
+        startup.showError('This cached library belongs to a different OneDrive account.');
+        return;
+    }
     sync.setSavedInfoRef(savedInfo);
 
     // Create favorites data module early (no tree dependency).
@@ -946,7 +1053,7 @@ async function startupInner(): Promise<void> {
                 return;
             }
         }
-        startup.renderSignInButtonIntoStatus();
+        showSignIn();
         log('showing sign-in');
         return;
     }
@@ -959,7 +1066,7 @@ async function startupInner(): Promise<void> {
         showTree(savedInfo!, cachedData);
         log(`showing cached: ${cachedData.count} tracks`);
         restorePlaybackState();
-    } else if (auth.reconcileEvidenceFromNavigator('startup:signed-in-no-cache-check') === 'evidence:not-online') {
+    } else if ((browserAuth?.reconcileEvidenceFromNavigator('startup:signed-in-no-cache-check') ?? auth.getEvidence()) === 'evidence:not-online') {
         log('startup: signed-in with no cache while evidence is not-online');
         startup.markStartupTerminalState('error');
         startup.renderStartupErrorIntoStatusAndWireReload(STARTUP_ERROR_MESSAGE);

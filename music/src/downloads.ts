@@ -29,7 +29,7 @@
 import {
     audioGet, audioPut, audioDelete, audioKeys, audioTotalBytes, audioClear,
 } from './db.js';
-import { type EvidenceState, type AuthFetch } from './auth.js';
+import { readGraphJson, type EvidenceState, type AuthFetch } from './auth.js';
 import { log, logError, errorMessage, errorDetail } from './logger.js';
 
 // ---------------------------------------------------------------------------
@@ -310,7 +310,7 @@ export function createDownloads(
                     return;
                 }
 
-                const meta = await metaR.json();
+                const meta = await readGraphJson(metaR, 'download URL');
                 const downloadUrl: string | undefined = meta['@microsoft.graph.downloadUrl'];
                 if (!downloadUrl) {
                     logError(`download: no URL for ${key}`);

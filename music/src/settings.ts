@@ -20,8 +20,7 @@ export interface SettingsShareRow {
     readonly id: string;
     readonly label: string;
     readonly deniedReason?: string;
-    readonly removeImpactTracks: number;
-    readonly removeImpactFavorites: number;
+    readonly getRemoveImpact: () => { uniqueTrackCount: number; affectedFavoriteCount: number };
 }
 
 export interface SettingsShareIndexRow {
@@ -52,6 +51,7 @@ interface OpenOptions {
     readonly onTimerChange: (next: TimerDuration) => void;
     readonly theme: ThemePreference;
     readonly onThemeChange: (next: ThemePreference) => void;
+    readonly onTestLocalPlayback?: () => void;
     readonly onDebugToggle: (next: boolean) => void;
 }
 
@@ -67,6 +67,7 @@ export interface SettingsView {
     open(initial: OpenOptions): void;
     close(): void;
     isOpen(): boolean;
+    updateAuthAction(evidence: EvidenceState): void;
     updateIndexSection(status: IndexStatus): void;
 }
 
@@ -128,6 +129,16 @@ function formatFailureMessageForDisplay(message: string): string {
 
 export function createSettings(container: HTMLElement): SettingsView {
     let openState = false;
+    let authButton: HTMLButtonElement | undefined;
+    let reconnect = false;
+
+    /** Evidence may change while a select or share dialog has focus. Update only the account action. */
+    function updateAuthAction(evidence: EvidenceState): void {
+        reconnect = evidence === 'evidence:signed-out';
+        if (!authButton) return;
+        authButton.classList.toggle('settings-pill-reconnect', reconnect);
+        authButton.textContent = reconnect ? 'Reconnect...' : 'Sign out';
+    }
     let indexStatus: IndexStatus = {
         checkingForUpdates: false,
         indexProgress: undefined,
@@ -249,19 +260,18 @@ export function createSettings(container: HTMLElement): SettingsView {
             };
 
             const oneDrive = section('OneDrive');
-            const authBtn = document.createElement('button');
-            authBtn.type = 'button';
-            const reconnect = initial.evidence === 'evidence:signed-out';
-            authBtn.className = reconnect ? 'settings-pill settings-pill-reconnect' : 'settings-pill';
-            authBtn.textContent = reconnect ? 'Reconnect...' : 'Sign out';
-            authBtn.addEventListener('click', () => {
+            authButton = document.createElement('button');
+            authButton.type = 'button';
+            authButton.className = 'settings-pill';
+            updateAuthAction(initial.evidence);
+            authButton.addEventListener('click', () => {
                 initial.onClose();
                 runMaybeAsyncUiAction(
                     () => reconnect ? initial.onReconnect() : initial.onSignOut(),
                     'settings auth action',
                 );
             });
-            oneDrive.appendChild(authBtn);
+            oneDrive.appendChild(authButton);
             body.appendChild(oneDrive);
 
             const shared = section('Shared with you');
@@ -314,9 +324,10 @@ export function createSettings(container: HTMLElement): SettingsView {
                 removeBtn.innerHTML = ACTION_DELETE_ICON_SVG;
                 removeBtn.addEventListener('click', () => {
                     showModal('Disconnect from share', (modal, close) => {
-                        if (share.removeImpactFavorites > 0) {
+                        const { uniqueTrackCount, affectedFavoriteCount } = share.getRemoveImpact();
+                        if (affectedFavoriteCount > 0) {
                             const p = document.createElement('p');
-                            p.textContent = `This will remove ${share.removeImpactTracks} tracks from ${share.removeImpactFavorites} playlists.`;
+                            p.textContent = `This will remove ${uniqueTrackCount} tracks from ${affectedFavoriteCount} playlists.`;
                             modal.appendChild(p);
                         }
                         addModalActions(modal, close, 'Disconnect', async () => {
@@ -446,6 +457,14 @@ export function createSettings(container: HTMLElement): SettingsView {
             debug.append(debugLineEl, debugButton);
             body.appendChild(debug);
 
+            if (initial.onTestLocalPlayback) {
+                const localFiles = document.createElement('button');
+                localFiles.className = 'settings-pill';
+                localFiles.textContent = 'Test local MP3 files…';
+                localFiles.addEventListener('click', initial.onTestLocalPlayback);
+                debug.appendChild(localFiles);
+            }
+
             root.append(header, body);
             container.replaceChildren(root);
         },
@@ -453,6 +472,7 @@ export function createSettings(container: HTMLElement): SettingsView {
         close() {
             if (!openState) return;
             openState = false;
+            authButton = undefined;
             container.replaceChildren();
             debugButton = undefined;
             debugLineEl = undefined;
@@ -462,6 +482,7 @@ export function createSettings(container: HTMLElement): SettingsView {
         },
 
         isOpen: () => openState,
+        updateAuthAction,
 
         updateIndexSection(status) {
             indexStatus = status;

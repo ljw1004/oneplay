@@ -12,7 +12,7 @@
  * 1. console.log / console.error — for browser DevTools
  * 2. window.__ONEPLAY_MUSIC_LOGS array — for Playwright page.evaluate()
  * 3. #log-panel DOM element — for visual inspection / screenshots
- * 4. localStorage key "oneplay_music_logs" — survives page navigations (OAuth redirects)
+ * 4. localStorage key "oneplay_music_logs_v2" — survives page navigations (OAuth redirects)
  */
 
 import { setLogImpl, setClearImpl } from './logger.js';
@@ -24,9 +24,15 @@ interface LogEntry {
     readonly message: string;
 }
 
+/** Native timestamps and IDs are assigned when Swift records the event. */
+export interface NativeLogEntry {
+    readonly id: string;
+    readonly at: number;
+    readonly message: string;
+}
+
 /** Returns a "Sun 14:23:05.012" timestamp (day-of-week helps distinguish today vs restored). */
-const timestamp = (): string => {
-    const d = new Date();
+const timestamp = (d = new Date()): string => {
     const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()];
     const pad2 = (n: number) => String(n).padStart(2, '0');
     const pad3 = (n: number) => String(n).padStart(3, '0');
@@ -48,7 +54,7 @@ const addLogDiv = (panel: HTMLElement, entry: LogEntry): void => {
  *
  * Must be called once before any logging occurs.
  */
-export function initWebLogger(): void {
+export function initWebLogger(): (entries: NativeLogEntry[]) => void {
     /** Module-level array, also exposed as window.__ONEPLAY_MUSIC_LOGS for Playwright. */
     const LOG_ENTRIES: LogEntry[] = [];
     (window as any).__ONEPLAY_MUSIC_LOGS = LOG_ENTRIES;
@@ -57,7 +63,9 @@ export function initWebLogger(): void {
     const MAX_LOG_ENTRIES = 300;
     const restored: LogEntry[] = (() => {
         try {
-            const raw = localStorage.getItem('oneplay_music_logs');
+            // Older diagnostics included response bodies and signed URLs.
+            localStorage.removeItem('oneplay_music_logs');
+            const raw = localStorage.getItem('oneplay_music_logs_v2');
             const all = raw ? (JSON.parse(raw) as LogEntry[]) : [];
             return all.length > MAX_LOG_ENTRIES ? all.slice(-MAX_LOG_ENTRIES) : all;
         } catch {
@@ -70,7 +78,7 @@ export function initWebLogger(): void {
 
         // Render restored entries into the DOM (newest first via prepend).
         const renderRestored = (): void => {
-            const panel = document.getElementById('log-panel');
+            const panel = document.getElementById('js-log');
             if (!panel) return;
             for (const entry of restored) addLogDiv(panel, entry);
         };
@@ -98,7 +106,7 @@ export function initWebLogger(): void {
         // 2. window.__ONEPLAY_MUSIC_LOGS — already pushed above
 
         // 3. DOM panel (best-effort; element may not exist yet). Newest at top.
-        const panel = document.getElementById('log-panel');
+        const panel = document.getElementById('js-log');
         if (panel) {
             addLogDiv(panel, entry);
             // Cap DOM children to match in-memory cap.
@@ -107,7 +115,7 @@ export function initWebLogger(): void {
 
         // 4. localStorage persistence
         try {
-            localStorage.setItem('oneplay_music_logs', JSON.stringify(LOG_ENTRIES));
+            localStorage.setItem('oneplay_music_logs_v2', JSON.stringify(LOG_ENTRIES));
         } catch {
             // Storage full or unavailable — drop silently.
         }
@@ -116,12 +124,24 @@ export function initWebLogger(): void {
     // --- Install clear impl ---
     setClearImpl(() => {
         LOG_ENTRIES.length = 0;
-        const panel = document.getElementById('log-panel');
+        const panel = document.getElementById('js-log');
         if (panel) panel.textContent = '';
         try {
-            localStorage.removeItem('oneplay_music_logs');
+            localStorage.removeItem('oneplay_music_logs_v2');
+            const nativeSection = document.getElementById('native-log');
+            if (nativeSection) { nativeSection.hidden = true; nativeSection.querySelector('div')!.textContent = ''; }
         } catch {
             // Ignore.
         }
     });
+    // Swift retains this history on disk. JS only renders it; the ordinary 300-entry log can churn independently.
+    const nativeEntries: NativeLogEntry[] = [];
+    return incoming => {
+        nativeEntries.push(...incoming);
+        if (nativeEntries.length > 200) nativeEntries.splice(0, nativeEntries.length - 200);
+        const section = document.getElementById('native-log')!;
+        section.hidden = false;
+        section.querySelector('div')!.textContent = nativeEntries.slice().reverse()
+            .map(e => `[${new Date(e.at).toLocaleString()}] ${e.message}`).join('\n');
+    };
 }

@@ -28,7 +28,7 @@ function makeDeps(handler: (url: string) => MockResponse): SharesDeps {
 describe('shares:addFromUrl', () => {
     it('surfaces Graph error message for share-open failures', async () => {
         const shares = createShares(makeDeps((url) => {
-            if (url.includes('/shares/') && url.includes('?$select=id')) {
+            if (url.includes('/shares/') && url.endsWith('?$select=id')) {
                 return { status: 403, body: { error: { code: 'accessDenied', message: 'Access denied' } } };
             }
             return { status: 404 };
@@ -42,7 +42,7 @@ describe('shares:addFromUrl', () => {
 
     it('adds valid folder share', async () => {
         const shares = createShares(makeDeps((url) => {
-            if (url.includes('/shares/') && url.includes('?$select=id')) {
+            if (url.includes('/shares/') && url.endsWith('?$select=id')) {
                 return { status: 200, body: { id: 'sid-1' } };
             }
             if (url.includes('/shares/') && url.includes('/driveItem')) {
@@ -69,7 +69,7 @@ describe('shares:addFromUrl', () => {
 
     it('rejects duplicate shareId', async () => {
         const shares = createShares(makeDeps((url) => {
-            if (url.includes('/shares/') && url.includes('?$select=id')) {
+            if (url.includes('/shares/') && url.endsWith('?$select=id')) {
                 return { status: 200, body: { id: 'sid-dup' } };
             }
             if (url.includes('/shares/') && url.includes('/driveItem')) {
@@ -95,7 +95,7 @@ describe('shares:addFromUrl', () => {
 
     it('rejects non-folder share', async () => {
         const shares = createShares(makeDeps((url) => {
-            if (url.includes('/shares/') && url.includes('?$select=id')) {
+            if (url.includes('/shares/') && url.endsWith('?$select=id')) {
                 return { status: 200, body: { id: 'sid-file' } };
             }
             if (url.includes('/shares/') && url.includes('/driveItem')) {
@@ -119,7 +119,7 @@ describe('shares:addFromUrl', () => {
 
     it('requires special/music for whole-drive share', async () => {
         const shares = createShares(makeDeps((url) => {
-            if (url.includes('/shares/') && url.includes('?$select=id')) {
+            if (url.includes('/shares/') && url.endsWith('?$select=id')) {
                 return { status: 200, body: { id: 'sid-root' } };
             }
             if (url.includes('/shares/') && url.includes('/driveItem')) {

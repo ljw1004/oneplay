@@ -134,12 +134,25 @@ to{transform:rotate(360deg);}
 }
 #footer{display:none;flex-direction:column;width:100%;background:var(--bg-footer);border-top:1px solid var(--border-footer);flex-shrink:0;position:relative;z-index:1;}
 #footer.visible{display:flex;}
-#footer.expanded{background:linear-gradient(to right,var(--footer-edge-highlight),rgba(255,255,255,0)) 10px 0/24px 100% no-repeat,linear-gradient(to right,var(--footer-edge-shadow),rgba(0,0,0,0)) 0/10px 100% no-repeat,linear-gradient(to left,var(--footer-edge-shadow),rgba(0,0,0,0)) 100%/10px 100% no-repeat,var(--bg-footer);}
+#footer.expanded{box-shadow:0 -4px 12px -4px rgba(0,0,0,.22);background:linear-gradient(to right,var(--footer-edge-highlight),rgba(255,255,255,0)) 10px 0/24px 100% no-repeat,linear-gradient(to right,var(--footer-edge-shadow),rgba(0,0,0,0)) 0/10px 100% no-repeat,linear-gradient(to left,var(--footer-edge-shadow),rgba(0,0,0,0)) 100%/10px 100% no-repeat,var(--bg-footer);}
 .footer-bar{display:grid;grid-template-columns:auto 1fr auto;gap:4px;align-items:center;padding:4px 12px;padding-bottom:calc(4px + env(safe-area-inset-bottom) / 2);}
 .footer-gripper{display:flex;justify-content:center;padding:6px 0 2px;}
 .footer-gripper::before{content:'';width:36px;height:5px;border-top:2px solid var(--border-footer);border-bottom:2px solid var(--border-footer);}
 .expansion{max-height:0;overflow:hidden;transition:max-height 300ms ease;}
 .expansion-inner{position:relative;display:flex;align-items:center;justify-content:center;flex:1 1 auto;min-height:0;}
+.audio-ranges{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;padding:2px 12px 6px;font:11px system-ui;color:var(--text-tertiary);}
+.audio-ranges[hidden]{display:none;}
+.audio-ranges>div{min-width:0;}
+.audio-ranges>div>div:first-child{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}
+.audio-ranges .empty{opacity:.4;}
+.audio-range-rail{position:relative;background:#101310;border-radius:2px;height:9px;margin-top:3px;}
+.audio-range-rail i{position:absolute;top:0;bottom:0;min-width:1px;}
+.audio-range-rail .cached{background:#277242;}
+.audio-range-rail .fetching{background:#eb503f80;box-shadow:inset 0 0 0 1px #ff6655,0 0 4px #f54d3d;animation:range-pulse .8s ease-in-out infinite alternate;}
+.audio-range-rail .marker{width:2px;background:white;transform:translateX(-1px);}
+.audio-range-rail .lookup{left:0;top:50%;bottom:auto;width:8px;height:8px;border-radius:50%;transform:translateY(-50%);background:#ff5447;box-shadow:0 0 4px #ff6758;animation:range-pulse .8s ease-in-out infinite alternate;}
+@keyframes range-pulse{to{opacity:.55;}}
+@media(prefers-reduced-motion:reduce){.audio-range-rail .fetching,.audio-range-rail .lookup{animation:none;}}
 .mode-label{position:absolute;top:0;left:0;appearance:none;border:none;background:none;color:var(--text-tertiary);font-size:14px;padding:8px 12px;cursor:pointer;min-width:44px;min-height:44px;display:flex;align-items:center;justify-content:center;}
 .scrubber-shell{touch-action:none;aspect-ratio:1 / 1;width:min(360px,max(0px,calc(100% - 100px)));margin:24px;margin-bottom:10px;position:relative;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;}
 .scrubber-wheel{position:absolute;inset:0;border-radius:50%;background:radial-gradient(circle closest-side,transparent 0 calc(100% - 65px),var(--scrubber-border) calc(100% - 65px) calc(100% - 64px),var(--bg-surface) calc(100% - 64px) calc(100% - 1px),var(--scrubber-border) calc(100% - 1px) calc(100% - 0px));pointer-events:none;}
@@ -259,3 +272,6 @@ body.select-mode #action-bar{display:flex;}
 .offline-global select{appearance:none;border:1px solid var(--border-input);border-radius:4px;padding:2px 6px;font-size:13px;background:var(--bg-surface);cursor:pointer;}
 .tree-row.unavailable{color:var(--text-disabled);font-style:italic;}
 .tree-row.unavailable .fav-icon{opacity:0.5;}
+
+.native-player .scrubber-shell:has(.scrubber-thumb:not([hidden],.fading)) .scrubber-text.loading span{display:inline;}
+.native-player .scrubber-shell:has(.scrubber-thumb:not([hidden],.fading)) .scrubber-text.loading .scrubber-spinner{display:none;}

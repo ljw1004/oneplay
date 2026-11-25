@@ -2,6 +2,7 @@ import Foundation
 import MSAL
 import Network
 import UIKit
+import OSLog
 
 /// The only errors that may cross the page boundary. Underlying SDK and HTTP errors can contain signed URLs.
 enum NativeAccountError: String, LocalizedError {
@@ -42,9 +43,16 @@ struct AccountRecord: Codable, Equatable {
     }
 }
 
+/// A replacement identifies the Graph grant that the CDN rejected, including after an HTTP redirect.
+enum MediaLookup: Sendable {
+    case reuse(MediaLocation? = nil), replace(MediaLocation), force
+}
+
 @MainActor final class NativeAccount {
     private let identity: NativeIdentity
     let diagnostics: NativeDiagnostics
+    // Only the most recent signed resources are retained, exclusively in this account's memory.
+    private var mediaLocations = [(drive: String, item: String, media: MediaLocation)]()
     private var previousExpiry: Date?
     private let recordFile: URL
     private var record: AccountRecord?
@@ -60,6 +68,11 @@ struct AccountRecord: Codable, Equatable {
     private var routeInterfaces: Set<NWInterface.InterfaceType>?
     private var offline = false
     private var evidence = "no-evidence"
+    var onNetworkPathChange: (() -> Void)?
+    #if DEBUG
+    private(set) var mediaRequests = [UUID: IndexedTrack]()
+    var onMediaRequestChange: (() -> Void)?
+    #endif
     var onEvidenceChange: ((String) -> Void)?
 
     private var signInTask: Task<[String: Any], Error>?
@@ -68,6 +81,14 @@ struct AccountRecord: Codable, Equatable {
     private var requests: [UUID: Task<[String: Any], Error>] = [:]
     private var chunks: [UUID: (file: FileHandle, remaining: UInt64)] = [:]
     private var follows: [String: Date] = [:]
+
+    /// Network.framework provides the current path safely to the media worker on each cache miss.
+    var unmeteredWiFi: @Sendable () -> Bool {
+        { [path] in
+            guard let route = path?.currentPath else { return false }
+            return route.status == .satisfied && route.usesInterfaceType(.wifi) && !route.isExpensive && !route.isConstrained
+        }
+    }
 
     var snapshot: [String: Any] {
         ["driveID": (cleanupPending ? nil : record?.driveID) as Any? ?? NSNull(), "evidence": evidence]
@@ -92,7 +113,10 @@ struct AccountRecord: Codable, Equatable {
         path?.pathUpdateHandler = { [weak self] path in
             let down = path.status == .unsatisfied
             let interfaces = Set(path.availableInterfaces.map(\.type).filter(path.usesInterfaceType))
-            Task { @MainActor in self?.updateNetworkPath(offline: down, interfaces: interfaces) }
+            Task { @MainActor in
+                self?.updateNetworkPath(offline: down, interfaces: interfaces)
+                self?.onNetworkPathChange?()
+            }
         }
         path?.start(queue: DispatchQueue(label: "me.unto.oneplay.music.network-path"))
     }
@@ -115,6 +139,7 @@ struct AccountRecord: Codable, Equatable {
     private func invalidateDriveProof(_ next: DriveProof) {
         proofGeneration += 1
         driveProof = next
+        if next == .mismatch { mediaLocations.removeAll() }
         follows.removeAll()
         chunks.removeAll()
     }
@@ -153,7 +178,9 @@ struct AccountRecord: Codable, Equatable {
                     let mode = force ? "forced" : "ordinary"
                     if force { diagnostics.record("MSAL silent forced start protectedData=\(available)") }
                     do {
+                        let begin = ProcessInfo.processInfo.systemUptime
                         let grant = try await identity.acquireSilent(home: home, force: force)
+                        Logger(subsystem: "me.unto.oneplay.music", category: "Playback").info("MSAL acquireSilent forced=\(force) durationMs=\(Int((ProcessInfo.processInfo.systemUptime-begin)*1000))")
                         // A later expiry distinguishes an ordinary renewal from a cache hit in this process.
                         let advanced = previousExpiry.flatMap { old in grant.expiresOn.map { $0 > old } } ?? false
                         if force || advanced || previousExpiry == nil {
@@ -179,9 +206,10 @@ struct AccountRecord: Codable, Equatable {
     }
 
     /// Bind a drive using a fresh direct Graph response. No library write is admitted on the strength of a cached token alone.
-    private func readDriveID(token: String) async throws -> String {
+    private func readDriveID(token: String, wifiOnly: Bool = false) async throws -> String {
         var request = URLRequest(url: URL(string: "https://graph.microsoft.com/v1.0/me/drive?$select=id")!,
                                  cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
+        if wifiOnly { request.requireUnmeteredWiFi() }
         request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
         let (response, file) = try await download(request, timeoutMs: 30_000)
         let status = response.statusCode
@@ -205,7 +233,7 @@ struct AccountRecord: Codable, Equatable {
     }
 
     /// A grant and its drive proof belong to the same account and path generation. Validate both after every callback.
-    private func acquireVerifiedGrant(force: Bool, rejectedAuthorization: String? = nil) async throws -> IdentityGrant {
+    private func acquireVerifiedGrant(force: Bool, rejectedAuthorization: String? = nil, wifiOnly: Bool = false) async throws -> IdentityGrant {
         guard let record, !cleanupPending else { throw NativeAccountError.unbound }
         let epoch = generation
         let proof = proofGeneration
@@ -219,13 +247,13 @@ struct AccountRecord: Codable, Equatable {
         guard grant.homeID == record.homeID else { throw NativeAccountError.wrongAccount }
         if driveProof != .verified(token: grant.accessToken) {
             let drive: String
-            do { drive = try await readDriveID(token: grant.accessToken) }
+            do { drive = try await readDriveID(token: grant.accessToken, wifiOnly: wifiOnly) }
             catch NativeAccountError.interactionRequired {
                 diagnostics.record("Graph drive verification HTTP 401; forcing renewal")
                 grant = try await acquireSilent(home: record.homeID, force: true)
                 try checkProof(proof)
                 guard grant.homeID == record.homeID else { throw NativeAccountError.wrongAccount }
-                drive = try await readDriveID(token: grant.accessToken)
+                drive = try await readDriveID(token: grant.accessToken, wifiOnly: wifiOnly)
             }
             try checkAdmission(epoch)
             try checkProof(proof)
@@ -300,6 +328,7 @@ struct AccountRecord: Codable, Equatable {
     func beginSignOut(theme: String? = nil) throws {
         guard var binding = record else { throw NativeAccountError.unbound }
         generation += 1
+        mediaLocations.removeAll()
         driveProof = .unchecked
         binding.cleanupPending = true
         if let theme, ["light", "dark", "auto"].contains(theme) { binding.cleanupTheme = theme }
@@ -374,7 +403,7 @@ struct AccountRecord: Codable, Equatable {
 
     /// One request policy for JS library work and the locked player. Retrying a 401 always keeps the same home account.
     private func fetchFile(_ request: URLRequest, graph: Bool, retry: Bool, forceRefresh: Bool = false,
-                           timeoutMs: Int?, proof: Int) async throws -> (HTTPURLResponse, FileHandle) {
+                           timeoutMs: Int?, proof: Int, track: IndexedTrack? = nil) async throws -> (HTTPURLResponse, FileHandle) {
         let epoch = generation
         var force = forceRefresh
         var rejectedAuthorization: String?
@@ -383,13 +412,22 @@ struct AccountRecord: Codable, Equatable {
             try checkProof(proof)
             var current = request
             if graph {
-                let grant = try await acquireVerifiedGrant(force: force, rejectedAuthorization: rejectedAuthorization)
+                let grant = try await acquireVerifiedGrant(force: force, rejectedAuthorization: rejectedAuthorization, wifiOnly: !request.allowsCellularAccess)
                 try checkAdmission(epoch)
                 try checkProof(proof)
                 current.setValue("Bearer " + grant.accessToken, forHTTPHeaderField: "Authorization")
                 force = false
             }
-            let (response, file) = try await download(current, timeoutMs: timeoutMs)
+            // Mark only the item metadata request. Token acquisition, retries and the audition hold have separate lifetimes.
+            let (response, file): (HTTPURLResponse, FileHandle)
+            do {
+                #if DEBUG
+                let id = UUID()
+                if let track { mediaRequests[id] = track; onMediaRequestChange?() }
+                defer { if track != nil { mediaRequests[id] = nil; onMediaRequestChange?() } }
+                #endif
+                (response, file) = try await download(current, timeoutMs: timeoutMs)
+            }
             try checkAdmission(epoch)
             try checkProof(proof)
             let status = response.statusCode
@@ -518,25 +556,57 @@ struct AccountRecord: Codable, Equatable {
     }
 
     /// Metadata, signed URL and version come from the same live Graph response. The player owns all media bytes.
-    func media(driveID: String, itemID: String, forceRefresh: Bool) async throws -> MediaLocation {
+    func media(driveID: String, itemID: String, lookup: MediaLookup = .reuse(), wifiOnly: Bool = false) async throws -> MediaLocation {
         let epoch = generation
+        try checkAdmission(epoch)
+        guard driveProof != .mismatch else { throw NativeAccountError.wrongAccount }
+        guard record != nil else { throw NativeAccountError.unbound }
+        let matches: ((drive: String, item: String, media: MediaLocation)) -> Bool = { $0.drive == driveID && $0.item == itemID }
+        let index = mediaLocations.firstIndex(where: matches)
+        let known = index.map { mediaLocations[$0].media }
+        let forceRefresh: Bool
+        switch lookup {
+        case .reuse(let admitted):
+            // An active reader can outlive the recent list. Even a rejected URL still identifies
+            // its retained blocks; its first miss will come back through .replace.
+            if let media = known ?? admitted, !media.accessDenied {
+                if let index { mediaLocations.append(mediaLocations.remove(at: index)) }
+                return media
+            }
+            forceRefresh = false
+        case .replace(let rejected):
+            if let known, known !== rejected, !known.isRejected { return known }
+            forceRefresh = false
+        case .force:
+            forceRefresh = true
+        }
+        // Match the PWA lookup. Mixing ordinary fields into this $select can omit the download URL.
+        let component = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()")
         guard !driveID.isEmpty, !itemID.isEmpty,
-              let drive = driveID.addingPercentEncoding(withAllowedCharacters: .alphanumerics),
-              let item = itemID.addingPercentEncoding(withAllowedCharacters: .alphanumerics),
-              let url = URL(string: "https://graph.microsoft.com/v1.0/drives/\(drive)/items/\(item)?$select=id,eTag,size,@microsoft.graph.downloadUrl")
+              let drive = driveID.addingPercentEncoding(withAllowedCharacters: component),
+              let item = itemID.addingPercentEncoding(withAllowedCharacters: component),
+              let url = URL(string: "https://graph.microsoft.com/v1.0/drives/\(drive)/items/\(item)?$select=@microsoft.graph.downloadUrl")
         else { throw NativeAccountError.invalidRequest }
-        let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+        if wifiOnly { request.requireUnmeteredWiFi() }
         let proof = proofGeneration
         do {
-            let (response, file) = try await fetchFile(request, graph: true, retry: false, forceRefresh: forceRefresh, timeoutMs: 30_000, proof: proof)
+            let (response, file) = try await fetchFile(request, graph: true, retry: false, forceRefresh: forceRefresh, timeoutMs: 30_000, proof: proof, track: IndexedTrack(driveId: driveID, itemId: itemID))
             try checkAdmission(epoch)
             try checkProof(proof)
-            let authenticated = response.url.map(GraphTransport.isGraph) == true
-            observe(status: response.statusCode, authenticated: authenticated, authFailure: authenticated && response.statusCode == 401)
+            guard response.url.map(GraphTransport.isGraph) == true else { throw NativeAccountError.unavailable }
+            observe(status: response.statusCode, authenticated: true, authFailure: response.statusCode == 401)
             if response.statusCode == 408 || response.statusCode == 429 || response.statusCode >= 500 { throw NativeAccountError.transient }
-            if response.statusCode == 403 { throw NativeAccountError.forbidden }
+            if [403, 404, 410].contains(response.statusCode) {
+                // A seek or an early successor may still hold this grant after its worker retires.
+                if case .replace(let rejected) = lookup { rejected.markAccessDenied() }
+                known?.markAccessDenied()
+                mediaLocations.first(where: matches)?.media.markAccessDenied()
+                mediaLocations.removeAll(where: matches)
+                throw NativeAccountError.forbidden
+            }
             if response.statusCode == 401 { throw NativeAccountError.interactionRequired }
-            guard response.statusCode == 200, response.url.map(GraphTransport.isGraph) == true,
+            guard response.statusCode == 200,
                   let data = try file.readToEnd(),
                   let fields = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   fields["id"] as? String == itemID,
@@ -544,7 +614,11 @@ struct AccountRecord: Codable, Equatable {
                   let size = fields["size"] as? Int64, size > 0,
                   let raw = fields["@microsoft.graph.downloadUrl"] as? String, let location = URL(string: raw),
                   GraphTransport.isHTTPS(location) else { throw NativeAccountError.unavailable }
-            return MediaLocation(url: location, etag: tag, size: size)
+            let media = MediaLocation(url: location, etag: tag, size: size)
+            mediaLocations.removeAll(where: matches)
+            if mediaLocations.count >= 16 { mediaLocations.removeFirst() }
+            mediaLocations.append((driveID, itemID, media))
+            return media
         } catch {
             let kind = NativeAccountError.classify(error)
             if epoch == generation && proof == proofGeneration && kind == .interactionRequired { observe(status: 401, authenticated: false, authFailure: true) }

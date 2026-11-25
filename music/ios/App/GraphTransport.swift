@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 /// Only the Graph v1 endpoint can receive the bearer. A content redirect is a new credential-free GET.
 final class GraphTransport: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
@@ -38,14 +39,31 @@ final class GraphTransport: NSObject, URLSessionTaskDelegate, @unchecked Sendabl
         guard let url = proposed.url, Self.isHTTPS(url) else { completionHandler(nil); return }
         if Self.isGraph(url), response.url.map(Self.isGraph) == true {
             var sameOrigin = proposed
+            if task.originalRequest?.allowsCellularAccess == false { sameOrigin.requireUnmeteredWiFi() }
             sameOrigin.setValue(task.currentRequest?.value(forHTTPHeaderField: "Authorization"), forHTTPHeaderField: "Authorization")
             completionHandler(sameOrigin)
             return
         }
         guard ["GET", "HEAD"].contains(proposed.httpMethod ?? "GET") else { completionHandler(nil); return }
         var read = URLRequest(url: url, cachePolicy: proposed.cachePolicy, timeoutInterval: proposed.timeoutInterval)
+        if task.originalRequest?.allowsCellularAccess == false { read.requireUnmeteredWiFi() }
         read.httpMethod = proposed.httpMethod
         completionHandler(read)
+    }
+
+    /// Only operation names and transaction timings are public. Graph redirects can contain signed credentials.
+    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+        guard let url = task.originalRequest?.url, Self.isGraph(url) else { return }
+        let operation: String
+        if url.path == "/v1.0/me/drive" { operation = "GET /me/drive" }
+        else if url.query == "$select=@microsoft.graph.downloadUrl" { operation = "GET /drives/{drive}/items/{item}?$select=@microsoft.graph.downloadUrl" }
+        else { return }
+        for transaction in metrics.transactionMetrics {
+            guard let start = transaction.fetchStartDate, let end = transaction.responseEndDate else { continue }
+            let status = (transaction.response as? HTTPURLResponse)?.statusCode ?? 0
+            let ms = Int(end.timeIntervalSince(start) * 1000)
+            Logger(subsystem: "me.unto.oneplay.music", category: "Playback").info("Graph \(operation, privacy: .public) http=\(status) durationMs=\(ms)")
+        }
     }
 
     /// Foundation owns the download file until this call returns. Unlink it after opening:

@@ -1,5 +1,7 @@
 # OnePlay Music
 
+Review current controls, messages and platform differences in the [listener interaction inventory](INTERACTIONS.md). Record new or changed interactions there for the listener to review.
+
 OnePlay Music is a mobile-first SPA app for playing your OneDrive music collection. It fills a gap:
 - The official OneDrive app from Microsoft can play music and has offline, but only a single fiel at a time -- it has no playlists, stops after the first track, is sluggish and hard to find
 - You can't pull a .m3u index of your OneDrive music into iTunes because OneDrive authentication stopped that working, and even when it did work, iTunes cut off the end of tracks

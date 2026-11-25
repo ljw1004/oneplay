@@ -108,6 +108,7 @@ export function createNativeLibrary(handler: ReplyHandler) {
         signOut: (theme: string) => post({ op: 'signOut', theme }),
         fetch: request,
         followContent: (url: string, signal?: AbortSignal) => request(url, false, { signal, timeoutMs: 30000 }, true),
+        playback: (action: string, args: Record<string, unknown> = {}) => post({op: 'playback', version: 1, action, ...args}),
         playIndexed: (tracks: {driveId: string; itemId: string}[], nearEnd: boolean, forceRefresh: boolean, delaySeconds: number) =>
             post({ op: 'playIndexed', tracks, nearEnd, forceRefresh, delaySeconds }),
         playLocal: (nearEnd: boolean) => post({ op: 'playLocal', nearEnd }),

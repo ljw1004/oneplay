@@ -1,5 +1,6 @@
 import { createAuth, isAbortError, type EvidenceState } from './auth.js';
 import { showModal } from './modal.js';
+import { attachNativePlayback } from './native-playback.js';
 import { connectBundledLibrary } from './native-library.js';
 import { dbGet, dbPut, dbClear } from './db.js';
 import { log, logError, logCatch } from './logger.js';
@@ -175,6 +176,7 @@ auth.onEvidenceChange = (newState, prevState) => {
 
 let tree: TreeView | undefined;
 let playback: Playback | undefined;
+let nativePlayer: ReturnType<typeof attachNativePlayback> | undefined;
 let favorites: Favorites | undefined;
 let select: Select | undefined;
 let downloads: Downloads | undefined;
@@ -306,6 +308,7 @@ function setRuntimeDebugEnabled(next: boolean): void {
     debugEnabled = next;
     localStorage.setItem('oneplay_music_debug_enabled', next ? '1' : '0');
     tree?.setDebugEnabled(SW_DEBUG && debugEnabled);
+    nativePlayer?.setDebugEnabled(debugEnabled);
 }
 
 /**
@@ -367,6 +370,7 @@ function showPlaybackTest(path?: readonly string[]): void {
         const play = (nearEnd: boolean, forceRefresh = false, delaySeconds = 0) => tracks
             ? native.playIndexed(tracks, nearEnd, forceRefresh, delaySeconds)
             : native.playLocal(nearEnd);
+        if (!path && nativePlayer?.currentPath()) add('Test playing album…', async () => showPlaybackTest(nativePlayer?.currentPath()));
         add('Play from beginning', () => play(false));
         add('Play near first join', () => play(true));
         if (tracks) for (const delay of [0, 5, 10]) {
@@ -553,8 +557,33 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
                 if (settings?.isOpen()) closeSettingsPage();
                 tree!.revealTrack(info.track);
             };
-        } else if (native?.state.debugPlayback) {
-            tree.onTrackClick = showPlaybackTest;
+        } else if (native) {
+            nativePlayer = attachNativePlayback(native, document.getElementById('footer')!,
+                info => tree!.setPlaybackInfo(info), path => {
+                    if (settings?.isOpen()) closeSettingsPage();
+                    tree!.revealTrack(path);
+                }, showToastMessage);
+            const playAlbum = async (folderPath: readonly string[], selected?: string) => {
+                const evidence = native.getEvidence();
+                if (evidence === 'evidence:not-online' || evidence === 'evidence:signed-out') {
+                    showToastMessage('Connect to OneDrive to play this track.');
+                    return;
+                }
+                const root = accountData.get(folderPath[1]);
+                const folder = resolveFolderFromPath(folderPath, accountData);
+                if (!root || !folder || shares?.getDeniedRootKeys().has(folderPath[1])) {
+                    showToastMessage('Choose a track in a OneDrive album folder.');
+                    return;
+                }
+                const tracks = sortedFolderChildren(folder).filter(([, isFolder]) => !isFolder).map(([name]) => ({
+                    path: [...folderPath, name], driveId: root.driveId, itemId: folder.children[name].id,
+                }));
+                const index = selected ? tracks.findIndex(track => track.path.at(-1) === selected) : 0;
+                if (!tracks[index]) { showToastMessage('No tracks in this folder.'); return; }
+                await nativePlayer!.start(tracks, index);
+            };
+            tree.onTrackClick = path => playAlbum(path.slice(0, -1), path[path.length - 1]);
+            tree.onPlayClick = path => playAlbum(path);
         }
 
         // M10: persist view state on path or expanded changes
@@ -577,6 +606,7 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
         tree.onSearchOpen = () => {
             if (select?.isActive()) select.exitSelectMode();
             playback?.collapse();
+            nativePlayer?.collapse();
             searchOpen = true;
             tree!.openSearchMode(searchQuery, searchScrollTop);
             runSearchAndPushIntoTree('open');
@@ -618,6 +648,7 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
     }
     tree.setIndexFailureWarning(sync.hasLatestIndexFailure());
     tree.setDebugEnabled(SW_DEBUG && debugEnabled);
+    nativePlayer?.setDebugEnabled(debugEnabled);
     playback?.setTimerDuration(timerDuration);
     tree.setAccount(info.driveId, data.folder, info, reindexing);
     sync.syncShareRootsIntoTreeAndPlayback();
@@ -625,6 +656,7 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
     // Wire favorites to tree + create select/downloads (idempotent).
     // Runs on every showTree since roots may have changed after setAccount.
     wireFavoritesUi();
+    if (native) computeAndPushOfflineState();
     invalidateSearchData();
     runSearchAndPushIntoTree('show-tree');
 }
@@ -838,6 +870,7 @@ function wireFavoritesUi(): void {
 
         select.onEnterSelect = () => {
             playback?.collapse();
+            nativePlayer?.collapse();
             document.body.classList.add('select-mode');
         };
         select.onExitSelect = () => {

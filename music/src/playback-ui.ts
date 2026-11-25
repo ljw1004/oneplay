@@ -26,7 +26,7 @@ export interface PlaybackUiDeps {
     readonly getMode: () => PlaybackMode;
     readonly getDuration: () => number | undefined;
     readonly onScrubStart: () => ScrubGesture | undefined;
-    readonly onModeCycleClick: () => void;
+    readonly onModeCycleClick?: () => void;
     readonly onExpandedChange: (expanded: boolean) => void;
     readonly onChevronClick: () => void;
     readonly onFooterPlayPauseClick: () => void;
@@ -126,6 +126,7 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
     modeLabel.className = 'mode-label';
     modeLabel.type = 'button';
     modeLabel.textContent = deps.getMode();
+    modeLabel.disabled = !deps.onModeCycleClick;
 
     const scrubberShell = document.createElement('div');
     scrubberShell.className = 'scrubber-shell';
@@ -221,7 +222,7 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
 
     modeLabel.addEventListener('click', (e) => {
         e.stopPropagation();
-        deps.onModeCycleClick();
+        deps.onModeCycleClick?.();
         modeLabel.textContent = deps.getMode();
     });
 
@@ -327,7 +328,6 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
 
     indicatorSvg.addEventListener('click', (e) => {
         e.stopPropagation();
-        setExpanded(false);
         deps.onChevronClick();
     });
     playpauseBtn.addEventListener('click', (e) => {

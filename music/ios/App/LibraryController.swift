@@ -9,7 +9,11 @@ import WebKit
     private let deviceTheme = URL.applicationSupportDirectory.appendingPathComponent("DeviceTheme")
     private let store: WKWebsiteDataStore
     private var account: NativeAccount?
-    private var player: NativePlayback?
+    private(set) var player: NativePlayback?
+    private var playbackSequence = 0
+    #if DEBUG
+    private var showingAudioRanges = false
+    #endif
     #if DEBUG
     private var pickedFiles: CheckedContinuation<[URL], Error>?
     #endif
@@ -25,6 +29,11 @@ import WebKit
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("The library is created programmatically") }
 
+    override func didReceiveMemoryWarning() {
+        super.didReceiveMemoryWarning()
+        player?.releaseCachedAudio()
+    }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
@@ -33,10 +42,15 @@ import WebKit
             do {
                 let account = try self.account ?? NativeAccount()
                 self.account = account
-                player = player ?? NativePlayback(diagnostics: account.diagnostics) { drive, item, force in
-                    try await account.media(driveID: drive, itemID: item, forceRefresh: force)
+                player = player ?? NativePlayback(diagnostics: account.diagnostics, pool: MediaPool(unmeteredWiFi: account.unmeteredWiFi)) { drive, item, request, wifiOnly in
+                    try await account.media(driveID: drive, itemID: item, lookup: request, wifiOnly: wifiOnly)
                 }
+                player?.onChange = { [weak self] debugOnly in self?.signalPlayerChange(debugOnly: debugOnly) }
+                #if DEBUG
+                account.onMediaRequestChange = { [weak self] in self?.signalPlayerChange(debugOnly: true) }
+                #endif
                 account.diagnostics.onPending = { [weak self] in self?.signalPendingDiagnostics() }
+                account.onNetworkPathChange = { [weak self] in self?.player?.cancelWiFiReadsIfMetered() }
                 account.onEvidenceChange = { [weak self] evidence in
                     self?.webView?.callAsyncJavaScript(
                         "window.dispatchEvent(new CustomEvent('oneplay-evidence', {detail:evidence}))",
@@ -56,6 +70,30 @@ import WebKit
     func signalPendingDiagnostics() {
         guard let page = webView, page.url == BundledShell.page else { return }
         page.evaluateJavaScript("window.dispatchEvent(new Event('oneplay-diagnostics'))", completionHandler: nil)
+    }
+
+    private func signalPlayerChange(debugOnly: Bool) {
+        guard let page = webView, page.url == BundledShell.page, UIApplication.shared.applicationState == .active else { return }
+        if debugOnly {
+            #if DEBUG
+            guard showingAudioRanges else { return }
+            #else
+            return
+            #endif
+        }
+        guard let player, let account, account.snapshot["driveID"] is String else { return }
+        page.callAsyncJavaScript("window.dispatchEvent(new CustomEvent('oneplay-playback', {detail:sample}))",
+                                 arguments: ["sample": playbackSample(player, account)], in: nil, in: .page, completionHandler: nil)
+    }
+
+    /// Replies and pushed transitions share one sequence so a delayed command reply cannot rewind the drawer.
+    private func playbackSample(_ player: NativePlayback, _ account: NativeAccount) -> [String: Any] {
+        var lookups: [IndexedTrack]?
+        #if DEBUG
+        if showingAudioRanges { lookups = Array(account.mediaRequests.values) }
+        #endif
+        playbackSequence += 1
+        return ["sequence": playbackSequence, "snapshot": player.snapshot(lookups: lookups)]
     }
 
     private func showUnavailable() {
@@ -83,7 +121,7 @@ import WebKit
         }
     }
 
-    private func loadPage() {
+    func loadPage() {
         guard webView == nil, let account, !account.cleanupPending else { return }
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = store
@@ -118,6 +156,9 @@ import WebKit
     }
 
     func detachPage() {
+        #if DEBUG
+        showingAudioRanges = false
+        #endif
         #if DEBUG
         if pickedFiles != nil {
             pickedFiles?.resume(throwing: NativeAccountError.cancelled)
@@ -175,6 +216,25 @@ import WebKit
                     reply = state
                 case "diagnostics":
                     reply = try account.diagnostics.entries(after: (args["after"] as? String).flatMap(UUID.init(uuidString:)))
+                case "playback":
+                    guard args["version"] as? Int == 1, let player, account.snapshot["driveID"] is String,
+                          let action = args["action"] as? String else { throw NativeAccountError.invalidRequest }
+                    switch action {
+                    case "snapshot": break
+                    case "start":
+                        guard let values = args["tracks"] as? [[String: Any]], let index = args["index"] as? Int
+                        else { throw NativeAccountError.invalidRequest }
+                        let tracks = try JSONDecoder().decode([IndexedTrack].self, from: JSONSerialization.data(withJSONObject: values))
+                        guard tracks.allSatisfy({ ($0.path?.count ?? 0) >= 3 }) else { throw NativeAccountError.invalidRequest }
+                        try player.start(tracks: tracks, startIndex: index, delaySeconds: 0, nearEnd: false, forceRefresh: false)
+                    default:
+                        guard let item = args["item"] as? String else { throw NativeAccountError.invalidRequest }
+                        try player.apply(action, item: item, seconds: args["seconds"] as? Double)
+                    }
+                    #if DEBUG
+                    showingAudioRanges = args["debugRanges"] as? Bool == true
+                    #endif
+                    reply = playbackSample(player, account)
                 case "request":
                     reply = try await account.request(message: args)
                 case "chunk", "abort":

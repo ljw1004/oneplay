@@ -1,3 +1,4 @@
+import os
 import XCTest
 import WebKit
 import AVFoundation
@@ -23,6 +24,32 @@ import AVFoundation
 
     func cancelInteractive() {}
     func removePrivateAccounts() throws { removed += 1 }
+}
+
+/// A signed URL works until the fixture rejects it. Graph and CDN request counts are independent.
+private final class TestAudioCDN: URLProtocol {
+    static let fixture = OSAllocatedUnfairLock(initialState: (song: Data(), expired: false, paths: [String]()))
+    override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "audio.test" }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func stopLoading() {}
+    override func startLoading() {
+        let url = request.url!
+        let (song, denied) = Self.fixture.withLock {
+            $0.paths.append(url.path)
+            return ($0.song, $0.expired && url.path == "/B/2")
+        }
+        let limits = (request.value(forHTTPHeaderField: "Range") ?? "").dropFirst(6).split(separator: "-").compactMap { Int($0) }
+        guard limits.count == 2, 0 <= limits[0], limits[0] <= limits[1], limits[1] < song.count else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        let bytes = denied ? Data() : song.subdata(in: limits[0]..<limits[1]+1)
+        let headers = ["Content-Length": String(bytes.count), "Content-Range": "bytes \(limits[0])-\(limits[1])/\(song.count)"]
+        let reply = HTTPURLResponse(url: url, statusCode: denied ? 403 : 206, httpVersion: "HTTP/1.1", headerFields: headers)!
+        client?.urlProtocol(self, didReceive: reply, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: bytes)
+        client?.urlProtocolDidFinishLoading(self)
+    }
 }
 
 @MainActor final class AccountTests: XCTestCase {
@@ -412,6 +439,257 @@ import AVFoundation
         }
     }
 
+    /// Start cold on cellular, tap +30, then exercise warm seeks and manual Next with a filled cache.
+    /// Hold the successor metadata GET so the actual bundled UI can distinguish it from a range fetch.
+    func testWarmSeeksAndPreparedNextInDrawer() async throws {
+        let wifi = OSAllocatedUnfairLock(initialState: false)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [TestAudioCDN.self]
+        let pool = MediaPool(configuration: configuration, unmeteredWiFi: { wifi.withLock { $0 } })
+        let frame = Data([0xff, 0xfb, 0x90, 0x00]) + Data(repeating: 0, count: 413) // 128 kbps MPEG-1 Layer III
+        var song = frame
+        // Give Core Audio the length at open so it can leave most of this three-minute fixture unread.
+        var info = Data("Info".utf8)
+        for value in [3, 6900, 6901 * frame.count] { // Flags, MPEG frame count, compressed bytes
+            withUnsafeBytes(of: UInt32(value).bigEndian) { info.append(contentsOf: $0) }
+        }
+        song.replaceSubrange(36..<36+info.count, with: info)
+        for _ in 0..<6900 { song.append(frame) }
+        let size = song.count
+        TestAudioCDN.fixture.withLock { [song] in $0 = (song, false, []) }
+        defer { TestAudioCDN.fixture.withLock { $0 = (Data(), false, []) } }
+        var calls = [String]()
+        var holdLookups = true
+        var waiters = [CheckedContinuation<Void, Never>]()
+        func releaseLookups() {
+            holdLookups = false
+            waiters.forEach { $0.resume() }
+            waiters.removeAll()
+        }
+        let pending = expectation(description: "Cellular requested the successor URL during current playback")
+        let account = try NativeAccount(recordFile: record, identity: TestIdentity()) { [self] request in
+            if request.url?.path == "/v1.0/me/drive" { return try response(request, data: drive) }
+            let item = request.url?.lastPathComponent ?? ""
+            guard ["A", "B"].contains(item) else { return try response(request, status: 404, data: Data()) }
+            calls.append(item)
+            if item == "B" {
+                let isEarly = calls.count == 2
+                XCTAssertTrue(request.allowsCellularAccess)
+                if holdLookups {
+                    await withCheckedContinuation { waiters.append($0); if isEarly { pending.fulfill() } }
+                    try Task.checkCancellation()
+                }
+            }
+            let body: [String: Any] = ["id": item, "size": size, "eTag": "v1", "@microsoft.graph.downloadUrl": "https://audio.test/\(item)/\(calls.count)"]
+            return try response(request, data: JSONSerialization.data(withJSONObject: body))
+        }
+        let tracks = ["A","B"].map { IndexedTrack(driveId: "library", itemId: $0, path: ["Music", "Album", $0]) }
+        func fillCache(_ track: IndexedTrack) {
+            let file = MediaPool.File(drive: track.driveId, item: track.itemId, version: "v1", size: Int64(size))
+            for offset in stride(from: 0, to: size, by: MediaRanges.block) {
+                pool.store(song.subdata(in: offset..<min(offset + MediaRanges.block, size)), for: file, at: Int64(offset))
+            }
+        }
+        let player = NativePlayback(pool: pool) { drive, item, request, wifiOnly in
+            try await account.media(driveID: drive, itemID: item, lookup: request, wifiOnly: wifiOnly)
+        }
+        let controller = LibraryController(account: account, store: .nonPersistent(), player: player)
+        let host = try XCTUnwrap((UIApplication.shared.delegate as? AppDelegate)?.library)
+        host.addChild(controller)
+        host.view.addSubview(controller.view)
+        controller.didMove(toParent: host)
+        defer {
+            releaseLookups()
+            player.stop()
+            controller.detachPage()
+            controller.willMove(toParent: nil)
+            controller.view.removeFromSuperview()
+            controller.removeFromParent()
+        }
+        let page = try await readyPage(in: controller)
+        _ = try await account.signIn(presenting: controller)
+        // Use the installed drawer and native reply bridge with a synthetic queue and no library sync.
+        _ = try await page.callAsyncJavaScript("""
+            const {createNativeLibrary} = await import('./dist/native-library.js');
+            const {attachNativePlayback} = await import('./dist/native-playback.js');
+            const native = createNativeLibrary(window.webkit.messageHandlers.oneplay);
+            await native.loadAccountState('state');
+            document.getElementById('status').hidden = true;
+            const drawer = attachNativePlayback(native,document.getElementById('footer'),()=>{},()=>{},()=>{});
+            if (!document.querySelector('.audio-ranges').hidden) throw Error('Debug is off initially');
+            drawer.setDebugEnabled(true);
+            window.addEventListener('oneplay-playback', e => {
+                if (e.detail.snapshot.state === 'playing') {
+                    window.readyPosition = e.detail.snapshot.position;
+                    window.readyTrack = e.detail.snapshot.path.at(-1);
+                }
+            });
+            """, arguments: [:], in: nil, contentWorld: .page)
+        func waitForUI(_ predicate: String) async throws {
+            let deadline = ContinuousClock.now + .seconds(5)
+            while ContinuousClock.now < deadline {
+                if try await page.evaluateJavaScript(predicate) as? Bool == true { return }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTFail("Missing UI state: " + predicate + ", player: " + player.status)
+        }
+        try player.start(tracks: tracks, delaySeconds: 0, nearEnd: false, forceRefresh: false)
+        try await waitForUI("document.querySelector('.footer-title')?.textContent === 'A'")
+        _ = try await page.evaluateJavaScript("document.querySelector('.footer-gripper').click()")
+        try await waitForUI("!!document.querySelector('.audio-range-rail .marker')")
+        let item = try XCTUnwrap(player.snapshot["item"] as? String)
+        await fulfillment(of: [pending], timeout: 5)
+        try await waitForUI("!!document.querySelector('.audio-ranges > :last-child .lookup')")
+        _ = try await page.callAsyncJavaScript("await Promise.all(document.querySelector('.expansion').getAnimations().map(a => a.finished))",
+                                               arguments: [:], in: nil, contentWorld: .page)
+        let screen = try await page.takeSnapshot(configuration: nil)
+        let image = XCTAttachment(image: screen)
+        image.name = "Expanded player during successor Graph lookup"
+        image.lifetime = .keepAlways
+        add(image)
+        releaseLookups()
+        try await waitForUI("!document.querySelector('.audio-ranges .lookup')")
+        // A 128 kbps file needs ~560 kB through +30 and the first four seconds of resumed PCM.
+        // Wait for genuine cellular read-ahead on A while B has only its URL.
+        try await waitForUI("parseFloat(document.querySelector('.audio-ranges > :nth-child(2) .cached')?.style.width) >= 24")
+        XCTAssertFalse(TestAudioCDN.fixture.withLock { $0.paths.contains { $0.hasPrefix("/B/") } })
+        let beforeSkip = try XCTUnwrap(player.snapshot["position"] as? Double)
+        _ = try await page.evaluateJavaScript("document.querySelector('.scrubber-edge-button.top').click()")
+        try await waitForUI("Math.abs(window.readyPosition - \(beforeSkip + 30)) < 1 && !document.querySelector('.scrubber-text.loading')")
+        fillCache(tracks[0])
+        try await waitForUI("!document.querySelector('.audio-range-rail .fetching')")
+        let requestsBeforeWarmSeeks = TestAudioCDN.fixture.withLock { $0.paths }
+        for target in [10, 120, 15] {
+            let began = ContinuousClock.now
+            _ = try await page.callAsyncJavaScript("""
+                window.readyPosition = -1;
+                return await window.webkit.messageHandlers.oneplay.postMessage({op:'playback', version:1, action:'seek', item, seconds:target, debugRanges:true});
+                """, arguments: ["item": item, "target": target], in: nil, contentWorld: .page)
+            let time = String(format: "%d:%02d", target / 60, target % 60)
+            try await waitForUI("Math.abs(window.readyPosition - \(target)) < 0.8 && document.querySelector('.scrubber-text:not(.loading) span')?.textContent.startsWith('\(time) /')")
+            XCTAssertEqual(player.snapshot["state"] as? String, "playing")
+            print("Warm seek \(target)s to playing and displayed time: \(began.duration(to: .now))")
+        }
+        XCTAssertEqual(calls, ["A", "B"])
+        XCTAssertFalse(requestsBeforeWarmSeeks.isEmpty)
+        XCTAssertTrue(requestsBeforeWarmSeeks.allSatisfy { $0.hasPrefix("/A/") })
+        XCTAssertEqual(TestAudioCDN.fixture.withLock { $0.paths }, requestsBeforeWarmSeeks)
+        fillCache(tracks[1])
+        wifi.withLock { $0 = true }
+        // A paused scrub stays at the exact end.
+        let duration = try XCTUnwrap(player.snapshot["duration"] as? Double)
+        try player.apply("pause", item: item, seconds: nil)
+        try player.apply("seek", item: item, seconds: duration)
+        let endTime = String(format: "%d:%02d", Int(duration) / 60, Int(duration) % 60)
+        try await waitForUI("document.querySelector('.audio-range-rail .marker')?.style.left === '100%' && document.querySelector('.scrubber-text:not(.loading) span')?.textContent === '\(endTime) / \(endTime)'")
+        _ = try await page.callAsyncJavaScript("await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))", arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertEqual(player.snapshot["state"] as? String, "paused")
+        XCTAssertEqual(try XCTUnwrap(player.snapshot["position"] as? Double), duration)
+        let parked = XCTAttachment(image: try await page.takeSnapshot(configuration: nil))
+        parked.name = "Scrubber parked at exact end"
+        parked.lifetime = .keepAlways
+        add(parked)
+        try player.apply("seek", item: item, seconds: 120)
+        XCTAssertEqual(player.snapshot["position"] as? Double, 120)
+        XCTAssertEqual(player.snapshot["state"] as? String, "paused")
+        try player.apply("play", item: item, seconds: nil)
+        try await waitForUI("window.readyPosition >= 120 && !document.querySelector('.scrubber-text.loading')")
+        let began = ContinuousClock.now
+        _ = try await page.evaluateJavaScript("document.querySelector('.scrubber-edge-button.right').click()")
+        try await waitForUI("document.querySelector('.footer-title')?.textContent === 'B' && !!document.querySelector('.scrubber-text:not(.loading)') && !!document.querySelector('.audio-range-rail .marker')")
+        XCTAssertEqual(player.snapshot["state"] as? String, "playing")
+        XCTAssertEqual(calls, ["A", "B"])
+        print("Prepared Next to playing and displayed time: \(began.duration(to: .now))")
+
+        let last = try XCTUnwrap(player.snapshot["item"] as? String)
+        wifi.withLock { $0 = false }
+        try player.apply("seek", item: last, seconds: duration)
+        pool.clear()
+        try player.apply("seek", item: last, seconds: 45)
+        try player.apply("play", item: last, seconds: nil)
+        try await waitForUI("Math.abs(window.readyPosition - 45) < 1")
+        XCTAssertEqual(calls, ["A", "B"])
+        XCTAssertTrue(TestAudioCDN.fixture.withLock { $0.paths.contains("/B/2") })
+
+        // Hold Graph after a genuine CDN rejection. Seeking into retained audio still resumes immediately.
+        try player.apply("seek", item: last, seconds: duration)
+        holdLookups = true
+        TestAudioCDN.fixture.withLock { $0.expired = true }
+        pool.clear()
+        try player.apply("seek", item: last, seconds: 90)
+        try player.apply("play", item: last, seconds: nil)
+        try await waitForUI("!!document.querySelector('.scrubber-text.loading') && !!document.querySelector('.audio-ranges > :nth-child(2) .lookup')")
+        fillCache(tracks[1])
+        try player.apply("seek", item: last, seconds: 30)
+        try await waitForUI("Math.abs(window.readyPosition - 30) < 1 && !document.querySelector('.scrubber-text.loading')")
+        releaseLookups()
+
+        // The next uncached read can renew, then reuse the replacement for later ranges.
+        try player.apply("seek", item: last, seconds: duration)
+        pool.clear()
+        try player.apply("seek", item: last, seconds: 60)
+        try player.apply("play", item: last, seconds: nil)
+        try await waitForUI("Math.abs(window.readyPosition - 60) < 1 && !document.querySelector('.scrubber-text.loading')")
+        XCTAssertEqual(calls, ["A", "B", "B", "B"])
+        XCTAssertTrue(TestAudioCDN.fixture.withLock { $0.paths.contains("/B/4") })
+
+        // The same seek message as a wheel release advances the playing track without another tap.
+        try player.apply("previous", item: last, seconds: nil)
+        try await waitForUI("document.querySelector('.footer-title')?.textContent === 'A' && window.readyPosition < 1")
+        let previous = try XCTUnwrap(player.snapshot["item"] as? String)
+        _ = try await page.callAsyncJavaScript("""
+            window.readyTrack = null;
+            return await window.webkit.messageHandlers.oneplay.postMessage({op:'playback', version:1, action:'seek', item, seconds, debugRanges:true});
+            """, arguments: ["item": previous, "seconds": duration - 0.05], in: nil, contentWorld: .page)
+        try await waitForUI("window.readyTrack === 'B' && document.querySelector('.footer-title')?.textContent === 'B' && !document.querySelector('.scrubber-text.loading')")
+        _ = try await page.callAsyncJavaScript("await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))", arguments: [:], in: nil, contentWorld: .page)
+        let advanced = XCTAttachment(image: try await page.takeSnapshot(configuration: nil))
+        advanced.name = "Track B playing after scrubbing track A to the end"
+        advanced.lifetime = .keepAlways
+        add(advanced)
+        XCTAssertEqual(player.snapshot["state"] as? String, "playing")
+        let finalItem = try XCTUnwrap(player.snapshot["item"] as? String)
+        // Releasing at the end during playback finishes the queue in the same command.
+        try player.apply("seek", item: finalItem, seconds: duration)
+        XCTAssertEqual(player.snapshot["position"] as? Double, duration)
+        XCTAssertEqual(player.snapshot["state"] as? String, "ended", player.status)
+        XCTAssertEqual(calls, ["A", "B", "B", "B"])
+    }
+
+    func testMediaReadsURLAndVersionFromOneDriveItem() async throws {
+        try pair()
+        var status = 200
+        var redirected = false
+        let account = try NativeAccount(recordFile: record, identity: TestIdentity()) { [self] req in
+            if req.url?.path == "/v1.0/me/drive" { return try response(req, data: drive) }
+            XCTAssertEqual(req.url?.absoluteString,
+                           "https://graph.microsoft.com/v1.0/drives/library/items/drive!a%2Fb?$select=@microsoft.graph.downloadUrl")
+            let item = #"{"id":"drive!a/b","eTag":"v1","size":3596288,"@microsoft.graph.downloadUrl":"https://cdn.example.test/song"}"#
+            let origin = redirected ? URLRequest(url: URL(string: "https://cdn.example.test/redirect")!) : req
+            return try response(origin, status: status, data: Data(item.utf8))
+        }
+        let media = try await account.media(driveID: "library", itemID: "drive!a/b")
+        XCTAssertEqual(media.url.absoluteString, "https://cdn.example.test/song")
+        XCTAssertEqual(media.etag, "v1")
+        XCTAssertEqual(media.size, 3596288)
+        status = 403
+        redirected = true
+        do {
+            _ = try await account.media(driveID: "library", itemID: "drive!a/b", lookup: .replace(media))
+            XCTFail("Expected metadata from Graph")
+        } catch { XCTAssertEqual(NativeAccountError.classify(error), .unavailable) }
+        XCTAssertFalse(media.accessDenied)
+        redirected = false
+        do {
+            _ = try await account.media(driveID: "library", itemID: "drive!a/b", lookup: .replace(media))
+            XCTFail("Expected Graph to deny access")
+        } catch { XCTAssertEqual(NativeAccountError.classify(error), .forbidden) }
+        XCTAssertTrue(media.accessDenied)
+        status = 200
+        let restored = try await account.media(driveID: "library", itemID: "drive!a/b", lookup: .reuse(media))
+        XCTAssertFalse(restored === media)
+    }
+
     func testPlayerCancellationLeavesSilentRenewalToDrainAtLogout() async throws {
         try pair()
         let id = TestIdentity()
@@ -424,7 +702,7 @@ import AVFoundation
         }
         let stopped = expectation(description: "Decoder worker released before the SDK completes")
         let player = Task {
-            do { _ = try await account.media(driveID: "library", itemID: "track", forceRefresh: true); XCTFail("Expected cancellation") }
+            do { _ = try await account.media(driveID: "library", itemID: "track", lookup: .force); XCTFail("Expected cancellation") }
             catch { XCTAssertEqual(NativeAccountError.classify(error), .cancelled) }
             stopped.fulfill()
         }
@@ -468,7 +746,7 @@ import AVFoundation
             }
         }
         let capture = dir.appendingPathComponent("scale.caf")
-        let player = NativePlayback(captureURL: capture) { _, _, _ in throw NativeAccountError.invalidRequest }
+        let player = NativePlayback(captureURL: capture) { _, _, _, _ in throw NativeAccountError.invalidRequest }
         let controller = LibraryController(account: account, store: .nonPersistent(), player: player)
         let host = try XCTUnwrap((UIApplication.shared.delegate as? AppDelegate)?.library)
         host.addChild(controller)
@@ -575,7 +853,9 @@ import AVFoundation
         await fulfillment(of: [signOut.started], timeout: 3)
         _ = try await replacement.evaluateJavaScript("window.webkit.messageHandlers.oneplay.postMessage({op:'signOut'}).catch(()=>{}); true")
         await fulfillment(of: [signOut.cancelled], timeout: 3)
-        let signedOut = try await readyPage(in: controller, excluding: replacement)
+        // This page also waits for WebKit to clear the 30k-track store. On the simulator that
+        // cleanup alone can take 20 seconds; keep the regular cold-shell deadline for other callers.
+        let signedOut = try await readyPage(in: controller, excluding: replacement, timeout: .seconds(60))
         for retained in [page, replacement] {
             let retired = try await retained.evaluateJavaScript("location.href === 'about:blank' && typeof window.fixtureWriter === 'undefined'")
             XCTAssertEqual(retired as? Bool, true, "The old document is still alive after sign-out")

@@ -134,6 +134,12 @@
 
 ## Media playback and MediaSession
 
+- A streaming regression test can hold back a response after its first block until the decoder asks for a distant tail. This proves incremental delivery without a timing threshold. Surface fixture timeouts on the main test thread so a closed socket cannot accidentally pass the test. [Transport checks](experiments/ios-playback/tools/check-ranges.py)
+
+- Measure decoder reads, HTTP ranges, connection reuse and time to first PCM separately. On a slow link an MP3 opening its tail can stall behind a single whole-file transfer. A cached seek can also become cold when replacing the decoder discards its compressed bytes. [iOS and PWA traces](experiments/ios-playback/Evidence/phase5/BUFFERING.md)
+- For a recent incident on a paired iPhone, the device's unified log can join OnePlay’s range timings and frame underruns to CFNetwork task errors. The app's persisted diagnostics cover fewer events. Use a short time window, keep the archive private, and extract only sanitized measurements. [Cellular to Wi-Fi handoff](music/ai/AUDIO-FETCHING.md#luphone13-cellular-to-wi-fi-handoff-build-21)
+- An MP3 time-to-byte estimate can size the network range while Core Audio still selects the actual sample. Test uneven VBR and compare with the same seek on local bytes. Test an evicted header separately from a normal scrub after playback has started. [Cellular seek measurements](music/ai/AUDIO-FETCHING.md#build-21-cellular-seeks-and-earlier-successor-lookup)
+
 - **Check both sides of a recorded audio join independently.** A queue transition callback can arrive on time while the output has a gap. Align waveforms on both sides against an independent edit on the same route. Periodic fades need an onset or a level check to disambiguate repeated cycles.
 
 - **Reset media element state before async track switches to prevent stale event races.**
@@ -168,3 +174,5 @@
 - **Budget explicit waits for real production startup work.** Token refresh and first render can require deterministic grace time.
 
 - On a USB-connected iPhone, the status-bar setting alone does not establish which route carried a test download. Record URLSession transaction metrics per request, including the cellular flag, across the whole run. A native PCM tap can measure joins under lock without requiring the listener to time a screen recording. See the [M17 device measurements](music/ai/PLAN-M17-ios.md#gate-2-measurements-on-luphone13-2026-11-24).
+
+- When a seek sounds prompt but its spinner lingers, measure the first scheduled PCM and the visible ready transition separately. A one-second position poll can leave a finished seek looking stalled for almost a second. [Native drawer behavior and simulator measurements](music/ai/AUDIO-FETCHING.md)

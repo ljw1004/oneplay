@@ -26,7 +26,7 @@ final class MeteredSource: @unchecked Sendable {
     func cancel() { ranges.cancel() }
     func promote() { ranges.promote() }
     func finishRenewal() throws {
-        try ranges.installRenewal(MediaLocation(url: media.renewed, etag: media.etag, size: media.bytes))
+        try ranges.renewLocation { MediaLocation(url: media.renewed, etag: media.etag, size: media.bytes) }
     }
     func read(_ offset: Int64, _ count: Int) throws -> Data { try ranges.read(offset, count) }
 }

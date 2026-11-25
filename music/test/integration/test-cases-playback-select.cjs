@@ -102,8 +102,21 @@ module.exports = {
 
         await page.locator("#children").evaluate(el => { el.scrollTop -= 100; });
         const visible = await geometry();
+        assert(visible.top >= 0 && visible.bottom >= 0, "The row should be fully visible before tapping");
         await chevron.click();
         assert((await geometry()).top === visible.top, "A fully visible song should stay put");
+
+        await page.locator(".footer-gripper").click();
+        await page.locator(".expansion").evaluate(async el => {
+            // Let the drawer reach its final size before checking the list's visible area.
+            el.getBoundingClientRect();
+            await Promise.all(el.getAnimations().map(animation => animation.finished));
+        });
+        await page.locator("#children").evaluate(el => { el.scrollTop = 0; });
+        await chevron.click();
+        assert(await page.locator("#footer.expanded").count() === 1, "Revealing the song should keep the drawer open");
+        const expanded = await geometry();
+        assert(expanded.top >= -1 && expanded.bottom >= -1, "The revealed row should fit above the expanded player");
     },
 
     /** After clicking play on a folder, the play button changes to filled ▶. */

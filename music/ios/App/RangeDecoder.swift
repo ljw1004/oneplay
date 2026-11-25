@@ -62,6 +62,30 @@ final class MP3RangeDecoder {
                                          UInt32(MemoryLayout<AudioStreamBasicDescription>.size), stereo.streamDescription))
     }
 
+    /// Ask Apple's MP3 stream parser for a time-to-byte hint using only retained header bytes.
+    /// This influences HTTP range sizing. ExtAudioFileSeek still positions the actual decoder.
+    static func estimatedSeekByte(seconds: Double, duration: Double, size: Int64, header: Data?) -> Int64 {
+        let fallback = Int64(exactly: (Double(size) * min(1, seconds / duration)).rounded(.down)) ?? size
+        var parser: AudioFileStreamID?
+        guard let header, !header.isEmpty,
+              AudioFileStreamOpen(nil, { _,_,_,_ in }, { _,_,_,_,_ in }, kAudioFileMP3Type, &parser) == noErr,
+              let parser else { return fallback }
+        defer { AudioFileStreamClose(parser) }
+        let status = header.withUnsafeBytes { AudioFileStreamParseBytes(parser, UInt32($0.count), $0.baseAddress!, []) }
+        var format = AudioStreamBasicDescription()
+        var length = UInt32(MemoryLayout.size(ofValue: format))
+        guard status == noErr, AudioFileStreamGetProperty(parser, kAudioFileStreamProperty_DataFormat, &length, &format) == noErr,
+              format.mFramesPerPacket > 0, let packet = Int64(exactly: (seconds * format.mSampleRate / Double(format.mFramesPerPacket)).rounded(.down))
+        else { return fallback }
+        var start: Int64 = 0, offset: Int64 = 0
+        var flags = AudioFileStreamSeekFlags()
+        length = UInt32(MemoryLayout.size(ofValue: start))
+        guard AudioFileStreamGetProperty(parser, kAudioFileStreamProperty_DataOffset, &length, &start) == noErr,
+              AudioFileStreamSeek(parser, packet, &offset, &flags) == noErr,
+              start >= 0, start < size, offset >= 0, offset < size - start else { return fallback }
+        return start + offset
+    }
+
     deinit {
         if let decoder { ExtAudioFileDispose(decoder) }
         if let audio { AudioFileClose(audio) }

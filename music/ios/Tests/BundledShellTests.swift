@@ -4,8 +4,8 @@ import WebKit
 
 /// A cold WebContent process can start after XCTest. Check the rendered page
 /// and report its actual terminal state if WebKit or application startup fails.
-@MainActor func readyPage(in controller: LibraryController, excluding old: WKWebView? = nil) async throws -> WKWebView {
-    let deadline = ContinuousClock.now + .seconds(20)
+@MainActor func readyPage(in controller: LibraryController, excluding old: WKWebView? = nil, timeout: Duration = .seconds(20)) async throws -> WKWebView {
+    let deadline = ContinuousClock.now + timeout
     let ready = "!!document.querySelector('.signin-btn') || document.getElementById('tree-container')?.hidden === false"
     while ContinuousClock.now < deadline {
         if let page = controller.webView, page !== old,

@@ -1,7 +1,7 @@
 import AVFoundation
 import OSLog
 
-struct IndexedTrack: Decodable, Equatable, Sendable {
+struct IndexedTrack: Codable, Equatable, Sendable {
     let driveId: String
     let itemId: String
     var path: [String]? = nil
@@ -22,7 +22,7 @@ private enum Recording: Sendable {
     #endif
 }
 
-enum QueueMode: String, CaseIterable {
+enum QueueMode: String, CaseIterable, Codable {
     case one, timer, all, `repeat`, shuffle
 
     var following: Self {
@@ -35,13 +35,13 @@ private enum NextPolicy { case automatic, manualOnly, fenced }
 
 /// An immutable pass travels with the audible anchor. Preparing a new shuffle pass does
 /// not change the current one until its first frame is actually rendered.
-private struct PlayCursor {
+private struct PlayCursor: Codable {
     let order: [Int]
     let slot: Int
     /// A removed recording is appended outside canonical order. Keep its former neighbors
     /// until handoff, so repeated edits cannot redirect it to the new occupant of its old row.
     var held: Held? = nil
-    struct Held {
+    struct Held: Codable, Equatable {
         let index: Int
         let former: [Int]
         let slot: Int
@@ -86,6 +86,38 @@ private struct PlayCursor {
     }
 }
 
+/// The structural record contains a complete restart point. A newer small checkpoint applies
+/// only to the same record and occurrence. A kill between replacements leaves either point usable.
+private struct SessionPoint: Codable, Equatable {
+    let generation: UUID
+    let item: String
+    let key: String
+    let slot: Int
+    let seconds: Double
+    let duration: MP3RangeDecoder.Length
+    let atEnd: Bool
+}
+
+private struct SavedSession: Codable {
+    let tracks: [IndexedTrack]
+    let canonical: [Int]
+    let cursor: PlayCursor
+    let next: PlayCursor?
+    let point: SessionPoint
+    let folder: [String]
+    let folderKey: String
+    let mode: QueueMode
+    let timer: String
+    let favorite: String?
+    let configuredMode: QueueMode?
+    let fenced: Bool
+}
+
+private struct SourceAccess: Codable {
+    let connected: Set<String>?
+    let denied: Set<String>
+}
+
 /// One serial worker schedules PCM. A separate worker prepares the single successor while the
 /// outgoing music renders. Replacement drains both, including outstanding transfer accounting.
 final class NativePlayback: @unchecked Sendable {
@@ -114,6 +146,7 @@ final class NativePlayback: @unchecked Sendable {
     private var catalog = [Recording]()
     private var slots = [String: Int]()
     private var canonical = [Int]()
+    private var accessDirty = false
     private var deniedRoots = Set<String>()
     private var connectedShares: Set<String>?
     private func blocked(_ root: String) -> Bool {
@@ -124,6 +157,170 @@ final class NativePlayback: @unchecked Sendable {
         return mode == .one || (mode == .timer && timerSetting == "end-of-track") ? .manualOnly : .automatic
     }
     private var pool: MediaPool
+
+    private let writer = DispatchQueue(label: "me.unto.oneplay.music.checkpoints", qos: .utility)
+    // Each failed file retains its newest write until that file succeeds. A different
+    // favorite or a newer session record cannot acknowledge an unsaved outgoing spot.
+    private var pendingWrites = [String: () throws -> Void]()
+    private var spots = [String: FavoriteSpot]()
+    private var store: PlaybackStore?
+    private var favorite: String?
+    private var configuredMode: QueueMode?
+    private var savedCursor: PlayCursor?
+    private var savedNextOrder: [Int]?
+    private var savedPoint: SessionPoint?
+    private var structureDirty = true
+    private var ticker: DispatchSourceTimer?
+    private var hasHistory = false
+
+    /// Reattaching WebKit never reopens a live session. The paused run waits before activating audio or resolving a URL.
+    func restoreIfNeeded(from storage: PlaybackStore) throws {
+        try lock.withLock {
+            guard store?.directory != storage.directory else { return }
+            let access = try storage.read(SourceAccess.self, "access")
+            guard store == nil else { throw NativeAccountError.wrongAccount }
+            let saved: SavedSession??
+            do { saved = try storage.read(SavedSession?.self, "queue") }
+            catch is DecodingError { saved = .some(nil); diagnostics?.record("Unreadable playback queue") }
+            store = storage
+            connectedShares = access?.connected
+            deniedRoots = access?.denied ?? []
+            hasHistory = saved != nil
+            guard let record = saved ?? nil else { return }
+            let indices = record.tracks.indices
+            func validCursor(_ cursor: PlayCursor) -> Bool {
+                guard cursor.order.allSatisfy(indices.contains), Set(cursor.order).count == cursor.order.count else { return false }
+                if let held = cursor.held {
+                    return indices.contains(held.index) && held.former.indices.contains(held.slot)
+                        && held.former[held.slot] == held.index && held.former.allSatisfy(indices.contains)
+                        && [held.previous, held.next].compactMap { $0 }.allSatisfy(cursor.order.indices.contains)
+                }
+                return cursor.order.indices.contains(cursor.slot)
+            }
+            guard validCursor(record.cursor), record.next.map(validCursor) != false, record.canonical.allSatisfy(indices.contains),
+                  Set(record.canonical).count == record.canonical.count, Set(record.tracks.compactMap(\.key)).count == record.tracks.count else { return }
+            let recent = try? storage.read(SessionPoint.self, "position")
+            func valid(_ point: SessionPoint) -> Bool {
+                let index = record.cursor.held?.index ?? (record.cursor.order.indices.contains(point.slot) ? record.cursor.order[point.slot] : -1)
+                return point.generation == record.point.generation && record.tracks.indices.contains(index)
+                    && record.tracks[index].key == point.key && Self.validPosition(point.seconds) && point.duration.frames >= 0
+            }
+            let point = recent.flatMap { valid($0) ? $0 : nil } ?? record.point
+            guard valid(point) else { return }
+            let cursor = PlayCursor(order: record.cursor.order, slot: point.slot, held: record.cursor.held)
+            guard !blocked(record.tracks[cursor.index].sourceRootKey ?? "") else {
+                try storage.save(Optional<SavedSession>.none, "queue")
+                return
+            }
+            catalog = record.tracks.map(Recording.oneDrive)
+            slots = Dictionary(uniqueKeysWithValues: record.tracks.enumerated().compactMap { i, entry in entry.key.map { ($0, i) } })
+            canonical = record.canonical.filter { !blocked(record.tracks[$0].sourceRootKey ?? "") }
+            mode = record.mode
+            folder = record.folder
+            folderKey = record.folderKey
+            favorite = record.favorite
+            configuredMode = record.configuredMode
+            timerSetting = record.timer
+            session = UUID().uuidString
+            fencedRevision = record.fenced ? revision : nil
+            let eligible = cursor.revised(for: canonical, from: mode, to: mode)
+            replaceRun(cursor: eligible, position: point.atEnd ? .end : .seconds(point.seconds), paused: true,
+                       duration: point.duration, restoredNext: canonical == record.canonical && point.slot == record.cursor.slot ? record.next : nil)
+            savedCursor = cursor
+            savedPoint = point
+            savedNextOrder = mode == .shuffle && cursor.held == nil && cursor.slot == cursor.order.count - 1 ? record.next?.order : nil
+            structureDirty = canonical != record.canonical
+        }
+    }
+
+    /// Checkpoint the audible anchor independently of UI polling, even during locked playback.
+    func checkpoint() { lock.withLock { saveCheckpoint() } }
+
+    static func validPosition(_ seconds: Double) -> Bool {
+        seconds >= 0 && Int64(exactly: (seconds * 44_100).rounded()) != nil
+    }
+
+    /// Encode immutable snapshots on one serial writer. A slow 30k queue write cannot
+    /// freeze WebKit or the audio clock, or overtake the checkpoint for its replacement.
+    private func enqueueWrite(_ name: String, _ operation: @escaping () throws -> Void) {
+        writer.async { [self] in
+            do {
+                try operation()
+                pendingWrites.removeValue(forKey: name)
+            } catch {
+                pendingWrites[name] = operation
+                diagnostics?.record("Playback checkpoint write failed")
+            }
+        }
+    }
+
+    func waitForCheckpointWrites() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            writer.async { [self] in
+                do {
+                    for (name, operation) in pendingWrites {
+                        try operation()
+                        pendingWrites.removeValue(forKey: name)
+                    }
+                    if lock.withLock({ accessDirty }) { throw NativeAccountError.unavailable }
+                    continuation.resume()
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
+    private func saveCheckpoint() {
+        guard let store else { return }
+        if accessDirty {
+            do {
+                try store.save(SourceAccess(connected: connectedShares, denied: deniedRoots), "access")
+                accessDirty = false
+            } catch { diagnostics?.record("Playback source access write failed") }
+        }
+        guard let run = active, !folderKey.isEmpty, let anchor = run.persistenceAnchor() else {
+            if hasHistory && (structureDirty || savedPoint != nil) {
+                enqueueWrite("queue") { try store.save(Optional<SavedSession>.none, "queue") }
+                savedPoint = nil
+                savedCursor = nil
+                structureDirty = false
+            }
+            return
+        }
+        let cursor = anchor.cursor
+        guard let entry = catalog[cursor.index].indexed, let key = entry.key, let path = entry.path else { return }
+        // Only a shuffle wrap has a next pass distinct from the current order.
+        let alternate = mode == .shuffle && cursor.held == nil && cursor.slot == cursor.order.count - 1 ? anchor.next?.order : nil
+        let structural = structureDirty || savedCursor?.order != cursor.order || savedCursor?.held != cursor.held
+            || savedNextOrder != alternate || savedPoint == nil
+        let point = SessionPoint(generation: structural ? UUID() : savedPoint!.generation,
+            item: anchor.item, key: key, slot: cursor.slot, seconds: anchor.seconds, duration: anchor.duration, atEnd: anchor.atEnd)
+        guard structural || savedPoint != point else { return }
+        if structural {
+            let record = SavedSession(tracks: catalog.compactMap(\.indexed), canonical: canonical, cursor: cursor,
+                next: alternate == nil ? nil : anchor.next, point: point, folder: folder, folderKey: folderKey, mode: mode,
+                timer: timerSetting, favorite: favorite, configuredMode: configuredMode, fenced: fencedRevision != nil)
+            enqueueWrite("queue") { try store.save(record, "queue") }
+            hasHistory = true
+        } else { enqueueWrite("position") { try store.save(point, "position") } }
+        if let favorite, cursor.held == nil {
+            let spot = FavoriteSpot(folder: folder, folderKey: folderKey, path: path, key: key, seconds: point.seconds)
+            spots[favorite] = spot
+            let name = store.bookmarkFile(favorite)
+            enqueueWrite(name) { try store.save(spot, name) }
+        }
+        savedPoint = point
+        savedCursor = cursor
+        savedNextOrder = alternate
+        structureDirty = false
+    }
+
+    /// One-time migration accepts resolved identities only and can never replace Swift's bookmark.
+    func importSpot(_ spot: FavoriteSpot, favorite: String) throws {
+        try lock.withLock {
+            guard Self.validPosition(spot.seconds), let store, spots[favorite] == nil, try store.read(FavoriteSpot.self, store.bookmarkFile(favorite)) == nil else { return }
+            try store.save(spot, store.bookmarkFile(favorite))
+        }
+    }
 
     @MainActor var onChange: ((_ debugOnly: Bool) -> Void)?
 
@@ -143,6 +340,7 @@ final class NativePlayback: @unchecked Sendable {
     func snapshot(lookups: [IndexedTrack]?) -> [String: Any] {
         lock.withLock {
             var result = active?.snapshot(lookups: lookups) ?? [:]
+            result["hasHistory"] = hasHistory
             result["mode"] = mode.rawValue
             if active != nil && (result["item"] != nil || fencedRevision != nil) {
                 result["fenced"] = fencedRevision != nil
@@ -157,15 +355,25 @@ final class NativePlayback: @unchecked Sendable {
     }
 
     func start(tracks: [IndexedTrack], startIndex: Int = 0, delaySeconds: Int, nearEnd: Bool, forceRefresh: Bool,
-               folder: [String] = [], folderKey: String = "", selected: Bool = true, timer: String? = nil, initialMode: QueueMode? = nil) throws {
-        guard tracks.indices.contains(startIndex), [0,5,10].contains(delaySeconds),
+               folder: [String] = [], folderKey: String = "", selected: Bool = true, timer: String? = nil, initialMode: QueueMode? = nil, favorite: String? = nil, legacyPosition: Double? = nil) throws {
+        guard legacyPosition.map(Self.validPosition) != false, tracks.indices.contains(startIndex), [0,5,10].contains(delaySeconds),
               tracks.allSatisfy({ !$0.driveId.isEmpty && !$0.itemId.isEmpty }) else {
             throw PlaybackError("Invalid playback request")
         }
         try lock.withLock {
             let eligible = tracks.indices.filter { !blocked(tracks[$0].sourceRootKey ?? "") }
             guard let first = eligible.first, !selected || eligible.contains(startIndex) else { throw NativeAccountError.forbidden }
-            let initial = selected ? startIndex : first
+            if legacyPosition != nil && (hasHistory || active != nil) { return }
+            saveCheckpoint()
+            let bookmark: FavoriteSpot?
+            if let favorite, !selected, initialMode != .shuffle, let store {
+                bookmark = spots[favorite] ?? (try? store.read(FavoriteSpot.self, store.bookmarkFile(favorite)))
+            } else { bookmark = nil }
+            let bookmarked = bookmark.flatMap { spot in Self.validPosition(spot.seconds) ? eligible.first { tracks[$0].key == spot.key } : nil }
+            let initial = bookmarked ?? (selected ? startIndex : first)
+            self.favorite = favorite
+            configuredMode = initialMode
+            structureDirty = true
             if let timer { try setTimerSetting(timer) }
             if let initialMode { mode = initialMode }
             else if self.folder.dropFirst().first?.hasPrefix("fav:") == true && self.folder.dropFirst().first != folder.dropFirst().first { mode = .all }
@@ -184,9 +392,11 @@ final class NativePlayback: @unchecked Sendable {
             if mode != .shuffle { order = eligible }
             else if selected { order = [initial] + eligible.filter { $0 != initial }.shuffled() }
             else { order = eligible.shuffled() }
-            replaceRun(cursor: PlayCursor(order: order, slot: selected ? order.firstIndex(of: initial)! : 0),
+            replaceRun(cursor: PlayCursor(order: order, slot: selected || bookmarked != nil ? order.firstIndex(of: initial)! : 0),
+                       position: .seconds(legacyPosition ?? (bookmarked != nil ? bookmark!.seconds : 0)), paused: legacyPosition != nil,
                        delaySeconds: delaySeconds, nearEnd: nearEnd, forceRefresh: forceRefresh)
-            armTimer(playing: true)
+            armTimer(playing: legacyPosition == nil)
+            saveCheckpoint()
         }
     }
 
@@ -198,6 +408,9 @@ final class NativePlayback: @unchecked Sendable {
         }
         let ordered = urls.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
         lock.withLock {
+            saveCheckpoint()
+            favorite = nil
+            folderKey = ""
             mode = .all
             catalog = ordered.map(Recording.local)
             canonical = Array(catalog.indices)
@@ -212,13 +425,27 @@ final class NativePlayback: @unchecked Sendable {
     private func replaceRun(cursor: PlayCursor, advanced: Bool = false, position: PlaybackRun.Position = .seconds(0), paused: Bool = false,
                             seekItem: String? = nil, duration: MP3RangeDecoder.Length = .unknown, admitted: MediaLocation? = nil, budget: MediaRanges.Budget = .init(),
                             delaySeconds: Int = 0, nearEnd: Bool = false, forceRefresh: Bool = false,
-                            issuedAt: Double = ProcessInfo.processInfo.systemUptime) {
+                            issuedAt: Double = ProcessInfo.processInfo.systemUptime, restoredNext: PlayCursor? = nil) {
         active?.cancel()
-        let run = PlaybackRun(tracks: catalog, cursor: cursor, advanced: advanced, mode: mode, nextPolicy: nextPolicy(for: mode), position: position, paused: paused, seekItem: seekItem, duration: duration,
+        let run = PlaybackRun(tracks: catalog, cursor: cursor, restoredNext: restoredNext, advanced: advanced, mode: mode, nextPolicy: nextPolicy(for: mode), position: position, paused: paused, seekItem: seekItem, duration: duration,
                               admitted: admitted, lookup: lookup, captureURL: destination, diagnostics: diagnostics, pool: pool, budget: budget) { [weak self] debugOnly in
-            DispatchQueue.main.async { [weak self] in self?.onChange?(debugOnly) }
+            DispatchQueue.main.async { [weak self] in
+                if !debugOnly { self?.checkpoint() }
+                self?.onChange?(debugOnly)
+            }
         }
         active = run
+        if store != nil && ticker == nil {
+            let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+            timer.schedule(deadline: .now() + 5, repeating: 5)
+            timer.setEventHandler { [weak self] in
+                guard let self else { return }
+                self.checkpoint()
+                Task { try? await self.waitForCheckpointWrites() }
+            }
+            timer.resume()
+            ticker = timer
+        }
         run.setDeadline(deadline)
         guard !run.startsAtEnd else { return }
         worker.async {
@@ -232,6 +459,7 @@ final class NativePlayback: @unchecked Sendable {
         try lock.withLock {
             guard let run = active else { return }
             if fencedRevision != nil && (action == "next" || action == "previous") { return }
+            defer { saveCheckpoint() }
             if action == "cycleMode" {
                 let next = mode.following
                 if configure(run, mode: next, item: item) { armTimer(playing: active?.wantsPlay == true) }
@@ -255,6 +483,7 @@ final class NativePlayback: @unchecked Sendable {
         let updated = run.configure(catalog: catalog, canonical: canonical, mode: newMode,
             nextPolicy: nextPolicy(for: newMode), item: item, blocked: blocked, resumeAtBoundary: resumeAtBoundary)
         guard updated.applied else { return false }
+        structureDirty = structureDirty || mode != newMode
         mode = newMode
         if updated.revoked {
             active = nil
@@ -272,6 +501,8 @@ final class NativePlayback: @unchecked Sendable {
         lock.withLock {
             guard session == expected, next > revision, let run = active else { return }
             if fencedRevision == nil { continueAfterFence = run.wantsPlay && nextPolicy(for: mode) == .automatic }
+            structureDirty = true
+            defer { saveCheckpoint() }
             fencedRevision = next
             revision = next
             configure(run, mode: mode)
@@ -280,21 +511,33 @@ final class NativePlayback: @unchecked Sendable {
 
     /// Library revisions carry canonical order. Preparation budgets and occurrence references
     /// retain their slot even when a row moves or temporarily disappears.
-    func revise(session expected: String, revision next: Int, folder: [String], tracks: [IndexedTrack]) {
+    func revise(session expected: String, revision next: Int, folder: [String], tracks: [IndexedTrack], favorite: String? = nil, configuredMode: QueueMode? = nil) {
         lock.withLock {
             guard session == expected, next > revision || next == fencedRevision, let run = active else { return }
             let continueAtEnd = fencedRevision != nil && continueAfterFence
+            structureDirty = structureDirty || fencedRevision != nil || self.folder != folder || self.favorite != favorite || self.configuredMode != configuredMode
+            self.favorite = favorite
+            let nextMode = configuredMode != self.configuredMode ? configuredMode ?? mode : mode
+            self.configuredMode = configuredMode
             fencedRevision = nil
             revision = next
             self.folder = folder
-            canonical = tracks.compactMap { entry in
+            let newOrder = tracks.compactMap { entry -> Int? in
                 guard let key = entry.key, !blocked(entry.sourceRootKey ?? "") else { return nil }
-                if let slot = slots[key] { catalog[slot] = .oneDrive(entry); return slot }
+                if let slot = slots[key] {
+                    if catalog[slot].indexed != entry { catalog[slot] = .oneDrive(entry); structureDirty = true }
+                    return slot
+                }
                 slots[key] = catalog.count
                 catalog.append(.oneDrive(entry))
                 return catalog.count - 1
             }
-            configure(run, mode: mode, resumeAtBoundary: continueAtEnd && (deadline.map { $0 > .now } ?? true))
+            structureDirty = structureDirty || canonical != newOrder
+            canonical = newOrder
+            let modeChanged = mode != nextMode
+            configure(run, mode: nextMode, resumeAtBoundary: continueAtEnd && (deadline.map { $0 > .now } ?? true))
+            if modeChanged { armTimer(playing: active?.wantsPlay == true) }
+            saveCheckpoint()
         }
     }
 
@@ -303,7 +546,13 @@ final class NativePlayback: @unchecked Sendable {
         lock.withLock {
             let known = connected ?? connectedShares
             let excluded = deniedRoots.subtracting(allowed).union(denied)
-            guard connectedShares != known || deniedRoots != excluded else { return }
+            guard connectedShares != known || deniedRoots != excluded else {
+                if accessDirty { saveCheckpoint() }
+                return
+            }
+            accessDirty = store != nil
+            structureDirty = true
+            defer { saveCheckpoint() }
             connectedShares = known
             deniedRoots = excluded
             guard let run = active else { return }
@@ -341,13 +590,26 @@ final class NativePlayback: @unchecked Sendable {
         try lock.withLock {
             let old = timerSetting
             try setTimerSetting(setting)
-            guard old != setting, mode == .timer, let run = active else { return }
+            guard old != setting else { return }
+            structureDirty = true
+            defer { saveCheckpoint() }
+            guard mode == .timer, let run = active else { return }
             configure(run, mode: mode)
             armTimer(playing: active?.wantsPlay == true)
         }
     }
 
-    func stop() { lock.withLock { active?.cancel(); active = nil; armTimer(playing: false) } }
+    func pauseForInterruption() {
+        lock.withLock {
+            guard let run = active else { return }
+            run.pauseForInterruption()
+            armTimer(playing: false)
+            continueAfterFence = false
+            saveCheckpoint()
+        }
+    }
+
+    func stop() { lock.withLock { active?.cancel(); active = nil; armTimer(playing: false); saveCheckpoint() } }
 
     func cancelWiFiReadsIfMetered() { lock.withLock { pool.cancelWiFiReadsIfMetered() } }
 
@@ -356,7 +618,8 @@ final class NativePlayback: @unchecked Sendable {
 
     /// Logout drains all in-flight bytes before removing the diagnostic recording. Retrying cleanup is safe.
     func stopAndDrain() async throws {
-        lock.withLock { active?.cancel(); active = nil; catalog = []; canonical = []; slots = [:]; connectedShares = nil; deniedRoots = []; mode = .all; armTimer(playing: false); pool = MediaPool(unmeteredWiFi: pool.unmeteredWiFi) }
+        lock.withLock { ticker?.cancel(); ticker = nil; store = nil; accessDirty = false; spots.removeAll(); hasHistory = false; savedPoint = nil; savedCursor = nil; structureDirty = true; favorite = nil; folder = []; folderKey = ""; configuredMode = nil; active?.cancel(); active = nil; catalog = []; canonical = []; slots = [:]; connectedShares = nil; deniedRoots = []; mode = .all; armTimer(playing: false); pool = MediaPool(unmeteredWiFi: pool.unmeteredWiFi) }
+        await withCheckedContinuation { continuation in writer.async { self.pendingWrites.removeAll(); continuation.resume() } }
         await withCheckedContinuation { continuation in worker.async { continuation.resume() } }
         do { try FileManager.default.removeItem(at: destination) }
         catch let error as CocoaError where error.code == .fileNoSuchFile { }
@@ -446,6 +709,17 @@ private final class PlaybackRun: @unchecked Sendable {
         return lastFrame
     }
 
+    /// Cursor, successor, clock and length must all describe the same side of a render boundary.
+    func persistenceAnchor() -> (cursor: PlayCursor, next: PlayCursor?, item: String, seconds: Double, duration: MP3RangeDecoder.Length, atEnd: Bool)? {
+        lock.withLock {
+            let frame = min(renderedFrame(), scheduled)
+            let entry = audibleAnchor(at: frame)
+            if entry.cursor.held != nil && terminal == "ended" { return nil }
+            let seconds = started ? Double(entry.fileFrame + max(0, frame - entry.nodeFrame)) / Double(rate) : lastPosition
+            return (entry.cursor, entry.next, entry.item, terminal == "ended" ? 0 : seconds, entry.duration, startsAtEnd && terminal == nil)
+        }
+    }
+
     func snapshot(lookups: [IndexedTrack]?) -> [String: Any] {
         lock.withLock {
             expireIfDue()
@@ -469,7 +743,7 @@ private final class PlaybackRun: @unchecked Sendable {
         }
     }
 
-    init(tracks: [Recording], cursor: PlayCursor, advanced: Bool, mode: QueueMode, nextPolicy: NextPolicy, position: Position, paused: Bool, seekItem: String?, duration: MP3RangeDecoder.Length, admitted: MediaLocation?, lookup: @escaping NativePlayback.Lookup, captureURL: URL, diagnostics: NativeDiagnostics?, pool: MediaPool, budget: MediaRanges.Budget, signalChange: @escaping @Sendable (Bool) -> Void) {
+    init(tracks: [Recording], cursor: PlayCursor, restoredNext: PlayCursor?, advanced: Bool, mode: QueueMode, nextPolicy: NextPolicy, position: Position, paused: Bool, seekItem: String?, duration: MP3RangeDecoder.Length, admitted: MediaLocation?, lookup: @escaping NativePlayback.Lookup, captureURL: URL, diagnostics: NativeDiagnostics?, pool: MediaPool, budget: MediaRanges.Budget, signalChange: @escaping @Sendable (Bool) -> Void) {
         self.admitted = admitted
         self.signalChange = signalChange
         self.budget = budget
@@ -486,7 +760,7 @@ private final class PlaybackRun: @unchecked Sendable {
         self.startsAtEnd = position == .end
         self.paused = paused || startsAtEnd
         self.lastPosition = startSeconds
-        self.anchor = Anchor(cursor: cursor, next: cursor.neighbor(1, mode: mode), item: seekItem ?? UUID().uuidString, advanced: advanced, nodeFrame: 0, fileFrame: 0, duration: duration)
+        self.anchor = Anchor(cursor: cursor, next: restoredNext ?? cursor.neighbor(1, mode: mode), item: seekItem ?? UUID().uuidString, advanced: advanced, nodeFrame: 0, fileFrame: 0, duration: duration)
         self.diagnostics = diagnostics
         self.lookup = lookup
         self.captureURL = captureURL
@@ -649,6 +923,7 @@ private final class PlaybackRun: @unchecked Sendable {
                         resumeOrStop.signal()
                         preparingWindow?.changed.signal()
                     }
+                    if action == "pause" { _ = renderedFrame() }
                     paused = action == "pause"
                     if started {
                         if paused { node.pause() } else if !node.isPlaying { try node.playAudio() }
@@ -664,6 +939,14 @@ private final class PlaybackRun: @unchecked Sendable {
     }
 
     /// Stop audible output immediately, including when Graph or the CDN is unresponsive.
+    func pauseForInterruption() {
+        lock.withLock {
+            _ = renderedFrame()
+            if started { node.pause() }
+            paused = true
+        }
+    }
+
     func cancel() { lock.withLock { cancelLocked() } }
 
     /// The item comparison and the stop share the same critical section as successor scheduling.

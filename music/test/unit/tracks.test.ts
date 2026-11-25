@@ -344,5 +344,10 @@ describe('live queue identity', () => {
         assert.equal(selected.tracks.length, 1);
         assert.equal(await buildLibraryQueue(root, roots, favs, new Set(), selected.folderKey), undefined);
         assert.equal((await buildLibraryQueue(root, roots, favs, new Set(['share:s']), selected.folderKey))?.tracks.length, 1);
+        // Path-only migration also needs a complete projection before declaring a bookmark missing.
+        assert.equal(await buildLibraryQueue(root, roots, favs, new Set(), ''), undefined);
+        roots.delete('share:s');
+        assert.equal(await buildLibraryQueue(root, roots, favs, new Set(), '', false), undefined);
+        assert.equal((await buildLibraryQueue(root, roots, favs, new Set(), '', true))?.tracks.length, 1);
     });
 });

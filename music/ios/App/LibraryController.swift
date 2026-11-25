@@ -1,3 +1,4 @@
+import AVFoundation
 import UIKit
 import UniformTypeIdentifiers
 import WebKit
@@ -62,11 +63,21 @@ import WebKit
                 if account.cleanupPending {
                     try await finishCleanup(account)
                 }
+                if let storage = try account.openPlaybackStore(), let player { try await Task.detached { try player.restoreIfNeeded(from: storage) }.value }
+                NotificationCenter.default.addObserver(self, selector: #selector(audioInterrupted(_:)),
+                    name: AVAudioSession.didBecomeInactiveNotification, object: nil)
                 loadPage()
             } catch {
                 showUnavailable()
             }
         }
+    }
+
+    /// The operating system can interrupt playback while the library page is suspended.
+    @objc private func audioInterrupted(_ note: Notification) {
+        guard let context = note.userInfo?[AVAudioSession.deactivationContextKey] as? AVAudioSession.DeactivationContext, context.source == .system else { return }
+        player?.pauseForInterruption()
+        signalPlayerChange(debugOnly: false)
     }
 
     /// Best effort. JS also pulls on startup, so a suspended or replaced page can miss this signal.
@@ -223,6 +234,10 @@ import WebKit
                 switch op {
                 case "state", "signIn":
                     var state = op == "state" ? account.snapshot : try await account.signIn(presenting: self)
+                    // Cold startup loaded the existing account before admitting this page.
+                    // A fresh interactive pairing has an empty store after sign-out cleanup.
+                    guard page === webView, !account.cleanupPending else { throw NativeAccountError.cancelled }
+                    if let storage = try account.openPlaybackStore() { try player?.restoreIfNeeded(from: storage) }
                     #if DEBUG
                     state["debugPlayback"] = true
                     #endif
@@ -234,9 +249,19 @@ import WebKit
                           let action = args["action"] as? String else { throw NativeAccountError.invalidRequest }
                     switch action {
                     case "snapshot": break
+                    case "importSpot":
+                        guard let favorite = args["favorite"] as? String, let value = args["spot"] as? [String: Any] else { throw NativeAccountError.invalidRequest }
+                        let spot = try JSONDecoder().decode(FavoriteSpot.self, from: JSONSerialization.data(withJSONObject: value))
+                        guard spot.seconds.isFinite, spot.seconds >= 0, spot.path.dropFirst().first == "fav:" + favorite else { throw NativeAccountError.invalidRequest }
+                        try player.importSpot(spot, favorite: favorite)
                     case "intent":
                         selectionIntent = args["intent"] as? String
                         staged = nil
+                    case "cancelIntent":
+                        if let id = args["intent"] as? String, selectionIntent == id {
+                            selectionIntent = nil
+                            staged = nil
+                        }
                     case "fence":
                         guard let session = args["session"] as? String, let revision = args["revision"] as? Int else { throw NativeAccountError.invalidRequest }
                         player.fence(session: session, revision: revision)
@@ -276,18 +301,23 @@ import WebKit
                         }
                         staged = nil
                         guard Set(tracks.compactMap(\.key)).count == tracks.count else { throw NativeAccountError.invalidRequest }
+                        let favorite = args["favorite"] as? String
+                        let mode = (args["mode"] as? String).flatMap(QueueMode.init(rawValue:))
+                        guard favorite == nil || folder.dropFirst().first == "fav:" + favorite! else { throw NativeAccountError.invalidRequest }
                         if action == "start" {
-                            guard let intent = args["intent"] as? String, intent == selectionIntent,
-                                  player.sessionID == args["base"] as? String else {
+                            let legacy = args["legacyPosition"] as? Double
+                            let validIntent = legacy != nil ? selectionIntent == nil && legacy!.isFinite && legacy! >= 0
+                                : selectionIntent != nil && args["intent"] as? String == selectionIntent
+                            guard validIntent, player.sessionID == args["base"] as? String else {
                                 replyHandler(playbackSample(player, account), nil)
                                 return
                             }
                             guard let index = args["index"] as? Int else { throw NativeAccountError.invalidRequest }
                             try player.start(tracks: tracks, startIndex: index, delaySeconds: 0, nearEnd: false, forceRefresh: false,
-                                             folder: folder, folderKey: folderKey, selected: args["selected"] as? Bool == true, timer: args["timer"] as? String, initialMode: (args["mode"] as? String).flatMap(QueueMode.init(rawValue:)))
+                                             folder: folder, folderKey: folderKey, selected: args["selected"] as? Bool == true, timer: args["timer"] as? String, initialMode: mode, favorite: favorite, legacyPosition: legacy)
                         } else {
                             guard let session = args["session"] as? String, let revision = args["revision"] as? Int else { throw NativeAccountError.invalidRequest }
-                            player.revise(session: session, revision: revision, folder: folder, tracks: tracks)
+                            player.revise(session: session, revision: revision, folder: folder, tracks: tracks, favorite: favorite, configuredMode: mode)
                         }
                     default:
                         guard let item = args["item"] as? String else { throw NativeAccountError.invalidRequest }
@@ -296,6 +326,9 @@ import WebKit
                     #if DEBUG
                     showingAudioRanges = args["debugRanges"] as? Bool == true
                     #endif
+                    if ["start", "revise", "fence", "seek", "skip", "pause", "cycleMode", "next", "previous", "allow", "access", "timer", "play"].contains(action) {
+                        try await player.waitForCheckpointWrites()
+                    }
                     var sample = playbackSample(player, account)
                     if action == "intent" { sample["base"] = player.sessionID }
                     reply = sample

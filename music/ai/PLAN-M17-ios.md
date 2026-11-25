@@ -170,7 +170,7 @@ Try silent acquisition first and coalesce concurrent renewal. Surface interactio
 
 **Current slice — live Swift queue and play modes.** The library describes the selected folder or playlist and sends revisions as it changes. Swift owns the active occurrences, traversal order, modes, timer and prepared successor for the lifetime of the app process. Locking the phone or recreating the web view preserves this session. A reattached view reads the current native snapshot.
 
-**Next slice — playback persistence.** This slice has two acceptance tests.
+**Playback persistence (build 29).** The native acceptance tests cover two behaviors.
 
 - Restore the live queue after full process termination, including its playback folder, order, current occurrence, mode and position. Reopen paused and start audio on explicit Play.
 - Implement per-favorite **Remember my spot**. Save the outgoing favorite’s position and playback context, resume a surviving bookmark on folder Play, and honor explicit track selection and fresh Shuffle. Cover row shifts, deletion, legacy bookmarks and account isolation.
@@ -391,6 +391,8 @@ Simulator coverage includes natural and manual boundaries in all five modes, sta
 **Build 27.** The native player warms the opening of the manual Next track once the current recording has three seconds queued, on both cellular and Wi-Fi. One and end-of-track Timer keep their natural stop. The simulator exercised early Next two seconds into a long track at two MP3 bitrates. [Fetching policy and timings](AUDIO-FETCHING.md#build-27-early-next-measurements)
 
 **Build 28.** A cached opening now starts an unindexed MP3 without reading the entire file for its duration. [Phone incident and blocked-network verification](AUDIO-FETCHING.md#build-28-cellular-next-on-an-unindexed-mp3)
+
+**Build 29 — playback persistence.** Swift saves the active session, private favorite positions and confirmed source access under the account pairing. The simulator migrated a path-only global bookmark at 2.25 s and a private IndexedDB bookmark at 4.25 s through the installed library page. After seeking the favorite to 3.5 s, a second app process opened the same protected records and WebKit store. Its drawer showed the second recording paused in Repeat. Playback made zero media lookups before the explicit Play tap and resumed from the saved time. A standalone simulator installation using an isolated bundle identifier also showed the paused favorite after SIGKILL and relaunch. With the web page detached, Swift wrote a checkpoint at 4.93 s while the fixture’s 465-byte queue file stayed byte-identical. Tests also exercised a moved row, a removed held track and its surviving Next, an unrelated account with the same drive ID, and a stale or unreadable position file. In the cross-process suite, the 30,000-entry walk took 152 ms and transfer through durable commit took 873 ms on the simulator. The final simulator run passed 43 tests and skipped the opt-in real-account audition. An earlier run’s WebKit cleanup failure passed in isolation and in the final full run. All 155 TypeScript unit tests and all 98 Playwright cases passed locally and on production web build 287 using disposable signed-in profiles. The signed Release target built. Build 29 was installed and launched on LuPhone13. Two independent reviewers verified the native store and WebKit migration fixes. [Cold-reopen drawer](../../experiments/ios-playback/Evidence/phase5/cold-reopen-29.png)
 
 ### Later gates
 

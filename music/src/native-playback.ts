@@ -14,6 +14,7 @@ interface RangeBar {
 }
 
 interface NativeSample {
+    readonly hasHistory?: boolean;
     readonly bars?: RangeBar[];
     readonly mode?: PlaybackMode;
     readonly session?: string;
@@ -40,12 +41,15 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
     showError: (message: string) => void,
     rebuild?: (folder: FolderPath, key: string) => Promise<LibraryQueue | undefined> | undefined,
     getAccess?: () => {connected?: string[]; denied: string[]},
-    saveFavoriteMode?: (folder: FolderPath, mode: PlaybackMode) => Promise<void>) {
+    saveFavoriteMode?: (folder: FolderPath, mode: PlaybackMode) => Promise<void>,
+    favoriteSettings?: (folder: FolderPath) => {favorite?: string; mode?: PlaybackMode},
+    migratePrivateSpots?: (only?: string) => Promise<void>,
+    legacySession?: () => {folder: FolderPath; track: FolderPath; seconds: number; mode: PlaybackMode; timer: TimerDuration; consume: () => void} | undefined) {
     footer.classList.add('native-player');
     let sample: NativeSample = {};
     let sequence = 0;
     let sampledAt = 0;
-    const position = () => Math.min(sample.duration ?? 0, (sample.position ?? 0) +
+    const position = () => Math.min(sample.duration || Infinity, (sample.position ?? 0) +
         (sample.state === 'playing' ? (performance.now() - sampledAt) / 1000 : 0));
     let bufferTimer: number | undefined;
     let bufferWaitVisible = false;
@@ -102,7 +106,7 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
         footer.classList.toggle('visible', !!sample.item);
         ui.setModeLabelText(sample.mode ?? 'all');
         ui.indicatorSvg.setAttribute('aria-disabled', String(!path));
-        if (last.session !== sample.session) {
+        if (last.session !== sample.session || !intent && last.hasHistory === undefined && sample.hasHistory === false) {
             issuedRevision = sample.revision ?? 0;
             pendingRevision = !!sample.fenced;
             awaitingSave = false;
@@ -118,7 +122,7 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
         ui.setPlayPausePlaying(['playing', 'positioning', 'buffering'].includes(sample.state ?? ''));
         if (strip && !strip.hidden && sample.bars) paintRanges(strip, sample);
         if (!ui.isScrubbing()) ui.scrubberTimeEl.textContent = sample.duration
-            ? `${timeString(position())} / ${timeString(sample.duration)}` : '0:00';
+            ? `${timeString(position())} / ${timeString(sample.duration)}` : timeString(position());
         if (sample.state === 'error' && (last.item !== sample.item || last.state !== 'error'))
             showError(`${sample.message}. Tap Play to retry.`);
     }
@@ -203,7 +207,7 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
         const generation = ++buildGeneration;
         const {tracks, ...folder} = queue;
         const commit = async (data: Record<string, unknown>) => {
-            const reply = await applyAndPaint(action, {...folder, ...args, ...data});
+            const reply = await applyAndPaint(action, {...folder, ...favoriteSettings?.(folder.folder), ...args, ...data});
             if (action === 'revise' && reply.snapshot.session === args.session) {
                 if (reply.snapshot.fenced) throw new Error('Edit is still pending');
                 if ((reply.snapshot.revision ?? 0) >= Number(args.revision)) {
@@ -247,15 +251,25 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
         intent = {id, base};
     }
 
+    /** Cancel only the vanished selection. A newer tap can arrive before WebKit replies. */
+    async function clearSelectionIntent(): Promise<void> {
+        const cancelled = intent;
+        intent = undefined;
+        pendingSelection = undefined;
+        if (cancelled) await send('cancelIntent', {intent: cancelled.id});
+    }
+
     async function start(queue: LibraryQueue, index: number, selected: boolean, timer: TimerDuration, mode?: PlaybackMode): Promise<void> {
         if (!intent) beginSelection();
         const target = intent!;
         const generation = buildGeneration;
         ++refreshGeneration;
         pendingSelection = {queue, key: selected ? queue.tracks[index].key : undefined, timer, mode};
+        const favorite = favoriteSettings?.(queue.folder).favorite;
+        if (favorite) await migratePrivateSpots?.(favorite);
         const base = await target.base;
         if (target !== intent || generation !== buildGeneration) return;
-        await transfer(queue, 'start', {intent: target.id, base, index, selected, timer, ...(mode && {mode})});
+        await transfer(queue, 'start', {intent: target.id, base, index, selected, timer, ...(!favoriteSettings && mode && {mode})});
         if (target === intent && !pendingSelection) intent = undefined;
     }
 
@@ -302,7 +316,7 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
 
     async function projectLibrary(): Promise<void> {
         const refresh = ++refreshGeneration;
-        ++buildGeneration;
+        if (!intent || pendingSelection) ++buildGeneration;
         const access = getAccess?.();
         const signature = JSON.stringify(access);
         if (access && signature !== lastAccess) {
@@ -310,7 +324,23 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
             try { paint(await native.playback('access', access) as PlaybackReply); }
             catch { lastAccess = undefined; if (pendingRevision) throw new Error('Source access is pending'); return; }
         }
-        if (awaitingSave) return;
+        if (awaitingSave || (intent && !pendingSelection)) return;
+        await migratePrivateSpots?.();
+        if (refresh !== refreshGeneration) return;
+        // Only an empty native installation admits the bundled origin's old global record.
+        // An explicit tap invalidates this walk before it can install a paused session.
+        const legacy = sample.hasHistory === false && !sample.session && !intent && legacySession?.();
+        if (legacy && rebuild) {
+            const queue = await rebuild(legacy.folder, '');
+            if (refresh !== refreshGeneration || intent) return;
+            if (queue) {
+                const index = queue.tracks.findIndex(t => t.path.length === legacy.track.length && t.path.every((v, i) => v === legacy.track[i]));
+                if (index >= 0) await transfer(queue, 'start', {base: '', index, selected: true, mode: legacy.mode,
+                    timer: legacy.timer, legacyPosition: legacy.seconds});
+                if (index < 0 || sample.hasHistory) legacy.consume();
+                return;
+            }
+        }
         if (pendingSelection && rebuild) {
             const {queue, key, timer, mode} = pendingSelection;
             const latest = await rebuild(queue.folder, queue.folderKey);
@@ -318,7 +348,8 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
             const index = key ? latest.tracks.findIndex(t => t.key === key) : 0;
             if (latest.tracks[index]) { await start(latest, index, !!key, timer, mode); return; }
             ++buildGeneration;
-            pendingSelection = undefined;
+            await clearSelectionIntent();
+            if (refresh !== refreshGeneration) return;
             showError('The selected track or folder is no longer available.');
         }
         if (!sample.session || !sample.folder?.length || !sample.folderKey || !rebuild) return;
@@ -330,6 +361,10 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
     }
     return {
         start, beginSelection, fenceQueueEdit,
+        async cancelSelection(): Promise<void> {
+            await clearSelectionIntent();
+            if (!intent) await refreshLibraryQueue();
+        },
         refreshLibraryQueue,
         confirmShare: (root: string) => send('allow', {root}),
         setTimer: (timer: TimerDuration) => send('timer', {timer}),

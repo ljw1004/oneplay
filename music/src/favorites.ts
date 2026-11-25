@@ -126,6 +126,7 @@ export type RootsMap = Map<string, Root>;
 // ---------------------------------------------------------------------------
 
 export interface Favorites {
+    hasLoadedMembership?(): boolean;
     /** All favorites in display order. */
     getAll(): readonly Favorite[];
 
@@ -220,6 +221,7 @@ export interface Favorites {
 export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync') => void | Promise<void>): Favorites {
     let favorites: Favorite[] = [];
     let updatedAt = 0;
+    let loadedMembership = false;
     /** Stashed originals for _testOnlySuppressSave restore. */
     let originalDeps: Pick<FavoritesDeps, 'authFetch' | 'dbPut'> | undefined;
 
@@ -502,6 +504,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
     /** Persist to IndexedDB only (fast, awaited by callers).
      *  INVARIANT: callers must set updatedAt before calling. */
     const saveLocal = async (queueEdit = false): Promise<void> => {
+        loadedMembership = true;
         if (queueEdit && deps.fenceQueueEdit) await deps.fenceQueueEdit();
         const data = toData();
         await deps.dbPut(IDB_KEY, data).catch(logCatch('favorites:dbPut'));
@@ -548,6 +551,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
     const loadFromCache = async (): Promise<void> => {
         const cached = await deps.dbGet<FavoritesData>(IDB_KEY).catch(() => undefined);
         if (cached && typeof cached === 'object' && Array.isArray(cached.favorites)) {
+            loadedMembership = true;
             favorites = cached.favorites.filter(isValid).map(normalize);
             updatedAt = cached.updatedAt || 0;
             log(`favorites: loaded ${favorites.length} from cache (updatedAt=${updatedAt})`);
@@ -566,11 +570,13 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
             false,
         ).then(async (r) => {
             if (!r.ok) {
-                if (r.status !== 404) logError(`favorites: OneDrive load failed: ${r.status}`);
+                if (r.status === 404) loadedMembership = true;
+                else logError(`favorites: OneDrive load failed: ${r.status}`);
                 return;
             }
             const server: FavoritesData = await readGraphJson(r, 'favorites:onedrive-load');
             if (!server || !Array.isArray(server.favorites)) return;
+            loadedMembership = true;
             if ((server.updatedAt || 0) > updatedAt) {
                 if (deps.fenceQueueEdit) await deps.fenceQueueEdit();
                 favorites = server.favorites.filter(isValid).map(normalize);
@@ -586,6 +592,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
 
     const api: Favorites = {
         getAll: () => favorites,
+        hasLoadedMembership: () => loadedMembership,
 
         async add(fav) {
             if (!isValid(fav)) return false;

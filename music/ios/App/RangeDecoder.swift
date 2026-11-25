@@ -16,7 +16,7 @@ final class MP3RangeDecoder {
     private var decoder: ExtAudioFileRef?
     private var nativeRate: Double = 44100
     private var nextFrame: Int64 = 0
-    struct Length {
+    struct Length: Codable, Equatable {
         let frames: Int64
         let estimated: Bool
         static let unknown = Length(frames: 0, estimated: true)

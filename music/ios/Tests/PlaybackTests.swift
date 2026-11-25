@@ -449,3 +449,177 @@ extension PlaybackTests {
         XCTAssertEqual(player.snapshot["fenced"] as? Bool, false)
     }
 }
+
+extension PlaybackTests {
+    /// Tear down the entire audio worker between reads. A stale five-second file cannot
+    /// supply a different session's time, and a removed current song keeps its former Next.
+    func testColdRestorePausedWithHeldNeighborAndGenerationFence() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try PlaybackStore(root: root, home: "a", drive: "d")
+        let (player, tracks) = try liveQueue()
+        try player.restoreIfNeeded(from: store)
+        let folder = ["Music", "fav:list"]
+        try player.start(tracks: tracks, delaySeconds: 0, nearEnd: false, forceRefresh: false,
+                         folder: folder, folderKey: "list", initialMode: .repeat, favorite: "list")
+        let audible = try await waitFor(player) { $0["state"] as? String == "playing" }
+        let first = try XCTUnwrap(audible["item"] as? String)
+        try player.apply("pause", item: first, seconds: nil)
+        try player.apply("seek", item: first, seconds: 1)
+        try await player.waitForCheckpointWrites()
+        let positionURL = store.directory.appendingPathComponent("position")
+        let stale = try Data(contentsOf: positionURL)
+        player.revise(session: player.sessionID, revision: 1, folder: folder, tracks: [tracks[2]], favorite: "list", configuredMode: .repeat)
+        try player.apply("seek", item: first, seconds: 0.5)
+        try await player.waitForCheckpointWrites()
+        await XCTAssertColdHeld(store, expected: 0.5)
+        try stale.write(to: positionURL)
+        await XCTAssertColdHeld(store, expected: 1)
+        try Data("torn".utf8).write(to: positionURL)
+        let restored = NativePlayback { _, _, _, _ in throw NativeAccountError.unavailable }
+        try restored.restoreIfNeeded(from: store)
+        XCTAssertEqual(restored.snapshot["position"] as? Double, 1)
+        try restored.apply("next", item: try XCTUnwrap(restored.snapshot["item"] as? String), seconds: nil)
+        XCTAssertEqual(restored.snapshot["key"] as? String, "C")
+        restored.updateAccess(connected: nil, denied: ["d"])
+        try await restored.waitForCheckpointWrites()
+        let clean = NativePlayback { _, _, _, _ in throw NativeAccountError.unavailable }
+        try clean.restoreIfNeeded(from: store)
+        XCTAssertNil(clean.snapshot["item"])
+        XCTAssertThrowsError(try clean.start(tracks: tracks, delaySeconds: 0, nearEnd: false, forceRefresh: false))
+        try await player.stopAndDrain()
+        try await restored.stopAndDrain()
+    }
+
+    private func XCTAssertColdHeld(_ store: PlaybackStore, expected: Double) async {
+        let player = NativePlayback { _, _, _, _ in XCTFail("Cold restore opened media"); throw NativeAccountError.unavailable }
+        do {
+            try player.restoreIfNeeded(from: store)
+            let sample = player.snapshot
+            XCTAssertEqual(sample["key"] as? String, "A")
+            XCTAssertEqual(sample["folder"] as? [String], ["Music", "fav:list"])
+            XCTAssertNil(sample["path"])
+            XCTAssertEqual(sample["state"] as? String, "paused")
+            XCTAssertEqual(sample["mode"] as? String, "repeat")
+            XCTAssertEqual(sample["position"] as? Double, expected)
+            try await player.stopAndDrain()
+        } catch { XCTFail("Cold restore failed: \(error)") }
+    }
+
+    func testPrivateSpotRemapsRowsAndHonorsSelectionShuffleAndAccount() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try PlaybackStore(root: root, home: "account", drive: "d")
+        let (player, source) = try liveQueue()
+        try player.restoreIfNeeded(from: store)
+        let folder = ["Music", "fav:list"]
+        let tracks = source.enumerated().map { i, track in
+            var item = track
+            item.path = folder + ["m:\(i)"]
+            return item
+        }
+        func start(_ queue: [IndexedTrack], _ mode: QueueMode = .all, selected: Bool = false) throws {
+            try player.start(tracks: queue, delaySeconds: 0, nearEnd: false, forceRefresh: false, folder: folder,
+                             folderKey: "list", selected: selected, initialMode: mode, favorite: "list")
+        }
+        let legacy = FavoriteSpot(folder: folder, folderKey: "list", path: tracks[1].path!, key: "B", seconds: 0.8)
+        try player.importSpot(legacy, favorite: "list")
+        var moved = tracks[1]
+        moved.path = tracks[0].path
+        try start([tracks[2], moved])
+        XCTAssertEqual(player.snapshot["key"] as? String, "B")
+        XCTAssertEqual(player.snapshot["path"] as? [String], moved.path)
+        XCTAssertEqual(player.snapshot["position"] as? Double, 0.8)
+        let playing = try await waitFor(player) { $0["state"] as? String == "playing" }
+        try player.apply("pause", item: try XCTUnwrap(playing["item"] as? String), seconds: nil)
+        try player.apply("seek", item: try XCTUnwrap(playing["item"] as? String), seconds: 1.3)
+        try player.start(tracks: tracks, delaySeconds: 0, nearEnd: false, forceRefresh: false, folder: ["Music","d"], folderKey: "d")
+        try player.importSpot(legacy, favorite: "list")
+        try start(tracks)
+        XCTAssertEqual(player.snapshot["key"] as? String, "B")
+        XCTAssertEqual(player.snapshot["position"] as? Double, 1.3)
+        try start([tracks[0], tracks[2]])
+        XCTAssertEqual(player.snapshot["key"] as? String, "A")
+        XCTAssertEqual(player.snapshot["position"] as? Double, 0)
+        try start([tracks[2], tracks[0]], selected: true)
+        XCTAssertEqual(player.snapshot["key"] as? String, "C")
+        try start(tracks, .shuffle)
+        XCTAssertEqual(player.snapshot["mode"] as? String, "shuffle")
+        XCTAssertEqual(player.snapshot["position"] as? Double, 0)
+        try await player.waitForCheckpointWrites()
+        let other = try PlaybackStore(root: root, home: "other", drive: "d")
+        let isolated = NativePlayback { _, _, _, _ in throw NativeAccountError.unavailable }
+        try isolated.restoreIfNeeded(from: other)
+        XCTAssertNil(isolated.snapshot["item"])
+        XCTAssertNil(try other.read(FavoriteSpot.self, other.bookmarkFile("list")))
+        try await player.stopAndDrain()
+    }
+}
+
+extension PlaybackTests {
+    func testColdRestoreKeepsChosenNextShufflePass() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try PlaybackStore(root: root, home: "a", drive: "d")
+        let (first, tracks) = try liveQueue()
+        try first.restoreIfNeeded(from: store)
+        try first.start(tracks: tracks, delaySeconds: 0, nearEnd: false, forceRefresh: false,
+                        folder: ["Music", "d"], folderKey: "album", selected: false, initialMode: .shuffle)
+        func next(_ player: NativePlayback) throws {
+            try player.apply("next", item: XCTUnwrap(player.snapshot["item"] as? String), seconds: nil)
+        }
+        try next(first)
+        try next(first)
+        try first.apply("pause", item: XCTUnwrap(first.snapshot["item"] as? String), seconds: nil)
+        try await first.waitForCheckpointWrites()
+        let secondStore = try PlaybackStore(root: root.appendingPathComponent("second"), home: "a", drive: "d")
+        for file in try FileManager.default.contentsOfDirectory(at: store.directory, includingPropertiesForKeys: nil) {
+            try FileManager.default.copyItem(at: file, to: secondStore.directory.appendingPathComponent(file.lastPathComponent))
+        }
+        let (second, _) = try liveQueue()
+        try second.restoreIfNeeded(from: secondStore)
+        XCTAssertEqual(second.snapshot["state"] as? String, "paused")
+        XCTAssertEqual(second.snapshot["mode"] as? String, "shuffle")
+        for _ in tracks {
+            try next(first)
+            try next(second)
+            XCTAssertEqual(first.snapshot["key"] as? String, second.snapshot["key"] as? String)
+        }
+        try await first.stopAndDrain()
+        try await second.stopAndDrain()
+    }
+
+    /// No page subscribes, and no control is pressed between Play and reading the checkpoint.
+    func testPeriodicCheckpointAdvancesWithoutRewritingQueue() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try PlaybackStore(root: root, home: "a", drive: "d")
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "ScaleTone", withExtension: "mp3"))
+        let data = try Data(contentsOf: url)
+        let pool = MediaPool()
+        let file = MediaPool.File(drive: "d", item: "a", version: "v", size: Int64(data.count))
+        for offset in stride(from: 0, to: data.count, by: MediaRanges.block) {
+            pool.store(data.subdata(in: offset..<min(offset + MediaRanges.block, data.count)), for: file, at: Int64(offset))
+        }
+        let media = MediaLocation(url: URL(string: "https://audio.test/checkpoint")!, etag: "v", size: file.size)
+        let player = NativePlayback(pool: pool) { _, _, _, _ in media }
+        try player.restoreIfNeeded(from: store)
+        let folder = ["Music", "fav:reader"]
+        let track = IndexedTrack(driveId: "d", itemId: "a", path: folder + ["a"], key: "a")
+        try player.start(tracks: [track], delaySeconds: 0, nearEnd: false, forceRefresh: false, folder: folder,
+                         folderKey: "folder", initialMode: .one, favorite: "reader")
+        try await player.waitForCheckpointWrites()
+        let queue = store.directory.appendingPathComponent("queue")
+        let structure = try Data(contentsOf: queue)
+        let end = ContinuousClock.now + .seconds(8)
+        var position = 0.0
+        while position < 3 && ContinuousClock.now < end {
+            position = try store.read(FavoriteSpot.self, store.bookmarkFile("reader"))?.seconds ?? 0
+            if position < 3 { try await Task.sleep(for: .milliseconds(100)) }
+        }
+        XCTAssertGreaterThan(position, 3)
+        XCTAssertEqual(try Data(contentsOf: queue), structure)
+        print("Detached checkpoint at \(position)s; structural record \(structure.count) bytes")
+        try await player.stopAndDrain()
+    }
+}

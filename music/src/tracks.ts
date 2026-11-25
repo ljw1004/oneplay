@@ -477,7 +477,7 @@ export interface LibraryQueue {
 /** Resolve a folder by path on selection, or by identity after an edit. A missing share
  * index makes a revision incomplete. Sending that partial list would delete live entries. */
 function* walkLibraryQueue(path: FolderPath, roots: RootsMap, favorites: readonly Favorite[],
-    denied: ReadonlySet<string>, folderKey?: string): Generator<void, LibraryQueue | undefined> {
+    denied: ReadonlySet<string>, folderKey?: string, sharesKnown = true): Generator<void, LibraryQueue | undefined> {
     if (path.length < 2) return undefined;
     const rootKey = path[1];
     const byId = new Map(favorites.map(f => [f.id, f]));
@@ -518,7 +518,7 @@ function* walkLibraryQueue(path: FolderPath, roots: RootsMap, favorites: readonl
         if (!resolved.has(token)) resolved.set(token, resolveWalkableRootForItemRef(ref, roots));
         const root = resolved.get(token);
         if (!root) {
-            if (roots.get(key)?.type === 'share' && (inside(p) || !result)) incomplete = true;
+            if ((roots.get(key)?.type === 'share' || (!sharesKnown && !roots.has(key))) && (inside(p) || !result)) incomplete = true;
             return;
         }
         const parent = walkFolder(root.folder, ref.path.slice(0, -1));
@@ -556,8 +556,8 @@ function* walkLibraryQueue(path: FolderPath, roots: RootsMap, favorites: readonl
     }
     yield* visitRoot();
     if (folderKey && !result) { searchMoved = true; yield* visitRoot(); }
-    if (incomplete && (folderKey || !result)) return undefined;
-    return result ?? (folderKey ? {folder: path, folderKey, tracks: []} : undefined);
+    if (incomplete && (folderKey !== undefined || !result)) return undefined;
+    return result ?? (folderKey !== undefined ? {folder: path, folderKey, tracks: []} : undefined);
 }
 
 /** Give WebKit an event-loop turn during expensive walks. Small selections finish in one turn. */

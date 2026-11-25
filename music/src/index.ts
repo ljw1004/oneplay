@@ -2,7 +2,8 @@ import { createAuth, isAbortError, type EvidenceState } from './auth.js';
 import { showModal } from './modal.js';
 import { attachNativePlayback } from './native-playback.js';
 import { connectBundledLibrary } from './native-library.js';
-import { dbGet, dbPut, dbClear } from './db.js';
+import { parseFavoritePlaybackStorageValue } from './playback-engine.js';
+import { dbGet, dbPut, dbClear, dbDelete } from './db.js';
 import { log, logError, logCatch } from './logger.js';
 import { initWebLogger } from './logger-web.js';
 import {
@@ -567,7 +568,41 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
         } else if (native) {
             const denied = () => shares?.getDeniedRootKeys() ?? new Set<string>();
             const describe = (folder: readonly string[], key?: string) =>
-                favorites && buildLibraryQueue(folder, new Map(tree!.getRoots()), [...favorites.getAll()], denied(), key);
+                favorites && (!folder[1]?.startsWith('fav:') || favorites.hasLoadedMembership?.())
+                    ? buildLibraryQueue(folder, new Map(tree!.getRoots()), [...favorites.getAll()], denied(), key, !!shares?.hasLoadedMembership?.())
+                    : undefined;
+            const favoriteSettings = (folder: readonly string[]) => {
+                const favorite = favorites?.getAll().find(f => folder[1] === 'fav:' + f.id);
+                return favorite?.hasPrivatePlayback
+                    ? {favorite: favorite.id, mode: isValidMode(favorite.mode) ? favorite.mode : 'all' as const}
+                    : favorite ? {mode: 'all' as const} : {};
+            };
+            // Old bundled installations may have path-only positions in either store. Resolve
+            // them before a playlist edit can reuse a row. Swift accepts only the first import.
+            const migrated = new Set<string>();
+            const migratePrivateSpots = async (only?: string) => {
+                for (const favorite of favorites?.getAll() ?? []) {
+                    if (!favorite.hasPrivatePlayback || migrated.has(favorite.id) || (only && only !== favorite.id)) continue;
+                    try {
+                        const key = 'oneplay_music_fav:' + favorite.id;
+                        let saved = parseFavoritePlaybackStorageValue(localStorage.getItem(key));
+                        if (!saved) {
+                            const old = await dbGet<{trackPath?: string[]; currentTime?: number}>('playback:' + favorite.id);
+                            if (Array.isArray(old?.trackPath)) saved = {track: old.trackPath, time: Number.isSafeInteger(Math.round(Number(old.currentTime) * 44100)) ? Math.max(0, Number(old.currentTime)) : 0};
+                        }
+                        if (saved && saved.track[1] === 'fav:' + favorite.id) {
+                            const queue = await describe(saved.track.slice(0, 2), '');
+                            const entry = queue?.tracks.find(t => t.path.length === saved!.track.length && t.path.every((v, i) => v === saved!.track[i]));
+                            if (!queue) continue;
+                            if (entry) await native.playback('importSpot', {favorite: favorite.id, spot: {folder: queue.folder, folderKey: queue.folderKey,
+                                path: entry.path, key: entry.key, seconds: saved.time}});
+                            await dbDelete('playback:' + favorite.id);
+                            localStorage.removeItem(key);
+                        }
+                        migrated.add(favorite.id);
+                    } catch (error) { logCatch('playback:legacy favorite')(error); }
+                }
+            };
             nativePlayer = attachNativePlayback(native, document.getElementById('footer')!,
                 tree.setPlaybackInfo, path => {
                     if (settings?.isOpen()) closeSettingsPage();
@@ -575,7 +610,15 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
                 }, showToastMessage, describe, () => ({...(shares?.hasLoadedMembership?.() && {connected: shares.getAll().map(s => s.rootKey)}), denied: [...denied()]}), async (folder, mode) => {
                     const favorite = favorites?.getAll().find(f => folder[1] === 'fav:' + f.id);
                     if (favorite?.hasPrivatePlayback) await favorites!.setMode(favorite.id, mode);
-                });
+                }, favoriteSettings, migratePrivateSpots, () => restoredPlayback && Array.isArray(restoredPlayback.folder)
+                    && Array.isArray(restoredPlayback.track) ? {folder: restoredPlayback.folder, track: restoredPlayback.track,
+                        seconds: Number.isFinite(restoredTime) && restoredTime! > 0 ? restoredTime! : 0,
+                        mode: isValidMode(restoredPlayback.mode) ? restoredPlayback.mode : 'all', timer: timerDuration,
+                        consume: () => {
+                            restoredPlayback = undefined;
+                            localStorage.removeItem('oneplay_music_playback');
+                            localStorage.removeItem('oneplay_music_time');
+                        }} : undefined);
             let selection = 0;
             const playAlbum = async (folderPath: readonly string[], trackPath?: readonly string[]) => {
                 const evidence = native.getEvidence();
@@ -597,10 +640,12 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
                     index = trackPath ? queue?.tracks.findIndex(t => t.key === tappedKey) : 0;
                 }
                 if (intent !== selection) return;
-                if (!queue || index === undefined || !queue.tracks[index]) { showToastMessage('No playable tracks in this folder.'); return; }
-                const favorite = favorites?.getAll().find(f => folderPath[1] === 'fav:' + f.id);
-                const mode = favorite ? (favorite.hasPrivatePlayback && isValidMode(favorite.mode) ? favorite.mode : 'all') : undefined;
-                await nativePlayer!.start(queue, index, !!trackPath, timerDuration, mode);
+                if (!queue || index === undefined || !queue.tracks[index]) {
+                    showToastMessage('No playable tracks in this folder.');
+                    await nativePlayer!.cancelSelection();
+                    return;
+                }
+                await nativePlayer!.start(queue, index, !!trackPath, timerDuration);
             };
             tree.onTrackClick = path => {
                 const folder = nativePlayer!.currentFolder();

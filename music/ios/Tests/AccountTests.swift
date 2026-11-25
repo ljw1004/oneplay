@@ -92,9 +92,12 @@ private final class TestAudioCDN: URLProtocol {
         }
         let first = try open()
         XCTAssertEqual(first.snapshot["driveID"] as? String, "library")
+        let privateStore = try XCTUnwrap(first.openPlaybackStore())
+        try privateStore.save("private position", "position")
         try first.beginSignOut(theme: "dark")
         let afterMarker = try open()
         XCTAssertTrue(afterMarker.cleanupPending)
+        XCTAssertNil(try afterMarker.openPlaybackStore())
         XCTAssertEqual(afterMarker.cleanupTheme, "dark")
         XCTAssertFalse(afterMarker.snapshot["driveID"] is String)
         do {
@@ -106,6 +109,7 @@ private final class TestAudioCDN: URLProtocol {
         XCTAssertEqual(midway.cleanupTheme, "dark")
         try await midway.finishCleanup {}
         XCTAssertEqual(id.removed, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: privateStore.directory.path))
         let clean = try open()
         XCTAssertFalse(clean.cleanupPending)
         XCTAssertFalse(clean.snapshot["driveID"] is String)
@@ -1077,5 +1081,96 @@ extension AccountTests {
         XCTAssertEqual(restored?["session"] as? String, session)
         XCTAssertEqual(restored?["mode"] as? String, "repeat")
         XCTAssertEqual(restored?["rejected"] as? Bool, true)
+    }
+}
+
+extension AccountTests {
+    /// With the same optional fixture UUID, a second XCTest process reopens the first process's
+    /// WebKit and Swift files. The ordinary suite uses a fresh pairing and exercises the migration.
+    func testBundledLegacyBookmarksAndColdReopen() async throws {
+        let fixture = ProcessInfo.processInfo.environment["ONEPLAY_RESTART_FIXTURE"].flatMap(UUID.init(uuidString:))
+        let folder = fixture.map { FileManager.default.temporaryDirectory.appendingPathComponent($0.uuidString) } ?? dir!
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let binding = folder.appendingPathComponent("account.json")
+        let reopening = FileManager.default.fileExists(atPath: binding.path)
+        let webStore = fixture.map { WKWebsiteDataStore(forIdentifier: $0) } ?? .nonPersistent()
+        let account = try NativeAccount(recordFile: binding, identity: TestIdentity()) { [self] request in
+            try response(request, status: request.url?.path == "/v1.0/me/drive" ? 200 : 404, data: drive)
+        }
+        let lookups = OSAllocatedUnfairLock(initialState: 0)
+        let pool = MediaPool()
+        let bytes = try Data(contentsOf: XCTUnwrap(Bundle(for: Self.self).url(forResource: "ScaleTone", withExtension: "mp3")))
+        let media = MediaLocation(url: URL(string: "https://audio.test/bookmark")!, etag: "v", size: Int64(bytes.count))
+        for id in ["a", "b"] {
+            let file = MediaPool.File(drive: "library", item: id, version: "v", size: media.size)
+            for offset in stride(from: 0, to: bytes.count, by: MediaRanges.block) {
+                pool.store(bytes.subdata(in: offset..<min(offset + MediaRanges.block, bytes.count)), for: file, at: Int64(offset))
+            }
+        }
+        let player = NativePlayback(pool: pool) { _, _, _, _ in lookups.withLock { $0 += 1 }; return media }
+        let controller = LibraryController(account: account, store: webStore, player: player)
+        let host = try XCTUnwrap((UIApplication.shared.delegate as? AppDelegate)?.library)
+        host.addChild(controller)
+        host.view.addSubview(controller.view)
+        controller.didMove(toParent: host)
+        defer {
+            controller.detachPage()
+            controller.willMove(toParent: nil)
+            controller.view.removeFromSuperview()
+            controller.removeFromParent()
+        }
+        var page = try await readyPage(in: controller)
+        if !reopening {
+            _ = try await page.callAsyncJavaScript("""
+                const {dbPut} = await import('./dist/db.js');
+                localStorage.setItem('account_info',JSON.stringify({driveId:'library',displayName:'Fixture'}));
+                const root = ['OnePlay Music','library'];
+                localStorage.setItem('oneplay_music_playback',JSON.stringify({folder:root,track:[...root,'First.mp3'],mode:'one'}));
+                localStorage.setItem('oneplay_music_time','2.25');
+                await dbPut('index:library',{kind:'MusicData',count:2,size:20,folder:{id:'album',children:{'First.mp3':{id:'a'},'Second.mp3':{id:'b'}}}});
+                await dbPut('favorites',{updatedAt:1,favorites:[{kind:'playlist',id:'reader',name:'Remembered album',hasPrivatePlayback:true,
+                    mode:'repeat',members:['First','Second'].map((name,i)=>({driveId:'library',sourceRootKey:'library',itemId:i?'b':'a',isFolder:false,path:[name+'.mp3']}))}]});
+                await dbPut('playback:reader',{trackPath:['OnePlay Music','fav:reader','m:1'],currentTime:4.25});
+                """, arguments: [:], in: nil, contentWorld: .page)
+            _ = try await account.signIn(presenting: controller)
+            page.reload()
+            page = try await readyPage(in: controller, excluding: page)
+        }
+        func waitFor(_ predicate: @escaping ([String: Any]) -> Bool) async throws {
+            let deadline = ContinuousClock.now + .seconds(8)
+            while !predicate(player.snapshot), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+            XCTAssertTrue(predicate(player.snapshot), "Unexpected playback state: \(player.snapshot)")
+        }
+        try await waitFor { $0["state"] as? String == "paused" }
+        XCTAssertEqual(lookups.withLock { $0 }, 0)
+        if !reopening {
+            XCTAssertEqual(player.snapshot["position"] as? Double, 2.25)
+            XCTAssertEqual(player.snapshot["title"] as? String, "First.mp3")
+            _ = try await page.callAsyncJavaScript("await window._testTree.onPlayClick(['OnePlay Music','fav:reader'])", arguments: [:], in: nil, contentWorld: .page)
+            try await waitFor { $0["state"] as? String == "playing" && $0["title"] as? String == "Second.mp3" }
+            let item = try XCTUnwrap(player.snapshot["item"] as? String)
+            try player.apply("pause", item: item, seconds: nil)
+            XCTAssertGreaterThanOrEqual(try XCTUnwrap(player.snapshot["position"] as? Double), 4.25)
+            try player.apply("seek", item: item, seconds: 3.5)
+            try await player.waitForCheckpointWrites()
+        }
+        XCTAssertEqual(player.snapshot["position"] as? Double, 3.5)
+        XCTAssertEqual(player.snapshot["mode"] as? String, "repeat")
+        XCTAssertEqual(player.snapshot["path"] as? [String], ["OnePlay Music", "fav:reader", "m:1"])
+        _ = try await page.callAsyncJavaScript("""
+            document.querySelector('.footer-gripper').click();
+            await Promise.all(document.querySelector('.expansion').getAnimations().map(a => a.finished));
+            """, arguments: [:], in: nil, contentWorld: .page)
+        let attachment = XCTAttachment(image: try await page.takeSnapshot(configuration: nil))
+        attachment.name = reopening ? "Cold reopen at saved favorite" : "Remembered favorite after explicit seek"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        print("Playback process \(getpid()), reopen=\(reopening), paused=3.5s, track=Second, mode=repeat, lookups=\(lookups.withLock { $0 })")
+        if reopening {
+            _ = try await page.evaluateJavaScript("document.querySelector('.footer-playpause').click()")
+            try await waitFor { $0["state"] as? String == "playing" && ($0["position"] as? Double ?? 0) >= 3.5 }
+            XCTAssertGreaterThan(lookups.withLock { $0 }, 0)
+        }
+        try await player.stopAndDrain()
     }
 }

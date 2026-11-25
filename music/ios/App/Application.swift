@@ -19,6 +19,10 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         forwardCallback(connectionOptions.urlContexts)
     }
 
+    func sceneDidEnterBackground(_ scene: UIScene) {
+        (window?.rootViewController as? LibraryController)?.player?.checkpoint()
+    }
+
     func sceneDidBecomeActive(_ scene: UIScene) {
         (window?.rootViewController as? LibraryController)?.signalPendingDiagnostics()
     }

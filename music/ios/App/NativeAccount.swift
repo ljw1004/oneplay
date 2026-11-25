@@ -56,6 +56,14 @@ enum MediaLookup: Sendable {
     private var previousExpiry: Date?
     private let recordFile: URL
     private var record: AccountRecord?
+    private var playbackRoot: URL { recordFile.deletingLastPathComponent().appendingPathComponent("Playback") }
+
+    /// Only a locally bound, admitted account can open its session.
+    func openPlaybackStore() throws -> PlaybackStore? {
+        guard let record, !record.cleanupPending else { return nil }
+        return try PlaybackStore(root: playbackRoot, home: record.homeID, drive: record.driveID)
+    }
+
     var cleanupPending: Bool { record?.cleanupPending == true }
     var cleanupTheme: String? { cleanupPending ? record?.cleanupTheme : nil }
     private var generation = 0
@@ -349,6 +357,8 @@ enum MediaLookup: Sendable {
         _ = await signInTask?.result
         await silentTask?.value
         try identity.removePrivateAccounts()
+        do { try FileManager.default.removeItem(at: playbackRoot) }
+        catch CocoaError.fileNoSuchFile { }
         try diagnostics.clear()
         previousExpiry = nil
         try FileManager.default.removeItem(at: recordFile)

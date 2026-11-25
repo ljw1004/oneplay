@@ -362,7 +362,7 @@ extension PlaybackTests {
         player.revise(session: session, revision: 1, folder: [], tracks: tracks)
         _ = try await waitFor(player) { $0["key"] as? String == "C" && $0["state"] as? String == "playing" }
         XCTAssertEqual(player.snapshot["path"] as? [String], tracks[2].path)
-        player.updateAccess(connected: [], denied: ["d"])
+        XCTAssertTrue(try player.updateAccess(base: 0, connected: [], denied: ["d"]))
         XCTAssertNil(player.snapshot["item"])
         XCTAssertThrowsError(try player.start(tracks: tracks, delaySeconds: 0, nearEnd: false, forceRefresh: false))
     }
@@ -481,7 +481,7 @@ extension PlaybackTests {
         XCTAssertEqual(restored.snapshot["position"] as? Double, 1)
         try restored.apply("next", item: try XCTUnwrap(restored.snapshot["item"] as? String), seconds: nil)
         XCTAssertEqual(restored.snapshot["key"] as? String, "C")
-        restored.updateAccess(connected: nil, denied: ["d"])
+        XCTAssertTrue(try restored.updateAccess(base: 0, connected: nil, denied: ["d"]))
         try await restored.waitForCheckpointWrites()
         let clean = NativePlayback { _, _, _, _ in throw NativeAccountError.unavailable }
         try clean.restoreIfNeeded(from: store)
@@ -504,6 +504,61 @@ extension PlaybackTests {
             XCTAssertEqual(sample["position"] as? Double, expected)
             try await player.stopAndDrain()
         } catch { XCTFail("Cold restore failed: \(error)") }
+    }
+
+    /// A listener can revoke an audible share, kill the process and reconnect it later.
+    /// A stale grant, denial, queue upload or old membership projection cannot cross that boundary.
+    func testSourceAccessRevisionPersistsAndFencesStaleGrants() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try PlaybackStore(root: root, home: "account", drive: "d")
+        let share = "share:reader"
+        // Upgrade an actual build-29 access record, which carried no revision.
+        try store.save(["connected": [share], "denied": [String]()], "access")
+        let (player, tracks) = try liveQueue()
+        var book = tracks[0]
+        book.sourceRootKey = share
+        func start(_ player: NativePlayback) throws {
+            try player.start(tracks: [book], delaySeconds: 0, nearEnd: false, forceRefresh: false,
+                             folder: ["Music",share], folderKey: "book")
+        }
+        try player.restoreIfNeeded(from: store)
+        try start(player)
+        _ = try await waitFor(player) { $0["state"] as? String == "playing" }
+        // Make only the access file unwritable. The output still stops immediately, but
+        // no writer can see a committed revision until the complete access record is durable.
+        let accessFile = store.directory.appendingPathComponent("access")
+        try FileManager.default.removeItem(at: accessFile)
+        try FileManager.default.createDirectory(at: accessFile, withIntermediateDirectories: false)
+        XCTAssertThrowsError(try player.updateAccess(base: 0, connected: [], denied: []))
+        XCTAssertNil(player.snapshot["item"])
+        XCTAssertEqual(player.snapshot["accessRevision"] as? Int, 0)
+        try FileManager.default.removeItem(at: accessFile)
+        XCTAssertFalse(try player.updateAccess(base: 0, connected: [], denied: []), "Completing the pending denial invalidates the replay's old base")
+        XCTAssertFalse(try player.updateAccess(base: 0, connected: [share], denied: [], allowed: [share]))
+        try await player.waitForCheckpointWrites()
+        try await player.stopAndDrain()
+
+        let (restored, _) = try liveQueue()
+        try restored.restoreIfNeeded(from: store)
+        XCTAssertEqual(restored.snapshot["accessRevision"] as? Int, 1)
+        XCTAssertNil(restored.snapshot["denied"], "Ordinary clock samples stay small")
+        XCTAssertEqual(restored.snapshot(lookups: nil, includeDenied: true)["denied"] as? [String], [share])
+        XCTAssertTrue(try restored.updateAccess(base: 1, connected: [share], denied: []))
+        XCTAssertThrowsError(try start(restored), "A stale membership list cannot restore a grant")
+        XCTAssertTrue(try restored.updateAccess(base: 2, connected: nil, denied: [], allowed: [share]))
+        XCTAssertNil(restored.snapshot["item"], "Re-admitting the source must not resume it")
+        XCTAssertFalse(try restored.updateAccess(base: 2, connected: nil, denied: [share]))
+        try start(restored)
+        _ = try await waitFor(restored) { $0["state"] as? String == "playing" }
+        XCTAssertTrue(try restored.updateAccess(base: 3, connected: nil, denied: [], allowed: [share]))
+        XCTAssertFalse(try restored.updateAccess(base: 3, connected: nil, denied: [share]), "Identical fresh proof supersedes an older result")
+        let session = restored.sessionID
+        XCTAssertTrue(try restored.updateAccess(base: 4, connected: nil, denied: [share]))
+        restored.revise(session: session, revision: 1, folder: ["Music",share], tracks: [book])
+        XCTAssertNil(restored.snapshot["item"])
+        XCTAssertThrowsError(try start(restored))
+        try await restored.stopAndDrain()
     }
 
     func testPrivateSpotRemapsRowsAndHonorsSelectionShuffleAndAccount() async throws {

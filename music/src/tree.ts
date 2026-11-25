@@ -36,6 +36,7 @@ import { type PlaybackInfo } from './playback.js';
 import { type RootsMap, type Favorite, type Favorites, isFavRef } from './favorites.js';
 import { type EvidenceState } from './auth.js';
 import { type SearchResult } from './search.js';
+import { isPathDeniedByShare } from './roots.js';
 import { resolvePathTailDisplayName } from './path-names.js';
 
 /** Paint the same compact arrow in the trail, child list and offline details.
@@ -797,7 +798,7 @@ export function createTree(
         // The menu occupies the left gutter. Only the text belongs to the path.
         if (isAppRoot) {
             // Force text-presentation glyphs (FE0E) for a flatter, monochrome look.
-            const showWarning = evidence === 'evidence:signed-out' || deniedRootKeys.size > 0 || hasIndexFailureWarning;
+            const showWarning = evidence === 'evidence:signed-out' || [...deniedRootKeys].some(key => roots.has(key)) || hasIndexFailureWarning;
             const menuIcon = document.createElement('button');
             menuIcon.type = 'button';
             menuIcon.className = 'row-icon row-icon-menu row-icon-menu-left row-icon-settings';
@@ -869,7 +870,7 @@ export function createTree(
         // Non-selectable rows (OnePlay Music + account roots) are explicit no-ops.
         // Track greying: when signed-out or not-online, non-cached tracks are
         // unavailable (grey, no click handler — the track genuinely can't play).
-        const isUnavailableFromDeniedShare = !opts.isFolder && deniedRootKeys.has(opts.path[1]);
+        const isUnavailableFromDeniedShare = !opts.isFolder && isPathDeniedByShare(opts.path, deniedRootKeys, roots);
         const isUnavailableFromEvidence = !opts.isFolder && !opts.isBreadcrumb
             && (evidence === 'evidence:signed-out' || evidence === 'evidence:not-online')
             && !isTrackCachedFn(opts.path);

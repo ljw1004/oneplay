@@ -10,8 +10,14 @@ import { type MusicFolder, isMusicFolder, walkFolder } from './indexer.js';
 import { log, logCatch, logError } from './logger.js';
 import { resolveWalkableRootForItemRef } from './roots.js';
 import { readGraphJson, type AuthFetch } from './auth.js';
+import type { NativeLibrary } from './native-library.js';
 
 export interface SharesDeps {
+    /** Redemption proves access to the resolved folder, including an explicitly reconnected share. */
+    readonly readPlaybackDenials?: () => Promise<readonly string[]>;
+    readonly beginSourceProbe?: NativeLibrary['beginSourceProbe'];
+    /** The native player must withdraw the removed root even if deleting its index later stalls. */
+    readonly onDisconnect?: (remainingRoots: string[], removedRoot: string) => Promise<void>;
     authFetch: AuthFetch;
     dbGet<T>(key: string): Promise<T | undefined>;
     dbPut(key: string, value: unknown): Promise<void>;
@@ -155,7 +161,10 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
         hasLoadedMembership: () => loadedMembership,
 
         async loadFromCache() {
-            const cached = await deps.dbGet<SharesData>(IDB_KEY).catch(() => undefined);
+            const [cached, denied] = await Promise.all([
+                deps.dbGet<SharesData>(IDB_KEY).catch(() => undefined), deps.readPlaybackDenials?.(),
+            ]);
+            for (const root of denied ?? []) deniedByRootKey.set(root, 'Waiting for OneDrive to confirm access');
             if (!cached || !Array.isArray(cached.shares)) return;
             loadedMembership = true;
             shares = sortByAddedAt(cached.shares.map(normalizeShare));
@@ -207,6 +216,8 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
                 throw new Error('This share is already connected');
             }
 
+            const rootKey = 'share:' + shareId;
+            const applyAccess = deps.beginSourceProbe?.(rootKey);
             const itemR = await deps.authFetch(
                 `https://graph.microsoft.com/v1.0/shares/${token}/driveItem?$select=id,name,folder,root,parentReference,createdBy`,
                 false,
@@ -227,6 +238,7 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
             const driveId = driveIdRaw;
 
             let rootItem = item;
+            let rootResponse = itemR;
             const isWholeDriveShare = item.root !== undefined && item.root !== null;
             if (isWholeDriveShare) {
                 const musicR = await deps.authFetch(
@@ -241,6 +253,7 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
                         'Whole-drive share must expose Music folder',
                     ));
                 }
+                rootResponse = musicR;
                 rootItem = await readGraphJson(musicR, 'shared music folder');
                 if (!rootItem?.folder) throw new Error('Music special folder is not accessible');
             }
@@ -255,7 +268,7 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
                 id: crypto.randomUUID(),
                 shareId,
                 name,
-                rootKey: `share:${shareId}`,
+                rootKey,
                 driveId,
                 rootItemId: rootItem.id,
                 addedAt: now,
@@ -264,7 +277,9 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
             loadedMembership = true;
             shares = sortByAddedAt([...shares, record]);
             updatedAt = now;
-            await saveLocal();
+            const proof = applyAccess?.(rootResponse, true, () => shares.some(s => s.id === record.id));
+            const [, granted] = await Promise.all([saveLocal(), proof?.catch(logCatch('shares:confirm playback access'))]);
+            if (granted) deniedByRootKey.delete(rootKey);
             onChange();
             scheduleOneDriveUploadFireAndForget();
             log('shares:addFromUrl success');
@@ -285,12 +300,15 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
         },
 
         async remove(id) {
-            if (!shares.some((s) => s.id === id)) return;
+            const removed = shares.find(s => s.id === id);
+            if (!removed) return;
             shares = shares.filter((s) => s.id !== id);
             updatedAt = Date.now();
-            await saveLocal();
-            onChange();
-            scheduleOneDriveUploadFireAndForget();
+            try { await Promise.all([saveLocal(), deps.onDisconnect?.(shares.map(s => s.rootKey), removed.rootKey)]); }
+            finally {
+                onChange();
+                scheduleOneDriveUploadFireAndForget();
+            }
         },
 
         setDeniedState(rootKey, reason) {
@@ -306,7 +324,7 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
             onChange();
         },
 
-        getDeniedCount: () => deniedByRootKey.size,
+        getDeniedCount: () => shares.filter(s => deniedByRootKey.has(s.rootKey)).length,
         getDeniedRootKeys: () => new Set(deniedByRootKey.keys()),
         getDeniedReason: (rootKey) => deniedByRootKey.get(rootKey),
 

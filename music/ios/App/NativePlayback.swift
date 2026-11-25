@@ -114,6 +114,8 @@ private struct SavedSession: Codable {
 }
 
 private struct SourceAccess: Codable {
+    // Build 29 recorded membership and denials before assigning access revisions.
+    let revision: Int?
     let connected: Set<String>?
     let denied: Set<String>
 }
@@ -146,6 +148,7 @@ final class NativePlayback: @unchecked Sendable {
     private var catalog = [Recording]()
     private var slots = [String: Int]()
     private var canonical = [Int]()
+    private var accessRevision = 0
     private var accessDirty = false
     private var deniedRoots = Set<String>()
     private var connectedShares: Set<String>?
@@ -183,6 +186,7 @@ final class NativePlayback: @unchecked Sendable {
             do { saved = try storage.read(SavedSession?.self, "queue") }
             catch is DecodingError { saved = .some(nil); diagnostics?.record("Unreadable playback queue") }
             store = storage
+            accessRevision = access?.revision ?? 0
             connectedShares = access?.connected
             deniedRoots = access?.denied ?? []
             hasHistory = saved != nil
@@ -273,7 +277,9 @@ final class NativePlayback: @unchecked Sendable {
         guard let store else { return }
         if accessDirty {
             do {
-                try store.save(SourceAccess(connected: connectedShares, denied: deniedRoots), "access")
+                let next = accessRevision + 1
+                try store.save(SourceAccess(revision: next, connected: connectedShares, denied: deniedRoots), "access")
+                accessRevision = next
                 accessDirty = false
             } catch { diagnostics?.record("Playback source access write failed") }
         }
@@ -337,9 +343,11 @@ final class NativePlayback: @unchecked Sendable {
     /// A fresh document samples the running node without restarting the decoder.
     var snapshot: [String: Any] { snapshot(lookups: nil) }
 
-    func snapshot(lookups: [IndexedTrack]?) -> [String: Any] {
+    func snapshot(lookups: [IndexedTrack]?, includeDenied: Bool = false) -> [String: Any] {
         lock.withLock {
             var result = active?.snapshot(lookups: lookups) ?? [:]
+            result["accessRevision"] = accessRevision
+            if includeDenied { result["denied"] = Array(deniedRoots) }
             result["hasHistory"] = hasHistory
             result["mode"] = mode.rawValue
             if active != nil && (result["item"] != nil || fencedRevision != nil) {
@@ -541,23 +549,37 @@ final class NativePlayback: @unchecked Sendable {
         }
     }
 
-    /// Access updates are independent of library traversal and survive session replacement.
-    func updateAccess(connected: Set<String>?, denied: Set<String>, allowed: Set<String> = []) {
-        lock.withLock {
-            let known = connected ?? connectedShares
-            let excluded = deniedRoots.subtracting(allowed).union(denied)
-            guard connectedShares != known || deniedRoots != excluded else {
-                if accessDirty { saveCheckpoint() }
-                return
+    /// A fresh decision fences older probes even when it confirms the previous value. Omitted
+    /// membership is unknown; only an explicit allowed decision clears a persisted denial.
+    /// Revoke output immediately. Publish the new revision only after the complete access file commits.
+    @discardableResult
+    func updateAccess(base: Int, connected: Set<String>?, denied: Set<String>, allowed: Set<String> = [], disconnected: Set<String> = []) throws -> Bool {
+        try lock.withLock {
+            // A prior write may have failed after its denial took effect in memory. Finish it
+            // before comparing the caller's observed (durable) revision.
+            if accessDirty {
+                saveCheckpoint()
+                guard !accessDirty else { throw NativeAccountError.unavailable }
             }
-            accessDirty = store != nil
-            structureDirty = true
-            defer { saveCheckpoint() }
+            guard base == accessRevision else { return false }
+            let known = connected ?? connectedShares
+            // A stale cached membership list may re-add a disconnected root on reattachment.
+            // Only a successful source probe can grant access again.
+            let removed = connected.map { (connectedShares ?? []).subtracting($0) } ?? []
+            let excluded = deniedRoots.subtracting(allowed).union(denied).union(removed).union(disconnected)
+            let changed = connectedShares != known || deniedRoots != excluded
             connectedShares = known
             deniedRoots = excluded
-            guard let run = active else { return }
-            canonical = canonical.filter { !blocked(catalog[$0].indexed?.sourceRootKey ?? "") }
-            configure(run, mode: mode)
+            if changed, let run = active {
+                canonical = canonical.filter { !blocked(catalog[$0].indexed?.sourceRootKey ?? "") }
+                configure(run, mode: mode)
+                structureDirty = true
+            }
+            accessDirty = store != nil
+            if store == nil { accessRevision += 1 } // Standalone in-memory player.
+            saveCheckpoint()
+            guard !accessDirty else { throw NativeAccountError.unavailable }
+            return true
         }
     }
 
@@ -618,7 +640,7 @@ final class NativePlayback: @unchecked Sendable {
 
     /// Logout drains all in-flight bytes before removing the diagnostic recording. Retrying cleanup is safe.
     func stopAndDrain() async throws {
-        lock.withLock { ticker?.cancel(); ticker = nil; store = nil; accessDirty = false; spots.removeAll(); hasHistory = false; savedPoint = nil; savedCursor = nil; structureDirty = true; favorite = nil; folder = []; folderKey = ""; configuredMode = nil; active?.cancel(); active = nil; catalog = []; canonical = []; slots = [:]; connectedShares = nil; deniedRoots = []; mode = .all; armTimer(playing: false); pool = MediaPool(unmeteredWiFi: pool.unmeteredWiFi) }
+        lock.withLock { ticker?.cancel(); ticker = nil; store = nil; accessRevision = 0; accessDirty = false; spots.removeAll(); hasHistory = false; savedPoint = nil; savedCursor = nil; structureDirty = true; favorite = nil; folder = []; folderKey = ""; configuredMode = nil; active?.cancel(); active = nil; catalog = []; canonical = []; slots = [:]; connectedShares = nil; deniedRoots = []; mode = .all; armTimer(playing: false); pool = MediaPool(unmeteredWiFi: pool.unmeteredWiFi) }
         await withCheckedContinuation { continuation in writer.async { self.pendingWrites.removeAll(); continuation.resume() } }
         await withCheckedContinuation { continuation in worker.async { continuation.resume() } }
         do { try FileManager.default.removeItem(at: destination) }
@@ -735,6 +757,7 @@ private final class PlaybackRun: @unchecked Sendable {
             let seconds = started ? Double(entry.fileFrame + max(0, frame - entry.nodeFrame)) / Double(rate) : lastPosition
             var result: [String: Any] = ["item": entry.item, "advanced": entry.advanced, "title": track.title ?? path.last ?? "", "key": track.key ?? track.itemId, "path": path, "state": state,
                     "album": track.album ?? "", "position": seconds, "duration": Double(entry.duration.frames) / Double(rate), "message": message]
+            result["sourceRootKey"] = track.sourceRootKey
             if entry.cursor.held != nil { result.removeValue(forKey: "path") }
             #if DEBUG
             if let lookups { result["bars"] = debugBars(at: entry, lookups: lookups) }

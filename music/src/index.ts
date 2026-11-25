@@ -2,16 +2,18 @@ import { createAuth, isAbortError, type EvidenceState } from './auth.js';
 import { showModal } from './modal.js';
 import { attachNativePlayback } from './native-playback.js';
 import { connectBundledLibrary } from './native-library.js';
-import { parseFavoritePlaybackStorageValue } from './playback-engine.js';
-import { dbGet, dbPut, dbClear, dbDelete } from './db.js';
+import { buildFavoritePlaybackStorageValue, parseFavoritePlaybackStorageValue, parseGlobalPlaybackSave,
+    parseGlobalPlaybackTime, type GlobalPlaybackSave } from './playback-engine.js';
+import { dbGet, dbPut, dbClear, dbDelete, dbKeysWithPrefix } from './db.js';
 import { log, logError, logCatch } from './logger.js';
 import { initWebLogger } from './logger-web.js';
 import {
     type MusicData, type AccountInfo, type IndexProgress, sortedFolderChildren,
 } from './indexer.js';
 import { createTree, type TreeView } from './tree.js';
-import { createPlayback, type Playback, type PlaybackMode, isValidMode } from './playback.js';
-import { createFavorites, type Favorites } from './favorites.js';
+import { createPlayback, type Playback, isValidMode } from './playback.js';
+import { isPathDeniedByShare } from './roots.js';
+import { createFavorites, type Favorite, type Favorites } from './favorites.js';
 import { createSelect, type Select } from './select.js';
 import { createDownloads, type Downloads, classifyOfflineBadgeState } from './downloads.js';
 import { buildLibraryQueue, collectPhysicalTracks, resolveFolderFromPath, resolveTrackIds } from './tracks.js';
@@ -113,7 +115,7 @@ const clearM10State = (): void => {
 // Module-scoped so showTree and wireFavoritesUi can access them.
 let restoredView: { path: string[]; expanded: boolean } | undefined;
 let restoredScroll: Record<string, {top: number}> | undefined;
-let restoredPlayback: { folder: string[]; track: string[]; mode: string; favId?: string } | undefined;
+let restoredPlayback: GlobalPlaybackSave | undefined;
 let restoredTime: number | undefined;
 let favoriteCustomizeToastShownInSession = false;
 let activeToastEl: HTMLElement | undefined;
@@ -240,8 +242,11 @@ const sync = createIndexSync({
     onPlaybackRootsChange: () => {
         ++nativeLibraryGeneration;
         nativePlayer?.refreshLibraryQueue().catch(logCatch('queue refresh'));
+        if (playback) {
+            playback.refreshLibraryQueue().then(restorePlaybackState).catch(logCatch('browser queue refresh'));
+            migrateBrowserFavoriteBookmarks().catch(logCatch('browser bookmark migration'));
+        }
     },
-    onShareAccessConfirmed: root => nativePlayer?.confirmShare(root),
     getFavorites: () => favorites,
     getSelect: () => select,
     getSettings: () => settings,
@@ -431,6 +436,8 @@ function openSettingsPage(): void {
             }
             if (native) { await native.signOut(themePreference); return; }
             await browserAuth!.signOut(async () => {
+                playback?.stop();
+                browserBookmarksClosed = true;
                 localStorage.removeItem('account_info');
                 clearM10State();
                 sync.cancelScheduledPull();
@@ -493,8 +500,8 @@ function openSettingsPage(): void {
             if (!shares) return;
             const record = shares.getAll().find((s) => s.id === id);
             if (!record) return;
-            await shares.remove(id);
-            await sync.onShareRemoved(record);
+            try { await shares.remove(id); }
+            finally { await sync.onShareRemoved(record); }
         },
         onTimerChange: (next) => {
             timerDuration = next;
@@ -550,11 +557,18 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
                 document.getElementById('player') as HTMLAudioElement,
                 document.getElementById('footer')!,
                 auth.fetch,
+                migrateBrowserFavoriteBookmarks,
             );
             playback.setTimerDuration(timerDuration);
 
-            tree.onTrackClick = (path) => playback!.playTrack(path, accountData);
-            tree.onPlayClick = (path) => { playback!.playFolder(path, accountData).catch(logCatch('playFolder')); };
+            tree.onTrackClick = path => {
+                restoredPlayback = undefined;
+                return playback!.playTrack(path, accountData).catch(logCatch('playTrack'));
+            };
+            tree.onPlayClick = path => {
+                restoredPlayback = undefined;
+                return playback!.playFolder(path, accountData).catch(logCatch('playFolder'));
+            };
             playback.onPlaybackChange = tree.setPlaybackInfo;
             playback.onPlayBlockedNoPlayableTracks = () => {
                 alert('No offline tracks are available here.');
@@ -582,7 +596,7 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
             const migrated = new Set<string>();
             const migratePrivateSpots = async (only?: string) => {
                 for (const favorite of favorites?.getAll() ?? []) {
-                    if (!favorite.hasPrivatePlayback || migrated.has(favorite.id) || (only && only !== favorite.id)) continue;
+                    if (migrated.has(favorite.id) || (only && only !== favorite.id)) continue;
                     try {
                         const key = 'oneplay_music_fav:' + favorite.id;
                         let saved = parseFavoritePlaybackStorageValue(localStorage.getItem(key));
@@ -607,7 +621,7 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
                 tree.setPlaybackInfo, path => {
                     if (settings?.isOpen()) closeSettingsPage();
                     tree!.revealTrack(path);
-                }, showToastMessage, describe, () => ({...(shares?.hasLoadedMembership?.() && {connected: shares.getAll().map(s => s.rootKey)}), denied: [...denied()]}), async (folder, mode) => {
+                }, showToastMessage, describe, () => shares?.hasLoadedMembership?.() ? shares.getAll().map(s => s.rootKey) : undefined, async (folder, mode) => {
                     const favorite = favorites?.getAll().find(f => folder[1] === 'fav:' + f.id);
                     if (favorite?.hasPrivatePlayback) await favorites!.setMode(favorite.id, mode);
                 }, favoriteSettings, migratePrivateSpots, () => restoredPlayback && Array.isArray(restoredPlayback.folder)
@@ -747,37 +761,6 @@ let prevIconsJson = '';
 let prevEvidence: EvidenceState = 'no-evidence';
 let prevOfflineHadPending = false;
 
-function isPathDeniedByShare(
-    path: readonly string[],
-    deniedRootKeys: ReadonlySet<string>,
-): boolean {
-    if (deniedRootKeys.has(path[1])) return true;
-    if (!favorites) return false;
-    const favRoot = path[1];
-    if (!favRoot?.startsWith('fav:')) return false;
-    const favoritesById = new Map(favorites.getAll().map((fav) => [fav.id, fav]));
-
-    const visit = (favId: string, subPath: readonly string[], visited: Set<string>): boolean => {
-        if (visited.has(favId)) return false;
-        visited.add(favId);
-        const fav = favoritesById.get(favId);
-        if (!fav) return false;
-        if (fav.kind === 'shortcut') {
-            return fav.target.sourceRootKey ? deniedRootKeys.has(fav.target.sourceRootKey) : false;
-        }
-        if (subPath.length === 0) return false;
-        const m = subPath[0].match(/^m:(\\d+)$/);
-        if (!m) return false;
-        const idx = parseInt(m[1], 10);
-        if (idx < 0 || idx >= fav.members.length) return false;
-        const member = fav.members[idx];
-        if ('favId' in member) return visit(member.favId, subPath.slice(1), new Set(visited));
-        return member.sourceRootKey ? deniedRootKeys.has(member.sourceRootKey) : false;
-    };
-
-    return visit(favRoot.slice(4), path.slice(2), new Set());
-}
-
 function computeAndPushOfflineState(): void {
     if (!tree || !favorites) return;
     if (!downloads) {
@@ -860,7 +843,8 @@ function computeAndPushOfflineState(): void {
     playback?.setAvailabilityContext(
         snap.evidence,
         cachedCheck,
-        (path) => isPathDeniedByShare(path, deniedRoots),
+        path => isPathDeniedByShare(path, deniedRoots, roots),
+        entry => snap.downloadedKeys.has(`${entry.driveId}:${entry.itemId}`),
     );
 
     // Only re-render when icon states or evidence actually changed.
@@ -891,19 +875,23 @@ async function ensureFavorites(): Promise<void> {
                 tree.setFavorites(favorites!);
                 if (select) select.setRoots(tree.getRoots());
                 // Update playback context so logical path resolution uses fresh data
-                if (playback) playback.setContext(favorites!, tree.getRoots());
+                if (playback) {
+                    playback.setContext(favorites!, tree.getRoots(), shares?.getDeniedRootKeys(), shares?.hasLoadedMembership?.());
+                    await playback.refreshLibraryQueue(true);
+                    await restorePlaybackState();
+                }
                 // Recompute offline state (favorites may have changed offlinePin)
                 computeAndPushOfflineState();
             }
         };
-        favorites = createFavorites({authFetch: auth.fetch, dbGet, dbPut, fenceQueueEdit: () => {
+        favorites = createFavorites({authFetch: auth.fetch, dbGet, dbPut, fenceQueueEdit: async () => {
             ++nativeLibraryGeneration;
-            return nativePlayer?.fenceQueueEdit();
+            return playback ? playback.fenceQueueEdit() : nativePlayer?.fenceQueueEdit();
         }}, origin => {
             const published = publishFavorites();
             // A remote edit may reference a share whose index this same sync still has to load.
             // Keep its tree publication pending while the sync proceeds with that prerequisite.
-            if (origin === 'sync' && nativePlayer) { published.catch(logCatch('publish synced favorite')); return; }
+            if (origin === 'sync' && (nativePlayer || playback)) { published.catch(logCatch('publish synced favorite')); return; }
             return published;
         });
 
@@ -918,7 +906,9 @@ async function ensureShares(): Promise<void> {
     if (ensureSharesPromise) return ensureSharesPromise;
 
     ensureSharesPromise = (async () => {
-        shares = createShares({ authFetch: auth.fetch, dbGet, dbPut }, () => {
+        shares = createShares({ authFetch: auth.fetch, dbGet, dbPut,
+            onDisconnect: native?.syncPlaybackMembership, beginSourceProbe: native?.beginSourceProbe,
+            readPlaybackDenials: native?.readPlaybackDenials }, () => {
             sync.syncShareRootsIntoTreeAndPlayback();
             computeAndPushOfflineState();
             sync.updateSettingsIndexSection();
@@ -937,7 +927,7 @@ function wireFavoritesUi(): void {
 
     // Always re-sync (roots may have changed after setAccount)
     tree.setFavorites(favorites);
-    if (playback) playback.setContext(favorites, tree.getRoots());
+    if (playback) playback.setContext(favorites, tree.getRoots(), shares?.getDeniedRootKeys(), shares?.hasLoadedMembership?.());
     if (select) select.setRoots(tree.getRoots());
 
     // Wire the select module (once, after tree + playback + favorites exist)
@@ -1024,20 +1014,91 @@ function renderIndexing(progress: IndexProgress): void {
 
 // M10: Restore playback visual state
 
-function restorePlaybackState(): void {
-    if (!restoredPlayback || !playback || !tree) return;
-    const { folder, track, mode, favId } = restoredPlayback;
-    if (!Array.isArray(folder) || !Array.isArray(track)) return;
-    const validMode: PlaybackMode = isValidMode(mode) ? mode : 'all';
-    const time = typeof restoredTime === 'number' && restoredTime > 0 ? restoredTime : 0;
-    const expandedState = restoredView?.expanded ?? false;
+/** Resolve a path-only bookmark against the favorite membership first loaded on this device.
+ * Keep that membership while an unresolved share index loads, even if sync moves its rows. */
+let bookmarkLibrary: readonly Favorite[] | undefined;
+let legacyFavoriteIds: Promise<Set<string>> | undefined;
+let browserBookmarksClosed = false;
+async function migrateBrowserFavoriteBookmarks(only?: string): Promise<void> {
+    if (!playback || !tree || browserBookmarksClosed || !favorites?.hasLoadedMembership?.()) return;
+    bookmarkLibrary ??= [...favorites.getAll()];
+    const roots = new Map(tree.getRoots());
+    legacyFavoriteIds ??= dbKeysWithPrefix('playback:').then(keys => new Set([
+        ...keys.map(key => key.slice('playback:'.length)),
+        ...Object.keys(localStorage).filter(key => key.startsWith('oneplay_music_fav:')).map(key => key.slice('oneplay_music_fav:'.length)),
+    ])).catch(error => { legacyFavoriteIds = undefined; throw error; });
+    const pending = await legacyFavoriteIds;
+    if (!pending.size) return;
+    for (const fav of bookmarkLibrary) {
+        if (!pending.has(fav.id) || (only && only !== fav.id)) continue;
+        const storageKey = 'oneplay_music_fav:' + fav.id;
+        const raw = localStorage.getItem(storageKey);
+        let bookmark = parseFavoritePlaybackStorageValue(raw);
+        if (!bookmark && raw === null) {
+            const old = await dbGet<{trackPath?: string[]; currentTime?: number}>('playback:' + fav.id);
+            if (Array.isArray(old?.trackPath)) bookmark = {track: old.trackPath, time: Number.isFinite(old.currentTime) ? Math.max(0, old.currentTime!) : 0};
+        }
+        if (bookmark && !bookmark.key && bookmark.track[1] === 'fav:' + fav.id) {
+            // Identify the legacy row from cached metadata even if its source is temporarily denied.
+            // Both players check current source access separately when admitting media.
+            const queue = await buildLibraryQueue(bookmark.track.slice(0, 2), roots, bookmarkLibrary,
+                new Set(), '', !!shares?.hasLoadedMembership?.());
+            if (!queue) continue;
+            if (browserBookmarksClosed || localStorage.getItem(storageKey) !== raw) continue; // a play or another migration won
+            const path = bookmark.track;
+            const entry = queue.tracks.find(t => t.path.length === path.length && t.path.every((part, i) => part === path[i]));
+            if (entry) localStorage.setItem(storageKey, buildFavoritePlaybackStorageValue(entry.path, bookmark.time,
+                {key: entry.key, folder: queue.folder, folderKey: queue.folderKey}));
+            await dbDelete('playback:' + fav.id);
+            if (!entry && localStorage.getItem(storageKey) === raw) localStorage.removeItem(storageKey);
+        }
+        pending.delete(fav.id);
+    }
+}
 
-    log(`M10 restore: folder=${folder.join('/')}, track=${track[track.length - 1]}, mode=${validMode}, time=${Math.round(time)}s`);
-    playback.restoreVisualState(folder, track, validMode, expandedState, time, favId, accountData);
-
-    // Clear restored state so it's not applied again on re-init
-    restoredPlayback = undefined;
-    restoredTime = undefined;
+/** Defer an unresolved folder until more cached roots arrive. A user selection supersedes restoration. */
+let restoringBrowserPlayback: Promise<void> | undefined;
+let retryBrowserRestore = false;
+function restorePlaybackState(): Promise<void> {
+    if (restoringBrowserPlayback) {
+        retryBrowserRestore = true;
+        return restoringBrowserPlayback;
+    }
+    if (!restoredPlayback || !playback || !tree || browserBookmarksClosed) return Promise.resolve();
+    let saved: GlobalPlaybackSave = restoredPlayback;
+    const mode = isValidMode(saved.mode) ? saved.mode : 'all';
+    const player = playback;
+    restoringBrowserPlayback = (async () => {
+        do {
+            retryBrowserRestore = false;
+            if (!saved.key) {
+                if (saved.folder[1]?.startsWith('fav:') && !favorites?.hasLoadedMembership?.()) return;
+                if (favorites?.hasLoadedMembership?.()) bookmarkLibrary ??= [...favorites.getAll()];
+                // A remote edit may arrive before a shared index. Bind the legacy path against
+                // the original cached membership, then let the current queue remap that key.
+                const original = await buildLibraryQueue(saved.folder, new Map(tree!.getRoots()), bookmarkLibrary ?? [],
+                    new Set(), '', !!shares?.hasLoadedMembership?.());
+                if (restoredPlayback !== saved || browserBookmarksClosed) return;
+                if (!original) continue;
+                const entry = original.tracks.find(t => t.path.length === saved.track.length && t.path.every((v, i) => v === saved.track[i]));
+                if (!entry) {
+                    localStorage.removeItem('oneplay_music_playback');
+                    localStorage.removeItem('oneplay_music_time');
+                    restoredPlayback = undefined;
+                    return;
+                }
+                saved = {...saved, key: entry.key, folderKey: original.folderKey, generation: crypto.randomUUID()};
+                restoredPlayback = saved;
+                localStorage.setItem('oneplay_music_playback', JSON.stringify(saved));
+                localStorage.setItem('oneplay_music_time', JSON.stringify({generation: saved.generation, time: restoredTime ?? 0}));
+            }
+            if (await player.restoreVisualState(saved.folder, saved.track, mode, restoredView?.expanded ?? false,
+                restoredTime ?? 0, saved.favId, accountData, saved)) {
+                if (restoredPlayback === saved) restoredPlayback = undefined;
+            }
+        } while (retryBrowserRestore && restoredPlayback === saved);
+    })().finally(() => { restoringBrowserPlayback = undefined; });
+    return restoringBrowserPlayback;
 }
 
 // Main entry point
@@ -1048,11 +1109,8 @@ async function startupInner(): Promise<void> {
     // These are module-scoped so showTree() can pass them to createTree().
     restoredView = readJson<{ path: string[]; expanded: boolean }>('oneplay_music_view');
     restoredScroll = readJson<Record<string, {top: number}>>('oneplay_music_scroll');
-    restoredPlayback = readJson<{ folder: string[]; track: string[]; mode: string; favId?: string }>('oneplay_music_playback');
-    restoredTime = (() => {
-        const raw = localStorage.getItem('oneplay_music_time');
-        return raw !== null ? parseFloat(raw) : undefined;
-    })();
+    restoredPlayback = parseGlobalPlaybackSave(readJson('oneplay_music_playback'));
+    restoredTime = parseGlobalPlaybackTime(localStorage.getItem('oneplay_music_time'), restoredPlayback);
     const timerRaw = localStorage.getItem('oneplay_music_timer_duration');
     timerDuration = isTimerDuration(timerRaw) ? timerRaw : '30m';
     const themeRaw = localStorage.getItem('oneplay_music_theme');
@@ -1161,7 +1219,7 @@ async function startupInner(): Promise<void> {
                 sync.setCachedDataRef(cached);
                 showTree(savedInfo, cached);
                 log('showing cached index (offline)');
-                restorePlaybackState();
+                await Promise.all([restorePlaybackState(), migrateBrowserFavoriteBookmarks().catch(logCatch('browser bookmark migration'))]);
                 await sync.requestStartupPullIfEvidenceAllows();
                 return;
             }
@@ -1178,7 +1236,7 @@ async function startupInner(): Promise<void> {
     if (cachedData) {
         showTree(savedInfo!, cachedData);
         log(`showing cached: ${cachedData.count} tracks`);
-        restorePlaybackState();
+        await Promise.all([restorePlaybackState(), migrateBrowserFavoriteBookmarks().catch(logCatch('browser bookmark migration'))]);
     } else if ((browserAuth?.reconcileEvidenceFromNavigator('startup:signed-in-no-cache-check') ?? auth.getEvidence()) === 'evidence:not-online') {
         log('startup: signed-in with no cache while evidence is not-online');
         startup.markStartupTerminalState('error');

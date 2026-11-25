@@ -329,10 +329,15 @@ describe('live queue identity', () => {
 
     it('distinguishes routes to the same file and invalidates ambiguous duplicate groups', async () => {
         const before = (await queue([album, favRef('child'), favRef('child')])).tracks;
-        const after = (await queue([album, favRef('child')])).tracks;
+        const nested = await queue([album, favRef('child'), favRef('child')], [...root, 'm:1']);
         assert.equal(new Set(before.map(t => t.key)).size, 6);
-        assert.equal(before[0].key, after[0].key);
-        for (const t of before.slice(2)) assert.ok(!after.some(other => t.key === other.key));
+        for (const count of [1, 3]) {
+            const members = [album, ...Array.from({length: count}, () => favRef('child'))];
+            const after = (await queue(members)).tracks;
+            assert.equal(before[0].key, after[0].key);
+            for (const t of before.slice(2)) assert.ok(!after.some(other => t.key === other.key));
+            assert.deepEqual((await queue(members, [...nested.folder], nested.folderKey)).tracks, []);
+        }
     });
 
     it('keeps an incomplete revision and filters a confirmed revoked source', async () => {

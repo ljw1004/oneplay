@@ -9,6 +9,7 @@ import {
     deriveMediaSessionFields,
     getMediaSessionPositionState,
     parseFavoritePlaybackStorageValue,
+    parseGlobalPlaybackSave, parseGlobalPlaybackTime,
     pickRestoreCandidate,
     reduceRefreshedTrackList,
     shuffleTrackList,
@@ -61,7 +62,7 @@ describe('reduceRefreshedTrackList', () => {
             prevTrackList: prev,
             playbackTrack: fresh[1],
             playbackMode: 'all',
-            pathEquals,
+            keyOf: path => JSON.stringify(path),
             random: () => 0,
         });
         assert.deepEqual(result.trackList, fresh);
@@ -80,12 +81,21 @@ describe('reduceRefreshedTrackList', () => {
             prevTrackList: prev,
             playbackTrack: a,
             playbackMode: 'shuffle',
-            pathEquals,
+            keyOf: path => JSON.stringify(path),
             random: () => 0,
         });
         assert.deepEqual(result.trackList, prev);
         assert.equal(result.currentTrackIdx, 1);
         assert.equal(result.didReshuffle, false);
+    });
+
+    it('keeps a surviving permutation and remaps every shifted row by occurrence key', () => {
+        const old = ['C', 'A', 'B'].map((key, i) => ({key, row: i}));
+        const fresh = ['A', 'B', 'C'].map((key, i) => ({key, row: i}));
+        const revised = reduceRefreshedTrackList({freshTrackList: fresh, prevTrackList: old, playbackTrack: old[0],
+            playbackMode: 'shuffle', keyOf: t => t.key, random: () => { throw Error('unexpected reshuffle'); }});
+        assert.deepEqual(revised.trackList, [fresh[2], fresh[0], fresh[1]]);
+        assert.equal(revised.currentTrackIdx, 0);
     });
 
     it('shuffle reshuffles when track set changes', () => {
@@ -99,7 +109,7 @@ describe('reduceRefreshedTrackList', () => {
             prevTrackList: prev,
             playbackTrack: b,
             playbackMode: 'shuffle',
-            pathEquals,
+            keyOf: path => JSON.stringify(path),
             random: () => 0,
         });
         assert.equal(result.currentTrackIdx, 0);
@@ -155,6 +165,17 @@ describe('favorite playback persistence helpers', () => {
             parseFavoritePlaybackStorageValue(JSON.stringify({ track: path('song'), time: -5 })),
             { track: path('song'), time: 0 },
         );
+    });
+
+    it('binds the time checkpoint to a single play of an occurrence', () => {
+        const legacy = {folder: path('folder'), track: path('a'), mode: 'repeat'};
+        const saved = {...legacy, key: 'A', folderKey: 'album', generation: 'play-2'};
+        assert.equal(parseGlobalPlaybackTime('13.5', parseGlobalPlaybackSave(legacy)), 13.5);
+        assert.equal(parseGlobalPlaybackTime('13.5', parseGlobalPlaybackSave(saved)), 0);
+        assert.equal(parseGlobalPlaybackTime('{"generation":"play-1","time":41}', saved), 0);
+        assert.equal(parseGlobalPlaybackTime('{"generation":"play-2","time":4.5}', saved), 4.5);
+        assert.equal(parseGlobalPlaybackSave({...saved, held: {entry: null}}), undefined);
+        assert.equal(parseGlobalPlaybackSave({...saved, folderKey: ''}), undefined);
     });
 
     it('pickRestoreCandidate validates membership/playability and clamps time', () => {

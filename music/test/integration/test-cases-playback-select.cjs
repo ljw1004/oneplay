@@ -159,6 +159,10 @@ module.exports = {
 
     /** In terminal evidence state, selected folders with only unavailable file children hide play button. */
     async "playback: selected folder with only unavailable file children hides play button"(page) {
+        // Keep a late startup response from changing the evidence under this controlled UI case.
+        await page.route("https://graph.microsoft.com/**", () => {});
+        await page.reload({waitUntil: "domcontentloaded"});
+        await page.waitForFunction(() => !!window._testPlayback);
         const blockedName = `Unavailable Files ${Date.now()}`;
         const missingTrackName = `missing-${Date.now()}-${Math.random().toString(36).slice(2)}.mp3`;
         const prepared = await page.evaluate(async ({ name, missingName }) => {

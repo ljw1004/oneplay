@@ -22,6 +22,7 @@
     "src/path-names.ts",
     "test/unit/favorites.test.ts",
     "test/unit/tracks.test.ts",
+    "test/unit/roots.test.ts",
     "test/unit/downloads.test.ts",
     "test/unit/auth.test.ts",
     "test/unit/search.test.ts",

@@ -11,6 +11,7 @@
  * - Audio element event wiring and app-level side-effect orchestration
  *   (owned by playback.ts).
  */
+import type { QueueEntry } from './tracks.js';
 import { type FolderPath } from './tree.js';
 import { log, logError, errorDetail } from './logger.js';
 import { readGraphJson, type AuthFetch, type EvidenceState } from './auth.js';
@@ -26,23 +27,6 @@ type UrlCacheEntry = {
     sync: { expiration: number; url: string } | undefined;
     async: { counter: number; promise: Promise<string | undefined> } | undefined;
 };
-
-export async function fetchDownloadUrl(
-    driveId: string,
-    itemId: string,
-    authFetch: AuthFetch,
-): Promise<string | undefined> {
-    const r = await authFetch(
-        `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(itemId)}?$select=@microsoft.graph.downloadUrl`,
-        false,
-    );
-    if (!r.ok) {
-        logError(`fetchDownloadUrl: ${r.status}`);
-        return undefined;
-    }
-    const data = await readGraphJson(r, 'playback URL');
-    return data['@microsoft.graph.downloadUrl'];
-}
 
 export const timerDurationMs = (duration: TimerDuration): number | undefined => {
     switch (duration) {
@@ -65,9 +49,9 @@ export const isTrackPlayableNow = (
 ): boolean =>
     !isTrackBlocked(path) && (!inTerminalEvidenceState(evidenceState) || isTrackCached(path));
 
-export const findFirstPlayableIdxIn = (
-    list: readonly FolderPath[],
-    isPlayable: (path: FolderPath) => boolean,
+export const findFirstPlayableIdxIn = <T>(
+    list: readonly T[],
+    isPlayable: (path: T) => boolean,
 ): number | undefined => {
     for (let i = 0; i < list.length; i++) {
         if (isPlayable(list[i])) return i;
@@ -75,9 +59,9 @@ export const findFirstPlayableIdxIn = (
     return undefined;
 };
 
-export const findLastPlayableIdxIn = (
-    list: readonly FolderPath[],
-    isPlayable: (path: FolderPath) => boolean,
+export const findLastPlayableIdxIn = <T>(
+    list: readonly T[],
+    isPlayable: (path: T) => boolean,
 ): number | undefined => {
     for (let i = list.length - 1; i >= 0; i--) {
         if (isPlayable(list[i])) return i;
@@ -85,10 +69,10 @@ export const findLastPlayableIdxIn = (
     return undefined;
 };
 
-export const findNextPlayableIdxAfter = (
-    list: readonly FolderPath[],
+export const findNextPlayableIdxAfter = <T>(
+    list: readonly T[],
     idx: number,
-    isPlayable: (path: FolderPath) => boolean,
+    isPlayable: (path: T) => boolean,
 ): number | undefined => {
     for (let i = Math.max(0, idx + 1); i < list.length; i++) {
         if (isPlayable(list[i])) return i;
@@ -96,10 +80,10 @@ export const findNextPlayableIdxAfter = (
     return undefined;
 };
 
-export const findPrevPlayableIdxBefore = (
-    list: readonly FolderPath[],
+export const findPrevPlayableIdxBefore = <T>(
+    list: readonly T[],
     idx: number,
-    isPlayable: (path: FolderPath) => boolean,
+    isPlayable: (path: T) => boolean,
 ): number | undefined => {
     for (let i = Math.min(list.length - 1, idx - 1); i >= 0; i--) {
         if (isPlayable(list[i])) return i;
@@ -107,10 +91,10 @@ export const findPrevPlayableIdxBefore = (
     return undefined;
 };
 
-export const findNextPlayableIdxWrapped = (
-    list: readonly FolderPath[],
+export const findNextPlayableIdxWrapped = <T>(
+    list: readonly T[],
     idx: number,
-    isPlayable: (path: FolderPath) => boolean,
+    isPlayable: (path: T) => boolean,
 ): number | undefined => {
     if (list.length === 0) return undefined;
     if (idx < 0) return findFirstPlayableIdxIn(list, isPlayable);
@@ -121,10 +105,10 @@ export const findNextPlayableIdxWrapped = (
     return undefined;
 };
 
-export const findPrevPlayableIdxWrapped = (
-    list: readonly FolderPath[],
+export const findPrevPlayableIdxWrapped = <T>(
+    list: readonly T[],
     idx: number,
-    isPlayable: (path: FolderPath) => boolean,
+    isPlayable: (path: T) => boolean,
 ): number | undefined => {
     if (list.length === 0) return undefined;
     if (idx < 0) return findLastPlayableIdxIn(list, isPlayable);
@@ -135,11 +119,11 @@ export const findPrevPlayableIdxWrapped = (
     return undefined;
 };
 
-export const computeNextIdx = (
+export const computeNextIdx = <T>(
     mode: PlaybackMode,
     currentTrackIdx: number,
-    trackList: readonly FolderPath[],
-    isPlayable: (path: FolderPath) => boolean,
+    trackList: readonly T[],
+    isPlayable: (path: T) => boolean,
 ): number | undefined => {
     switch (mode) {
         case 'one': return undefined;
@@ -155,36 +139,36 @@ export const computeNextIdx = (
     }
 };
 
-export const computePrevIdx = (
+export const computePrevIdx = <T>(
     mode: PlaybackMode,
     currentTrackIdx: number,
-    trackList: readonly FolderPath[],
-    isPlayable: (path: FolderPath) => boolean,
+    trackList: readonly T[],
+    isPlayable: (path: T) => boolean,
 ): number | undefined =>
     mode === 'shuffle' || mode === 'repeat'
         ? findPrevPlayableIdxWrapped(trackList, currentTrackIdx, isPlayable)
         : findPrevPlayableIdxBefore(trackList, currentTrackIdx, isPlayable);
 
-export const computeFirstPlayableIdxAfterReshuffle = (
-    trackList: readonly FolderPath[],
-    isPlayable: (path: FolderPath) => boolean,
+export const computeFirstPlayableIdxAfterReshuffle = <T>(
+    trackList: readonly T[],
+    isPlayable: (path: T) => boolean,
 ): number | undefined =>
     findNextPlayableIdxAfter(trackList, 0, isPlayable) ?? findFirstPlayableIdxIn(trackList, isPlayable);
 
-export type ShuffleResult = {
-    trackList: FolderPath[];
+export type ShuffleResult<T> = {
+    trackList: T[];
     currentTrackIdx: number;
 };
 
-interface ShuffleArgs {
-    trackList: readonly FolderPath[];
+interface ShuffleArgs<T> {
+    trackList: readonly T[];
     currentTrackIdx: number;
     random: () => number;
 }
 
-export const shuffleTrackList = ({
+export const shuffleTrackList = <T>({
     trackList, currentTrackIdx, random,
-}: ShuffleArgs): ShuffleResult => {
+}: ShuffleArgs<T>): ShuffleResult<T> => {
     const next = [...trackList];
     if (next.length <= 1) return { trackList: next, currentTrackIdx };
 
@@ -205,70 +189,48 @@ export const shuffleTrackList = ({
     };
 };
 
-/** Logical paths are unique rows, including distinct members pointing at one recording. */
-const didTrackSetChange = (fresh: readonly FolderPath[], previous: readonly FolderPath[]): boolean => {
-    if (fresh.length !== previous.length) return true;
-    const keys = new Set(previous.map(path => JSON.stringify(path)));
-    return fresh.some(path => !keys.has(JSON.stringify(path)));
-};
-
-export interface RefreshTrackListArgs {
-    freshTrackList: readonly FolderPath[];
-    prevTrackList: readonly FolderPath[];
-    playbackTrack: FolderPath | undefined;
-    playbackMode: PlaybackMode;
-    pathEquals: PathEquals;
-    random: () => number;
+/** Keep the old play order only while the membership of a shuffle pass survives.
+ * Even then rows and labels come from the new revision. */
+export function reduceRefreshedTrackList<T>(args: {
+    freshTrackList: readonly T[]; prevTrackList: readonly T[]; playbackTrack?: T;
+    playbackMode: PlaybackMode; keyOf: (entry: T) => string; random: () => number;
+}): {trackList: T[]; currentTrackIdx: number; didReshuffle: boolean} {
+    const {freshTrackList, prevTrackList, playbackTrack, playbackMode, keyOf, random} = args;
+    const current = playbackTrack === undefined ? undefined : keyOf(playbackTrack);
+    const index = (list: readonly T[]) => list.findIndex(t => keyOf(t) === current);
+    if (playbackMode !== 'shuffle') return {trackList: [...freshTrackList], currentTrackIdx: index(freshTrackList), didReshuffle: false};
+    const entries = new Map(freshTrackList.map(t => [keyOf(t), t]));
+    if (prevTrackList.length === entries.size && prevTrackList.every(t => entries.has(keyOf(t)))) {
+        const trackList = prevTrackList.map(t => entries.get(keyOf(t))!);
+        return {trackList, currentTrackIdx: index(trackList), didReshuffle: false};
+    }
+    return {...shuffleTrackList({trackList: freshTrackList, currentTrackIdx: index(freshTrackList), random}), didReshuffle: true};
 }
 
-export interface RefreshTrackListResult {
-    trackList: FolderPath[];
-    currentTrackIdx: number;
-    didReshuffle: boolean;
+/** Former neighbors are nearest first and belong to the removed occurrence's last live pass. */
+export interface HeldBookmark {
+    entry: QueueEntry;
+    before: string[];
+    after: string[];
 }
 
-export const reduceRefreshedTrackList = ({
-    freshTrackList,
-    prevTrackList,
-    playbackTrack,
-    playbackMode,
-    pathEquals,
-    random,
-}: RefreshTrackListArgs): RefreshTrackListResult => {
-    const currentTrackIdxFor = (list: readonly FolderPath[]): number =>
-        playbackTrack ? list.findIndex(path => pathEquals(path, playbackTrack)) : -1;
+export interface BookmarkedOccurrence {
+    key: string;
+    folderKey: string;
+}
 
-    if (playbackMode !== 'shuffle') {
-        const trackList = [...freshTrackList];
-        return {
-            trackList,
-            currentTrackIdx: currentTrackIdxFor(trackList),
-            didReshuffle: false,
-        };
-    }
+export interface GlobalPlaybackSave extends Partial<BookmarkedOccurrence> {
+    folder: FolderPath;
+    track: FolderPath;
+    mode: string;
+    favId?: string;
+    generation?: string;
+    held?: HeldBookmark;
+    heldId?: string;
+}
 
-    if (!didTrackSetChange(freshTrackList, prevTrackList)) {
-        const trackList = [...prevTrackList];
-        return {
-            trackList,
-            currentTrackIdx: currentTrackIdxFor(trackList),
-            didReshuffle: false,
-        };
-    }
-
-    const shuffled = shuffleTrackList({
-        trackList: freshTrackList,
-        currentTrackIdx: currentTrackIdxFor(freshTrackList),
-        random,
-    });
-    return {
-        trackList: shuffled.trackList,
-        currentTrackIdx: shuffled.currentTrackIdx,
-        didReshuffle: true,
-    };
-};
-
-export interface FavoritePlaybackSave {
+export interface FavoritePlaybackSave extends Partial<BookmarkedOccurrence> {
+    folder?: FolderPath;
     track: FolderPath;
     time: number;
 }
@@ -276,7 +238,8 @@ export interface FavoritePlaybackSave {
 export const buildFavoritePlaybackStorageValue = (
     track: FolderPath,
     time: number,
-): string => JSON.stringify({ track, time });
+    identity?: BookmarkedOccurrence & {folder?: FolderPath},
+): string => JSON.stringify({ track, time, ...identity });
 
 const parseFolderPathArray = (value: unknown): FolderPath | undefined =>
     Array.isArray(value) && value.every(part => typeof part === 'string')
@@ -288,13 +251,16 @@ export const parseFavoritePlaybackStorageValue = (
 ): FavoritePlaybackSave | undefined => {
     if (!raw) return undefined;
     try {
-        const parsed = JSON.parse(raw) as { track?: unknown; time?: unknown };
+        const parsed = JSON.parse(raw);
         const track = parseFolderPathArray(parsed.track);
         if (!track) return undefined;
         const time = typeof parsed.time === 'number' && Number.isFinite(parsed.time) && parsed.time > 0
             ? parsed.time
             : 0;
-        return { track, time };
+        if (parsed.key === undefined && parsed.folderKey === undefined) return {track, time};
+        if (typeof parsed.key !== 'string' || !parsed.key || typeof parsed.folderKey !== 'string' || !parsed.folderKey) return undefined;
+        const folder = parseFolderPathArray(parsed.folder);
+        return {track, time, key: parsed.key, folderKey: parsed.folderKey, ...(folder && {folder})};
     } catch {
         return undefined;
     }
@@ -319,7 +285,40 @@ export const buildGlobalPlaybackStorageValue = (
     track: FolderPath,
     mode: PlaybackMode,
     favId: string | undefined,
-): string => JSON.stringify({ folder, track, mode, favId });
+    identity?: BookmarkedOccurrence & {generation: string; held?: HeldBookmark; heldId?: string},
+): string => JSON.stringify({ folder, track, mode, favId, ...identity });
+
+/** A held occurrence can play without a row. Only a complete saved entry names its bytes. */
+export function parseGlobalPlaybackSave(value: unknown): GlobalPlaybackSave | undefined {
+    if (!value || typeof value !== 'object') return undefined;
+    const data = value as Partial<GlobalPlaybackSave>;
+    if (!parseFolderPathArray(data.folder) || !parseFolderPathArray(data.track) || typeof data.mode !== 'string') return undefined;
+    if (data.key !== undefined || data.folderKey !== undefined || data.generation !== undefined) {
+        if (!data.key || typeof data.key !== 'string' || !data.folderKey || typeof data.folderKey !== 'string'
+            || !data.generation || typeof data.generation !== 'string') return undefined;
+    }
+    if (data.heldId !== undefined && (!data.key || typeof data.heldId !== 'string' || !data.heldId)) return undefined;
+    if (data.held !== undefined) {
+        const held = data.held;
+        if (!held?.entry || !data.key || held.entry.key !== data.key || !parseFolderPathArray(held.entry.path)
+            || !['driveId', 'itemId', 'sourceRootKey', 'title', 'album'].every(k =>
+                typeof held.entry[k as keyof typeof held.entry] === 'string')
+            || !parseFolderPathArray(held.before) || !parseFolderPathArray(held.after)) return undefined;
+    }
+    return data as GlobalPlaybackSave;
+}
+
+/** A structural change may reach storage before its checkpoint. Only legacy records take numeric time. */
+export function parseGlobalPlaybackTime(raw: string | null, saved: GlobalPlaybackSave | undefined): number {
+    if (!saved || !raw) return 0;
+    try {
+        const checkpoint = JSON.parse(raw);
+        const seconds = saved.generation
+            ? (checkpoint?.generation === saved.generation ? checkpoint.time : 0)
+            : checkpoint;
+        return typeof seconds === 'number' && Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+    } catch { return 0; }
+}
 
 export type MediaSessionFields = { filename: string; album: string; title: string };
 
@@ -354,9 +353,7 @@ export const getMediaSessionPositionState = (
 };
 
 interface PrefetchArgs {
-    readonly asyncCounter: number;
-    readonly getNextPath: () => FolderPath | undefined;
-    readonly resolveTrackIds: (path: FolderPath) => { driveId: string; itemId: string } | undefined;
+    readonly getNext: () => QueueEntry | undefined;
     readonly getOfflineBlob: (driveId: string, itemId: string) => Promise<Blob | undefined>;
 }
 
@@ -365,13 +362,19 @@ export class PlaybackUrlEngine {
     private static readonly NEAR_EXPIRY_MS = 2 * 60_000;
     private readonly urlCache = new Map<string, UrlCacheEntry>();
     private urlCacheCounter = 0;
-    private prefetchedNextPath: FolderPath | undefined;
+    private prefetchedNextKey: string | undefined;
     private prefetchedNextBlobUrl: string | undefined;
     private nearEndFired = false;
     private prefetchGeneration = 0;
     private currentBlobUrl: string | undefined;
 
     public constructor(private readonly authFetch: AuthFetch) {}
+
+    /** Natural handoff may synchronously reuse a URL. A miss checks the offline blob before starting a fetch. */
+    public getCachedTrackUrl(driveId: string, itemId: string): string | undefined {
+        const hit = this.urlCache.get(`${driveId}:${itemId}`)?.sync;
+        return hit && hit.expiration > Date.now() ? hit.url : undefined;
+    }
 
     public getTrackUrl(driveId: string, itemId: string): SyncPromise<string | undefined> {
         const key = `${driveId}:${itemId}`;
@@ -407,30 +410,28 @@ export class PlaybackUrlEngine {
     }
 
     public clearPrefetchState(): void {
+        ++this.prefetchGeneration;
         if (this.prefetchedNextBlobUrl) {
             URL.revokeObjectURL(this.prefetchedNextBlobUrl);
             this.prefetchedNextBlobUrl = undefined;
         }
-        this.prefetchedNextPath = undefined;
+        this.prefetchedNextKey = undefined;
         this.nearEndFired = false;
     }
 
-    public consumePrefetchedBlobUrlForPath(
-        path: FolderPath,
-        pathEquals: (a: FolderPath, b: FolderPath) => boolean,
-    ): string | undefined {
-        if (!this.prefetchedNextBlobUrl || !this.prefetchedNextPath || !pathEquals(this.prefetchedNextPath, path)) {
-            return undefined;
-        }
+    public consumePrefetchedBlobUrl(key: string): string | undefined {
+        if (this.prefetchedNextKey !== key) return undefined;
         const url = this.prefetchedNextBlobUrl;
         this.prefetchedNextBlobUrl = undefined;
         return url;
     }
 
     public maybePrefetchNearEnd(currentTime: number, duration: number, args: PrefetchArgs): void {
-        if (this.nearEndFired || duration <= 0 || currentTime < duration - 60) return;
+        if (this.nearEndFired || !Number.isFinite(duration) || duration <= 0 || currentTime < duration - 60) return;
+        const next = args.getNext();
+        if (!next) return;
         this.nearEndFired = true;
-        this.prefetchNextTrackFireAndForget(args);
+        this.prefetchNextTrackFireAndForget(args, next);
     }
 
     private decodeTempauth(url: string): number | undefined {
@@ -491,32 +492,26 @@ export class PlaybackUrlEngine {
         return promise;
     }
 
-    private prefetchNextTrackFireAndForget(args: PrefetchArgs): void {
-        const generation = args.asyncCounter;
-        this.prefetchGeneration = generation;
+    private prefetchNextTrackFireAndForget(args: PrefetchArgs, next: QueueEntry): void {
+        const generation = ++this.prefetchGeneration;
         (async () => {
-            const nextPath = args.getNextPath();
-            if (!nextPath) return;
-            const ids = args.resolveTrackIds(nextPath);
-            if (!ids) return;
-
-            log(`prefetch: starting for ${nextPath[nextPath.length - 1]}`);
-            const offlineBlob = await args.getOfflineBlob(ids.driveId, ids.itemId);
+            log(`prefetch: starting for ${next.title}`);
+            const offlineBlob = await args.getOfflineBlob(next.driveId, next.itemId);
             if (this.prefetchGeneration !== generation) return;
 
             if (offlineBlob) {
                 this.prefetchedNextBlobUrl = URL.createObjectURL(offlineBlob);
-                this.prefetchedNextPath = nextPath;
+                this.prefetchedNextKey = next.key;
                 log('prefetch: blob URL created from offline cache');
                 return;
             }
 
-            const result = this.getTrackUrl(ids.driveId, ids.itemId);
+            const result = this.getTrackUrl(next.driveId, next.itemId);
             if (result.type === 'promise') {
                 await result.promise;
                 if (this.prefetchGeneration !== generation) return;
             }
-            this.prefetchedNextPath = nextPath;
+            this.prefetchedNextKey = next.key;
             log(`prefetch: URL cache warmed (${result.type})`);
         })().catch((e) => {
             logError(`prefetch error: ${errorDetail(e)}`);

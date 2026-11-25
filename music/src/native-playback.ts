@@ -20,6 +20,7 @@ interface NativeSample {
     readonly session?: string;
     readonly folder?: FolderPath;
     readonly folderKey?: string;
+    readonly sourceRootKey?: string;
     readonly revision?: number;
     readonly fenced?: boolean;
     readonly title?: string;
@@ -40,7 +41,7 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
     updateTree: (info: PlaybackInfo | undefined, advanced?: boolean) => void, reveal: (path: FolderPath) => void,
     showError: (message: string) => void,
     rebuild?: (folder: FolderPath, key: string) => Promise<LibraryQueue | undefined> | undefined,
-    getAccess?: () => {connected?: string[]; denied: string[]},
+    getConnected?: () => readonly string[] | undefined,
     saveFavoriteMode?: (folder: FolderPath, mode: PlaybackMode) => Promise<void>,
     favoriteSettings?: (folder: FolderPath) => {favorite?: string; mode?: PlaybackMode},
     migratePrivateSpots?: (only?: string) => Promise<void>,
@@ -49,6 +50,7 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
     let sample: NativeSample = {};
     let sequence = 0;
     let sampledAt = 0;
+    let projectedSources: {session: string; roots: Set<string>} | undefined;
     const position = () => Math.min(sample.duration || Infinity, (sample.position ?? 0) +
         (sample.state === 'playing' ? (performance.now() - sampledAt) / 1000 : 0));
     let bufferTimer: number | undefined;
@@ -66,7 +68,6 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
     let refreshing: Promise<void> | undefined;
     let refreshAgain = false;
     let retrying = false;
-    let lastAccess: string | undefined;
     let treePhase: PlaybackInfo['phase'] | undefined;
     function paintIndicators(advanced = false, targetChanged = false): void {
         // Only a sustained input wait can show the spinner. Once visible it covers local
@@ -132,6 +133,14 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
         const changesTarget = ['seek', 'skip', 'next', 'previous', 'play', 'pause', 'start'].includes(action);
         if (changesTarget) { targetCommands++; paintIndicators(); }
         try {
+            if (['play', 'next', 'previous', 'seek', 'skip'].includes(action)) {
+                await native.waitForPlaybackAccess?.(root => {
+                    if (sample.sourceRootKey === root) return true; // A held song can be outside the revised queue.
+                    if (projectedSources && projectedSources.session === sample.session) return projectedSources.roots.has(root);
+                    const folderRoot = sample.folder?.[1];
+                    return !folderRoot || folderRoot.startsWith('fav:') || folderRoot === root;
+                });
+            }
             const debugRanges = !!strip && !strip.hidden && ui.isExpanded() && !document.hidden;
             const reply = await native.playback(action, {...args, debugRanges}) as PlaybackReply;
             paint(reply, action);
@@ -207,7 +216,17 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
         const generation = ++buildGeneration;
         const {tracks, ...folder} = queue;
         const commit = async (data: Record<string, unknown>) => {
+            const connected = getConnected?.();
+            if (connected) await native.syncPlaybackMembership(connected);
+            await native.waitForPlaybackAccess?.(root => tracks.some(t => t.sourceRootKey === root));
+            if (generation !== buildGeneration) return;
             const reply = await applyAndPaint(action, {...folder, ...favoriteSettings?.(folder.folder), ...args, ...data});
+            const session = reply.snapshot.session;
+            const accepted = action === 'start' ? session !== args.base
+                : session === args.session && reply.snapshot.revision === args.revision && !reply.snapshot.fenced;
+            if (accepted && generation === buildGeneration && session && session === sample.session && reply.snapshot.folderKey === folder.folderKey) {
+                projectedSources = {session, roots: new Set(tracks.map(t => t.sourceRootKey))};
+            }
             if (action === 'revise' && reply.snapshot.session === args.session) {
                 if (reply.snapshot.fenced) throw new Error('Edit is still pending');
                 if ((reply.snapshot.revision ?? 0) >= Number(args.revision)) {
@@ -317,13 +336,8 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
     async function projectLibrary(): Promise<void> {
         const refresh = ++refreshGeneration;
         if (!intent || pendingSelection) ++buildGeneration;
-        const access = getAccess?.();
-        const signature = JSON.stringify(access);
-        if (access && signature !== lastAccess) {
-            lastAccess = signature;
-            try { paint(await native.playback('access', access) as PlaybackReply); }
-            catch { lastAccess = undefined; if (pendingRevision) throw new Error('Source access is pending'); return; }
-        }
+        const connected = getConnected?.();
+        if (connected) await native.syncPlaybackMembership(connected);
         if (awaitingSave || (intent && !pendingSelection)) return;
         await migratePrivateSpots?.();
         if (refresh !== refreshGeneration) return;
@@ -366,7 +380,6 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
             if (!intent) await refreshLibraryQueue();
         },
         refreshLibraryQueue,
-        confirmShare: (root: string) => send('allow', {root}),
         setTimer: (timer: TimerDuration) => send('timer', {timer}),
         currentFolder: () => sample.folder,
         collapse: () => ui.setExpanded(false),

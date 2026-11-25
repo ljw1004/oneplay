@@ -457,7 +457,7 @@ export function resolveTrackIds(
     return file && !isMusicFolder(file) ? { driveId: member.driveId, itemId: file.id } : undefined;
 }
 
-/** The web library names occurrences. Swift chooses their play order and owns the live cursor. */
+/** The library names stable occurrences. Each platform player owns its play order and audible cursor. */
 export interface QueueEntry {
     readonly key: string;
     readonly path: FolderPath;
@@ -485,7 +485,7 @@ function* walkLibraryQueue(path: FolderPath, roots: RootsMap, favorites: readonl
     let result: LibraryQueue | undefined;
     let visited = 0;
     let incomplete = false;
-    const resolved = new Map<string, WalkableRoot | undefined>();;
+    const resolved = new Map<string, WalkableRoot | undefined>();
     let searchMoved = false;
     type Route = readonly (readonly (string | number)[])[];
     const relevant = (p: FolderPath) => searchMoved || !!result || p.every((part, i) => path[i] === part);

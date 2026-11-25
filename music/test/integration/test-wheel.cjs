@@ -1,25 +1,174 @@
 const assert = require('node:assert/strict');
 
-/** A seekable two-minute PCM fixture. Both queue entries deliberately use the same URL. */
-function silentWav() {
-    const samples = 120 * 8000;
-    const header = Buffer.alloc(44);
-    header.write('RIFF');
-    header.writeUInt32LE(36 + samples, 4);
-    header.write('WAVEfmt ', 8);
-    header.writeUInt32LE(16, 16);
-    header.writeUInt16LE(1, 20); // PCM, mono, 8-bit
-    header.writeUInt16LE(1, 22);
-    header.writeUInt32LE(8000, 24);
-    header.writeUInt32LE(8000, 28);
-    header.writeUInt16LE(1, 32);
-    header.writeUInt16LE(8, 34);
-    header.write('data', 36);
-    header.writeUInt32LE(samples, 40);
-    return Buffer.concat([header, Buffer.alloc(samples, 128)]);
-}
-
 module.exports = {
+    /** Decode distinct files through the browser player while row positions and a prepared successor change. */
+    async 'wheel: browser playlist edits keep audible identity through a fenced boundary and cold restart'(page) {
+        const url = globalThis.__ONEPLAY_TEST_URL;
+        await page.route(url, r => r.fulfill({contentType: 'text/html', body:
+            '<link rel="stylesheet" href="index.css"><button id="start">Start</button><audio muted></audio><div id="footer"></div>'}));
+        await page.route('**/edit.wav', r => r.fulfill({contentType: 'audio/wav', body: silentWav()}));
+        async function open() {
+            await page.goto(url);
+            await page.evaluate(async () => {
+                const [{createPlayback}, {createFavorites}, {dbGet, dbPut}, {parseGlobalPlaybackTime}] = await Promise.all(
+                    ['playback', 'favorites', 'db', 'playback-engine'].map(module => import('./dist/' + module + '.js')));
+                const root = ['OnePlay Music', 'fav:show'];
+                const member = name => ({driveId: 'drive', itemId: name, path: [name], isFolder: name === 'archive'});
+                const children = Object.fromEntries(['A', 'B', 'C', 'D'].map(k => [k, {id: k}]));
+                children.archive = {id: 'archive', children: Object.fromEntries(Array.from({length: 30_000}, (_, i) =>
+                    ['extra' + i, {id: 'e' + i}]))};
+                const folder = {id: 'library', children};
+                const accounts = new Map([['drive', {driveId: 'drive', folder}]]);
+                const roots = new Map([['drive', {type: 'onedrive', key: 'drive', name: 'Drive', info: {driveId: 'drive'}, folder}]]);
+                const audio = document.querySelector('audio');
+                const p = createPlayback(audio, document.querySelector('#footer'), async () => new Response(null, {status: 503}));
+                const wav = await (await fetch('edit.wav')).arrayBuffer();
+                p.setDownloads({getOfflineBlob: async (_, id) => {
+                    window.lastRead = id;
+                    const bytes = new Uint8Array(wav.slice(0));
+                    bytes[44] = id.charCodeAt(0);
+                    return new Blob([bytes], {type: 'audio/wav'});
+                }});
+                const favs = createFavorites({dbGet, dbPut: async (key, value) => {
+                    await dbPut(key, value);
+                    if (window.holdWrite) await new Promise(resolve => { window.releaseWrite = resolve; });
+                }, authFetch: async () => new Response('{}'), fenceQueueEdit: () => p.fenceQueueEdit()}, async () => {
+                    p.setContext(favs, roots);
+                    await p.refreshLibraryQueue(true);
+                });
+                await favs.loadFromCache();
+                if (!favs.getAll().length) await favs.add({kind: 'playlist', id: 'show', name: 'Show',
+                    hasPrivatePlayback: false, members: ['A', 'B', 'C', 'D', 'archive'].map(member)});
+                const saved = JSON.parse(localStorage.getItem('oneplay_music_playback'));
+                if (saved) await p.restoreVisualState(saved.folder, saved.track, saved.mode, true,
+                    parseGlobalPlaybackTime(localStorage.oneplay_music_time, saved), saved.favId, accounts, saved);
+                document.querySelector('#start').onclick = () => p.playFolder(root, accounts);
+                window.removeAt = i => favs.removeMembers('show', [i]);
+                window.startVanishingFolder = async () => {
+                    await favs.add({kind: 'playlist', id: 'vanishing', name: 'Vanishing',
+                        hasPrivatePlayback: false, members: [member('A')]});
+                    window.releaseWrite = undefined;
+                    window.holdWrite = true;
+                    window.editDone = favs.remove('vanishing');
+                };
+                window.playVanishing = () => p.playFolder(['OnePlay Music', 'fav:vanishing'], accounts);
+                window.startDuplicates = async () => {
+                    await favs.add({kind: 'playlist', id: 'twice', name: 'Twice', hasPrivatePlayback: false,
+                        members: ['A', 'B', 'B', 'C', 'D'].map(member)});
+                    await p.playTrack(['OnePlay Music', 'fav:twice', 'm:1'], accounts);
+                };
+                window.removeDuplicate = () => favs.removeMembers('twice', [2]);
+                window.reverseTwice = async () => {
+                    const data = await dbGet('favorites');
+                    data.favorites.find(f => f.id === 'twice').members.reverse();
+                    await dbPut('favorites', data);
+                    await favs.loadFromCache();
+                };
+                window.restoreDuplicate = async () => {
+                    const {favorites} = await dbGet('favorites');
+                    const incoming = structuredClone(favorites);
+                    incoming.find(f => f.id === 'twice').members.splice(2, 0, member('B'));
+                    await dbPut('favorites', {version: 1, updatedAt: Date.now(), favorites: incoming});
+                    await favs.loadFromCache();
+                };
+                window.ack = () => p.refreshLibraryQueue(true);
+                window.info = () => p.getInfo();
+                window.sourceLetter = async () => String.fromCharCode(new Uint8Array(await (await fetch(audio.src)).arrayBuffer())[44]);
+            });
+        }
+        await open();
+        await page.locator('#start').click();
+        const audible = async letter => {
+            await page.waitForFunction(() => document.querySelector('audio').readyState >= 2 && !document.querySelector('audio').paused);
+            assert.equal(await page.evaluate(() => window.sourceLetter()), letter);
+            assert.equal(await page.locator('.footer-title').textContent(), letter);
+        };
+        await audible('A');
+        const audio = page.locator('audio');
+        await audio.evaluate(el => { el.currentTime = 80; el.dispatchEvent(new Event('timeupdate')); });
+        await page.waitForFunction(() => window.lastRead === 'B');
+        // B is already prepared. Hold the durable edit's acknowledgment, then finish A.
+        await page.evaluate(() => { window.holdWrite = true; window.editDone = window.removeAt(1); });
+        await page.waitForFunction(() => typeof window.releaseWrite === 'function');
+        await audio.evaluate(el => el.dispatchEvent(new Event('ended')));
+        assert.equal(await page.locator('.footer-title').textContent(), 'A');
+        await page.evaluate(async () => { window.holdWrite = false; window.releaseWrite(); await window.editDone; await window.ack(); });
+        await audible('C');
+        assert.equal(await page.evaluate(() => window.info().track.at(-1)), 'm:1');
+        // Commit a second edit that removes C, then lose the page before its revised queue is acknowledged.
+        await page.evaluate(() => { window.releaseWrite = undefined; window.holdWrite = true; window.editDone = window.removeAt(1); });
+        await page.waitForFunction(() => typeof window.releaseWrite === 'function');
+        await open();
+        assert.equal(await page.locator('.footer-title').textContent(), 'C');
+        assert.equal(await page.locator('.footer-indicator').getAttribute('aria-disabled'), 'true');
+        assert.equal(await page.evaluate(() => window.info()), undefined);
+        assert.equal(await audio.evaluate(el => el.src), '');
+        await page.locator('.footer-playpause').evaluate(el => el.click());
+        await audible('C');
+        await audio.evaluate(el => el.dispatchEvent(new Event('ended')));
+        await audible('D');
+        assert.equal(await page.evaluate(() => window.info().track.at(-1)), 'm:1');
+
+        // A 2→1 duplicate group has no safe match. Restoring the identical group reattaches
+        // the original ordinal and preserves its actual media source, position and pause state.
+        await page.evaluate(() => window.startDuplicates());
+        await audible('B');
+        const heldSource = await audio.evaluate(el => { el.pause(); el.currentTime = 26; return el.src; });
+        await page.evaluate(() => window.removeDuplicate());
+        assert.equal(await page.evaluate(() => window.info()), undefined);
+        assert.equal(await page.locator('.footer-title').textContent(), 'B');
+        await page.evaluate(() => window.restoreDuplicate());
+        assert.equal(await page.evaluate(() => window.info().track.at(-1)), 'm:1');
+        assert.deepEqual(await audio.evaluate(el => [el.src, el.paused, Math.round(el.currentTime)]), [heldSource, true, 26]);
+
+        // A held Previous in Shuffle or Repeat scans its former pass without wrapping.
+        await setPlaybackMode(page, 'repeat');
+        await page.evaluate(() => window.removeDuplicate());
+        await page.locator('.scrubber-edge-button.left').evaluate(el => el.click());
+        await audible('A');
+        // Shuffle [A,B,C,D] with deterministic draws -> [A,C,D,B]. Reverse the
+        // canonical rows. A and its successor C keep their shuffled positions and get fresh paths.
+        await page.evaluate(() => { Math.random = () => 0.01; });
+        await setPlaybackMode(page, 'shuffle');
+        await page.evaluate(() => window.reverseTwice());
+        assert.equal(await page.evaluate(() => window.info().track.at(-1)), 'm:3');
+        await page.locator('.scrubber-edge-button.right').evaluate(el => el.click());
+        await audible('C');
+        assert.equal(await page.evaluate(() => window.info().track.at(-1)), 'm:1');
+        await setPlaybackMode(page, 'one');
+        await page.locator('.scrubber-edge-button.left').evaluate(el => el.click());
+        await audible('D');
+
+        // The old row is still selectable while its deletion is waiting for disk.
+        // Its folder selection must not clear D when the rebuilt target is empty.
+        await page.evaluate(() => window.startVanishingFolder());
+        await page.waitForFunction(() => typeof window.releaseWrite === 'function');
+        await page.evaluate(async () => {
+            const selected = window.playVanishing();
+            // Queue walking and publication settle in microtasks for this one-entry target.
+            await new Promise(resolve => setTimeout(resolve, 0));
+            window.holdWrite = false;
+            window.releaseWrite();
+            await Promise.all([selected, window.editDone]);
+        });
+        await audible('D');
+
+        // The edit's recovery checkpoint must survive before the membership write can commit.
+        const quota = await page.evaluate(async () => {
+            const original = Storage.prototype.setItem;
+            Storage.prototype.setItem = function(key, text) {
+                if (key === 'oneplay_music_playback') throw new DOMException('fixture', 'QuotaExceededError');
+                return original.call(this, key, text);
+            };
+            try { await window.removeDuplicate(); return 'unexpected success'; }
+            catch (error) { return error.name; }
+            finally { Storage.prototype.setItem = original; }
+        });
+        assert.equal(quota, 'QuotaExceededError');
+        assert.equal(await page.locator('.footer-title').textContent(), 'D');
+        assert.equal(await page.locator('#footer').getAttribute('aria-busy'), null);
+    },
+
     /** Drive the native drawer through the snapshots from a cold Prev, including the gaps
      * between required reads. The fake clock makes a short wait and a visible wait distinct. */
     async 'wheel: native spinner stays through successive reads until playback'(page) {

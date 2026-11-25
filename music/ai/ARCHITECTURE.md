@@ -41,6 +41,8 @@ Swift saves the live queue and each private favorite in Application Support unde
 
 A fresh app process restores paused. Its decoder waits for Play before activating audio or requesting media. A replacement web view reads the existing player. Folder Play matches a private bookmark by occurrence key in the newly selected queue, including after a row moves. A track tap starts that occurrence at zero, and folder Play in Shuffle draws a fresh pass. TypeScript supplies the favorite’s configured mode and migrates old bundled localStorage and IndexedDB positions through a complete cached library projection. New native positions are written only by Swift.
 
+Swift persists source access and its revision together under the account pairing. A WebKit document proposes a change against the revision it read. A verified share probe can allow or deny that source, and an explicit disconnect withdraws it locally. The account and document identity qualify pending requests. A retired account proof or an older probe cannot change access after a newer decision. The player checks access on queue commit and on cold restore.
+
 Native playback owns one account-scoped URLSession and a 40 MB in-memory compressed-byte pool. Decoder replacement retains versioned blocks, and sign-out replaces the pool. The live network path governs forward range size. During metered playback the reader aims 45 seconds past decoded PCM in the current track, with a 2 MiB read-ahead cap per request. During a metered scrub, the first cache miss can stream through Core Audio’s estimated target plus the normal 256 KiB window. The immediate successor’s URL is resolved when the current track begins. With three seconds of current PCM queued, the low-priority successor worker can read a 256 KiB opening and a decoder tail probe on either route. Manual-only modes prepare the same Next target while retaining their stop-at-end behavior. On unmetered Wi-Fi the rolling 6 MB window spans the current track and its immediate successor. Missing blocks before the playhead do not gate successor preparation. The account reuses recent signed URLs across seeks, selections and natural joins. A missing range uses that URL directly, and a CDN rejection triggers renewal on demand. Playback transitions and command replies share one sequence number so delayed replies cannot repaint stale indicators. [Fetching algorithms and validation](AUDIO-FETCHING.md) · [Listener interaction review](INTERACTIONS.md)
 
 ## Module map
@@ -217,27 +219,15 @@ Playback has several key concepts:
 - **Playback folder**: the folder whose recursive descendants form the track
   list. Set by clicking ▷ on a folder or clicking a track (which sets its
   parent as the playback folder).
-- **Track list**: a flat array of `FolderPath` entries (logical paths through
-  favorites, not physical OneDrive paths). Physical resolution happens only at
-  play time.
-- **Playback mode**: `one` | `all` | `repeat` | `shuffle`. Determines
-  auto-advance behavior on track end.
-- **Per-favorite state**: favorites with "remember my spot" persist their own
-  track, position, and mode. Switching favorites saves the outgoing state and
-  loads the incoming state.
+- **Queue entries** carry a stable occurrence key, a logical path for the tree, the source root, physical drive/item IDs, title and album. The shared library walk distinguishes two playlist routes to the same recording.
+- **Playback modes** are One, All, Repeat, Shuffle and Timer. Each player owns its current pass, the audible occurrence and the natural-end policy.
+- **Remember my spot** saves the outgoing position for each private favorite. Folder Play resumes a surviving occurrence, an explicit track tap starts at zero, and Shuffle starts a fresh pass.
 
-### Shuffle
+### Playlist edits
 
-Shuffle works in-place on the track list array. This is safe because the tree
-UI is independent (it uses path slicing, not list indices), and save/restore
-uses path equality. On reshuffle at end of pass, the just-finished track is
-moved to [0] and playback continues from [1] to avoid immediate repetition.
+Each player matches the audible occurrence against the revised queue by key. A surviving recording keeps its media position as its row moves. A removed recording retains its title and playback controls while its tree indicator disappears. Previous and Next search its former neighbors for a surviving playable occurrence. A structural edit fences advancement until the replacement queue is ready. Revoking access to the audible source stops it immediately.
 
-### Track list refresh
-
-The track list is refreshed reactively when favorites or roots change (via
-`setContext()`), not on every prev/next action. This prevents bugs like
-reshuffling on every button press.
+A row-only change preserves the browser's shuffle order and updates the paths in that order. A membership change starts a new permutation with the surviving current occurrence first. Leaving Shuffle restores canonical order.
 
 ### Race prevention
 
@@ -287,7 +277,7 @@ Two storage layers serve different purposes:
   - `oneplay_music_view`, `oneplay_music_scroll`, `oneplay_music_playback`, `oneplay_music_time`, `oneplay_music_fav:{id}`
 - **IndexedDB** — Cache of server data. Read asynchronously.
   - Music index, favorites, audio blobs
-`oneplay_music_time` (every 5s) shouldn't re-serialize `oneplay_music_playback` (on track change).
+The browser writes the occurrence key and folder key with each global or private position. The five-second global checkpoint carries the playback generation, which also distinguishes repeated plays of one occurrence. Old numeric checkpoints apply only to path-only structural records. The browser resolves legacy localStorage and IndexedDB positions against its cached library. A moved key maps to the new row and a missing key discards its position. While an edit is pending, the global record can recover the removed recording and its former neighbors. Large neighbor lists are stored in the existing IndexedDB data store.
 
 ### Cold-start restore
 

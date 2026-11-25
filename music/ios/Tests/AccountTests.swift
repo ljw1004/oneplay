@@ -7,6 +7,7 @@ import AVFoundation
 @MainActor private final class TestIdentity: NativeIdentity {
     var home = "listener"
     var needsInteraction = false
+    var ordinaryToken = "original"
     var beforeSilent: (() async -> Void)?
     var forceCount = 0
     var removed = 0
@@ -15,7 +16,7 @@ import AVFoundation
         await beforeSilent?()
         if needsInteraction { throw NativeAccountError.interactionRequired }
         if force { forceCount += 1 }
-        return IdentityGrant(homeID: self.home, accessToken: force ? "fresh" : "original")
+        return IdentityGrant(homeID: self.home, accessToken: force ? "fresh" : ordinaryToken)
     }
 
     func acquireInteractive(home: String?, presenting: UIViewController) async throws -> IdentityGrant {
@@ -418,6 +419,78 @@ private final class TestAudioCDN: URLProtocol {
         let state = try await signingIn.value
         XCTAssertEqual(state["driveID"] as? String, "library")
         XCTAssertTrue(FileManager.default.fileExists(atPath: record.path))
+    }
+
+    /// A share 403 carries proof only while its account remains verified. A later renewal
+    /// challenge invalidates even a response JS has already received and has yet to publish.
+    func testShareProbeProofExpiresOnAccountRenewalFailure() async throws {
+        try pair()
+        let identity = TestIdentity()
+        let inFlight = expectation(description: "Share probe reached Graph on the first grant")
+        var finish: CheckedContinuation<Void, Never>?
+        let account = try NativeAccount(recordFile: record, identity: identity) { [self] req in
+            if req.url?.path == "/v1.0/me/drive" { return try response(req, data: drive) }
+            if req.url?.lastPathComponent == "held" {
+                await withCheckedContinuation { finish = $0; inFlight.fulfill() }
+            }
+            if req.url?.lastPathComponent == "renew" {
+                return try response(req, status: req.value(forHTTPHeaderField: "Authorization") == "Bearer original" ? 401 : 200, data: Data())
+            }
+            return try response(req, status: 403, data: Data())
+        }
+        let item = "https://graph.microsoft.com/v1.0/drives/shared/items/root"
+        let denied = try await account.request(message: ["url": item, "id": UUID().uuidString])
+        let oldProof = try XCTUnwrap((denied["headers"] as? [String: String])?["X-OnePlay-Account-Proof"])
+        XCTAssertEqual(denied["status"] as? Int, 403)
+        XCTAssertEqual(oldProof, account.currentShareProof)
+        identity.needsInteraction = true
+        let challenge = try await account.request(message: ["url": item, "id": UUID().uuidString])
+        XCTAssertEqual(challenge["status"] as? Int, 401)
+        XCTAssertNil((challenge["headers"] as? [String: String])?["X-OnePlay-Account-Proof"])
+        XCTAssertNil(account.currentShareProof)
+        identity.needsInteraction = false
+        let fresh = try await account.request(message: ["url": item, "id": UUID().uuidString])
+        let newProof = try XCTUnwrap((fresh["headers"] as? [String: String])?["X-OnePlay-Account-Proof"])
+        XCTAssertNotEqual(oldProof, newProof)
+        XCTAssertEqual(newProof, account.currentShareProof)
+
+        let late = Task { try await account.request(message: ["url": item + "/held", "id": UUID().uuidString]) }
+        await fulfillment(of: [inFlight], timeout: 3)
+        let renewal = try await account.request(message: ["url": item + "/renew", "id": UUID().uuidString])
+        XCTAssertEqual(renewal["status"] as? Int, 200)
+        XCTAssertNotEqual(account.currentShareProof, newProof)
+        finish?.resume()
+        let completed = try await late.value
+        XCTAssertEqual(completed["status"] as? Int, 403)
+        XCTAssertNil((completed["headers"] as? [String: String])?["X-OnePlay-Account-Proof"], "An older Graph transaction cannot borrow the renewed grant's proof")
+    }
+
+    /// The second 401 of a replay can arrive after a different request verified a new grant.
+    func testLateShareReplayCannotSignOutNewGrant() async throws {
+        try pair()
+        let identity = TestIdentity()
+        let replay = expectation(description: "Retiring bearer is awaiting its replay")
+        var finish: CheckedContinuation<Void, Never>?
+        let account = try NativeAccount(recordFile: record, identity: identity) { [self] request in
+            if request.url?.lastPathComponent == "held" {
+                if request.value(forHTTPHeaderField: "Authorization") == "Bearer fresh" {
+                    await withCheckedContinuation { finish = $0; replay.fulfill() }
+                }
+                return try response(request, status: 401, data: Data())
+            }
+            return try response(request, data: drive)
+        }
+        let root = "https://graph.microsoft.com/v1.0/drives/shared/items/"
+        let held = Task { try await account.request(message: ["url": root + "held", "id": UUID().uuidString]) }
+        await fulfillment(of: [replay], timeout: 3)
+        identity.ordinaryToken = "newer"
+        let current = try await account.request(message: ["url": root + "current", "id": UUID().uuidString])
+        let proof = try XCTUnwrap((current["headers"] as? [String: String])?["X-OnePlay-Account-Proof"])
+        finish?.resume()
+        do { _ = try await held.value; XCTFail("The old bearer cannot publish an account challenge") }
+        catch NativeAccountError.cancelled {}
+        XCTAssertEqual(account.currentShareProof, proof)
+        XCTAssertEqual(account.snapshot["evidence"] as? String, "evidence:signed-in")
     }
 
     func testHeldProbeAndTokenCannotAdmitWritesAfterRouteChange() async throws {
@@ -914,11 +987,25 @@ private final class TestAudioCDN: URLProtocol {
                 return true;
                 """, arguments: ["event":event], in: nil, contentWorld: .page)
         }
+        let oldSample = try await page.callAsyncJavaScript("""
+            return (await window.webkit.messageHandlers.oneplay.postMessage({op:'playback',version:1,action:'snapshot'})).subscription;
+            """, arguments: [:], in: nil, contentWorld: .page)
+        let oldSubscription = try XCTUnwrap(oldSample as? String)
         try await startHeldDownload(in: page, event: "reload")
         await fulfillment(of: [reload.started], timeout: 3)
         page.reload()
         await fulfillment(of: [reload.cancelled], timeout: 3)
         let replacement = try await readyPage(in: controller, excluding: page)
+        let rejected = try await replacement.callAsyncJavaScript("""
+            const send = (action,args={}) => window.webkit.messageHandlers.oneplay.postMessage({op:'playback',version:1,action,...args});
+            const fresh = await send('readAccess');
+            const late = await send('access',{base:fresh.snapshot.accessRevision,subscription:oldSubscription,denied:[]});
+            const expired = await send('access',{base:late.snapshot.accessRevision,subscription:fresh.subscription,
+                denied:['share:reader'], proof:'expired'});
+            return Array.isArray(fresh.denied) && !late.denied && late.applied === false && oldSubscription !== fresh.subscription && late.subscription === fresh.subscription &&
+                expired.applied === false && expired.staleProof === true;
+            """, arguments: ["oldSubscription":oldSubscription], in: nil, contentWorld: .page)
+        XCTAssertEqual(rejected as? Bool, true, "A retired subscription and an expired grant proof must each be rejected")
         let resultAfterReload = try await replacement.callAsyncJavaScript("""
             const b = window.webkit.messageHandlers.oneplay;
             let error = null;

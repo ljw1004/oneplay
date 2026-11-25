@@ -68,8 +68,17 @@ enum MediaLookup: Sendable {
     var cleanupTheme: String? { cleanupPending ? record?.cleanupTheme : nil }
     private var generation = 0
     private enum DriveProof: Equatable { case unchecked, verified(token: String), mismatch }
-    private var driveProof = DriveProof.unchecked
+    private var shareProof = UUID().uuidString
+    private var driveProof = DriveProof.unchecked {
+        didSet { if driveProof != oldValue { shareProof = UUID().uuidString } }
+    }
     private var proofGeneration = 0
+    /// A probe may reach JS just before MSAL loses the verified account. Require its
+    /// original proof again when admitting that probe's share-access decision.
+    var currentShareProof: String? {
+        guard case .verified = driveProof, record != nil, !cleanupPending else { return nil }
+        return shareProof
+    }
     typealias DownloadFile = (URLRequest) async throws -> (HTTPURLResponse, FileHandle)
     private let downloadFile: DownloadFile
     private let path: NWPathMonitor?
@@ -413,7 +422,7 @@ enum MediaLookup: Sendable {
 
     /// One request policy for JS library work and the locked player. Retrying a 401 always keeps the same home account.
     private func fetchFile(_ request: URLRequest, graph: Bool, retry: Bool, forceRefresh: Bool = false,
-                           timeoutMs: Int?, proof: Int, track: IndexedTrack? = nil) async throws -> (HTTPURLResponse, FileHandle) {
+                           timeoutMs: Int?, proof: Int, track: IndexedTrack? = nil) async throws -> (HTTPURLResponse, FileHandle, String?) {
         let epoch = generation
         var force = forceRefresh
         var rejectedAuthorization: String?
@@ -421,11 +430,13 @@ enum MediaLookup: Sendable {
             try checkAdmission(epoch)
             try checkProof(proof)
             var current = request
+            var sentProof: String?
             if graph {
                 let grant = try await acquireVerifiedGrant(force: force, rejectedAuthorization: rejectedAuthorization, wifiOnly: !request.allowsCellularAccess)
                 try checkAdmission(epoch)
                 try checkProof(proof)
                 current.setValue("Bearer " + grant.accessToken, forHTTPHeaderField: "Authorization")
+                if driveProof == .verified(token: grant.accessToken) { sentProof = currentShareProof }
                 force = false
             }
             // Mark only the item metadata request. Token acquisition, retries and the audition hold have separate lifetimes.
@@ -453,7 +464,7 @@ enum MediaLookup: Sendable {
                 try await Task.sleep(for: .seconds(status == 429 ? 2 : 10))
                 continue
             }
-            return (response, file)
+            return (response, file, sentProof)
         }
     }
 
@@ -502,7 +513,7 @@ enum MediaLookup: Sendable {
         let proof = proofGeneration
         let task = Task { @MainActor () throws -> [String: Any] in
             do {
-                let (response, file) = try await fetchFile(request, graph: !follow, retry: retry, timeoutMs: timeout, proof: proof)
+                let (response, file, sentProof) = try await fetchFile(request, graph: !follow, retry: retry, timeoutMs: timeout, proof: proof)
                 try checkAdmission(epoch)
                 try checkProof(proof)
                 if !follow, method == "GET", url.path == "/v1.0/me/drive", response.statusCode == 200 {
@@ -528,12 +539,17 @@ enum MediaLookup: Sendable {
                 try file.seek(toOffset: 0)
                 var headers: [String: String] = [:]
                 for (name, value) in response.allHeaderFields {
-                    if let name = name as? String, !["set-cookie", "x-oneplay-account-error"].contains(name.lowercased()) {
+                    if let name = name as? String, !["set-cookie", "x-oneplay-account-error", "x-oneplay-account-proof"].contains(name.lowercased()) {
                         headers[name] = String(describing: value)
                     }
                 }
                 let authenticated = !follow && response.url.map(GraphTransport.isGraph) == true
+                if authenticated, method == "GET", sentProof == currentShareProof, [200, 403, 404].contains(response.statusCode) {
+                    headers["X-OnePlay-Account-Proof"] = sentProof
+                }
                 let rejected = authenticated && response.statusCode == 401
+                // A replay on a retired bearer cannot sign out its successfully renewed replacement.
+                if rejected && sentProof != currentShareProof { throw NativeAccountError.cancelled }
                 if rejected { headers["X-OnePlay-Account-Error"] = NativeAccountError.interactionRequired.rawValue }
                 // URLSession exposes no wire reason phrase. A localized label outside HTTP's byte range would invalidate Response.
                 let statusText = HTTPURLResponse.localizedString(forStatusCode: response.statusCode)
@@ -601,10 +617,13 @@ enum MediaLookup: Sendable {
         if wifiOnly { request.requireUnmeteredWiFi() }
         let proof = proofGeneration
         do {
-            let (response, file) = try await fetchFile(request, graph: true, retry: false, forceRefresh: forceRefresh, timeoutMs: 30_000, proof: proof, track: IndexedTrack(driveId: driveID, itemId: itemID))
+            let (response, file, sentProof) = try await fetchFile(request, graph: true, retry: false, forceRefresh: forceRefresh, timeoutMs: 30_000, proof: proof, track: IndexedTrack(driveId: driveID, itemId: itemID))
             try checkAdmission(epoch)
             try checkProof(proof)
             guard response.url.map(GraphTransport.isGraph) == true else { throw NativeAccountError.unavailable }
+            // A late denial refers to the bearer used for this request. It cannot revoke a
+            // newly verified grant or invalidate a signed URL admitted under that grant.
+            if [401, 403, 404, 410].contains(response.statusCode), sentProof != currentShareProof { throw NativeAccountError.transient }
             observe(status: response.statusCode, authenticated: true, authFailure: response.statusCode == 401)
             if response.statusCode == 408 || response.statusCode == 429 || response.statusCode >= 500 { throw NativeAccountError.transient }
             if [403, 404, 410].contains(response.statusCode) {

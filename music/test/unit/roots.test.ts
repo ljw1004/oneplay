@@ -6,7 +6,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { type Root, type RootsMap, type ItemRef } from '../../src/favorites.js';
 import { type MusicFolder, type AccountInfo } from '../../src/indexer.js';
-import { resolveWalkableRootForItemRef, isWalkableRoot } from '../../src/roots.js';
+import { resolveWalkableRootForItemRef, isWalkableRoot, isPathDeniedByShare } from '../../src/roots.js';
 
 const folder = (): MusicFolder => ({ id: 'root', children: {} });
 const accountInfo = (driveId: string): AccountInfo => ({ driveId, displayName: 'Account' });
@@ -144,4 +144,15 @@ describe('resolveWalkableRootForItemRef', () => {
         assert.equal(resolved?.type, 'onedrive');
         assert.equal(resolved?.key, 'd1');
     });
+});
+
+it('disables rows in nested favorites using their denied source', () => {
+    const roots = rootMap([
+        {type:'playlist', key:'fav:mix', name:'Mix', members:[{favId:'book'}, itemRef('d1','share:other')]},
+        {type:'shortcut', key:'fav:book', name:'Book', target:itemRef('d1','share:book')},
+    ]);
+    const denied = new Set(['share:book']);
+    assert.equal(isPathDeniedByShare(['Music','fav:mix','m:0','chapter.mp3'], denied, roots), true);
+    assert.equal(isPathDeniedByShare(['Music','fav:mix','m:1'], denied, roots), false);
+    assert.equal(isPathDeniedByShare(['Music','fav:mix'], denied, roots), false);
 });

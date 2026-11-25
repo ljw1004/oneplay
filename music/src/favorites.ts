@@ -5,9 +5,8 @@
  * folder; a playlist is an ordered list of members (folders, files, or
  * references to other favorites). Favorites are persisted to IndexedDB
  * (fast, best-effort) and the OneDrive App folder (best-effort, may fail
- * offline). Persistence failures are logged but never thrown — mutations
- * succeed in-memory even when storage fails. This matches the offline-first
- * philosophy: the UI stays usable regardless of I/O errors.
+ * offline). An edit that fences a playback queue must commit to IndexedDB before
+ * acknowledgment. Other settings and cloud writes remain best effort.
  *
  * INVARIANTS:
  * - Shortcut targets always have isFolder=true. Enforced at add() and load().
@@ -181,8 +180,8 @@ export interface Favorites {
      *  Persists and calls onChange. */
     addMembers(playlistId: string, members: PlaylistMember[]): Promise<void>;
 
-    /** Remove members at given indices from a playlist. Sorts indices descending
-     *  internally to avoid index-shift bugs. Persists and calls onChange. */
+    /** Remove the members occupying the given rows when the command is issued.
+     *  Earlier pending edits may shift those rows before this edit commits. */
     removeMembers(playlistId: string, indices: number[]): Promise<void>;
 
     /** Set hasPrivatePlayback on a favorite. Persists and calls onChange. */
@@ -387,11 +386,11 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
      *    update path (item was moved/renamed). Heal by ID.
      * 4. If neither — broken. Remove shortcuts entirely; remove playlist members.
      */
-    const heal = async (
+    const healedFavorites = (
         roots: RootsMap,
         currentFolders: ReadonlyMap<string, MusicFolder>,
         removedRootKey?: string,
-    ): Promise<void> => {
+    ): Favorite[] | undefined => {
         let changed = false;
         const pathsByFolder = new Map<MusicFolder, Map<string, string[]>>();
 
@@ -487,13 +486,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
                 ? fav : { ...fav, members: newMembers };
         });
 
-        if (changed) {
-            favorites = newFavorites;
-            updatedAt = Date.now();
-            await saveLocal(true);
-            scheduleOneDriveUploadFireAndForget();
-            await onChange('sync');
-        }
+        return changed ? newFavorites : undefined;
     };
 
     // -- Persistence ---------------------------------------------------------
@@ -501,14 +494,47 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
     const IDB_KEY = 'favorites';
     const ONEDRIVE_PATH = '/me/drive/special/approot:/favorites.json:/content';
 
-    /** Persist to IndexedDB only (fast, awaited by callers).
-     *  INVARIANT: callers must set updatedAt before calling. */
-    const saveLocal = async (queueEdit = false): Promise<void> => {
-        loadedMembership = true;
-        if (queueEdit && deps.fenceQueueEdit) await deps.fenceQueueEdit();
-        const data = toData();
-        await deps.dbPut(IDB_KEY, data).catch(logCatch('favorites:dbPut'));
-    };
+    let pendingWrite: Promise<void> = Promise.resolve();
+
+    /** Compute each edit from the last admitted graph. Only disk work and the pre-edit
+     * playback fence are serialized. Queue publication may wait for a source supplied
+     * or removed by the next edit, so it runs outside this critical section. */
+    function serializeWrite<T>(operation: () => Promise<T>): Promise<T> {
+        const write = pendingWrite.then(operation);
+        pendingWrite = write.then(() => {}, () => {});
+        return write;
+    }
+
+    async function commitEdit(change: () => Favorite[] | undefined,
+        options: { queueEdit?: boolean; origin?: 'sync'; serverTime?: number } = {}): Promise<boolean> {
+        const fenced = !!options.queueEdit && !!deps.fenceQueueEdit;
+        const write = serializeWrite(async () => {
+            const next = change();
+            if (!next) return false;
+            const data = { version: 1, updatedAt: options.serverTime ?? Date.now(), favorites: next };
+            try {
+                if (fenced) await deps.fenceQueueEdit!();
+                await deps.dbPut(IDB_KEY, data);
+            } catch (error) {
+                if (fenced) throw error;
+                logCatch('favorites:dbPut')(error);
+            }
+            favorites = next;
+            updatedAt = data.updatedAt;
+            loadedMembership = true;
+            if (options.serverTime === undefined) scheduleOneDriveUploadFireAndForget();
+            return true;
+        });
+        let changed: boolean;
+        try {
+            changed = await write;
+        } catch (error) {
+            if (fenced) await onChange(options.origin); // release the fence using the admitted graph
+            throw error;
+        }
+        if (changed) await onChange(options.origin);
+        return changed;
+    }
 
     let uploadDirty = false;
     let uploadRunning = false;
@@ -549,14 +575,16 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
      * Cache-only — no network call. Returns quickly so the UI renders immediately.
      */
     const loadFromCache = async (): Promise<void> => {
-        const cached = await deps.dbGet<FavoritesData>(IDB_KEY).catch(() => undefined);
-        if (cached && typeof cached === 'object' && Array.isArray(cached.favorites)) {
+        const loaded = await serializeWrite(async () => {
+            const cached = await deps.dbGet<FavoritesData>(IDB_KEY).catch(() => undefined);
+            if (!cached || !Array.isArray(cached.favorites)) return false;
             loadedMembership = true;
             favorites = cached.favorites.filter(isValid).map(normalize);
             updatedAt = cached.updatedAt || 0;
             log(`favorites: loaded ${favorites.length} from cache (updatedAt=${updatedAt})`);
-            await onChange();
-        }
+            return true;
+        });
+        if (loaded) await onChange();
     };
 
     /**
@@ -577,14 +605,10 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
             const server: FavoritesData = await readGraphJson(r, 'favorites:onedrive-load');
             if (!server || !Array.isArray(server.favorites)) return;
             loadedMembership = true;
-            if ((server.updatedAt || 0) > updatedAt) {
-                if (deps.fenceQueueEdit) await deps.fenceQueueEdit();
-                favorites = server.favorites.filter(isValid).map(normalize);
-                updatedAt = server.updatedAt;
-                await deps.dbPut(IDB_KEY, toData()).catch(logCatch('favorites:dbPut-server'));
-                log(`favorites: adopted server version (updatedAt=${updatedAt}, ${favorites.length} items)`);
-                await onChange('sync');
-            }
+            const adopted = await commitEdit(() => (server.updatedAt || 0) > updatedAt
+                ? server.favorites.filter(isValid).map(normalize) : undefined,
+                { queueEdit: true, origin: 'sync', serverTime: server.updatedAt });
+            if (adopted) log(`favorites: adopted server version (updatedAt=${server.updatedAt})`);
         }).catch(logCatch('favorites:onedrive-load'));
     };
 
@@ -594,37 +618,27 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
         getAll: () => favorites,
         hasLoadedMembership: () => loadedMembership,
 
-        async add(fav) {
-            if (!isValid(fav)) return false;
-            // Cycle check for FavRef members in playlists
-            if (fav.kind === 'playlist') {
-                for (const m of fav.members) {
-                    if (isFavRef(m) && wouldCreateCycle(fav.id, m.favId)) {
-                        logError(`favorites: cycle detected adding ${m.favId} to ${fav.id}`);
-                        return false;
+        add(fav) {
+            return commitEdit(() => {
+                if (!isValid(fav)) return;
+                if (fav.kind === 'playlist') {
+                    for (const m of fav.members) {
+                        if (isFavRef(m) && wouldCreateCycle(fav.id, m.favId)) {
+                            logError(`favorites: cycle detected adding ${m.favId} to ${fav.id}`);
+                            return;
+                        }
                     }
                 }
-            }
-            favorites.push(fav);
-            updatedAt = Date.now();
-            await saveLocal();
-            scheduleOneDriveUploadFireAndForget();
-            await onChange();
-            return true;
+                return [...favorites, fav];
+            });
         },
 
         async remove(id) {
-            favorites = favorites.filter(f => f.id !== id);
-            // Also remove FavRefs pointing to the removed favorite
-            favorites = favorites.map(f => {
+            await commitEdit(() => favorites.filter(f => f.id !== id).map(f => {
                 if (f.kind !== 'playlist') return f;
                 const filtered = f.members.filter(m => !isFavRef(m) || m.favId !== id);
                 return filtered.length === f.members.length ? f : { ...f, members: filtered };
-            });
-            updatedAt = Date.now();
-            await saveLocal(true);
-            scheduleOneDriveUploadFireAndForget();
-            await onChange();
+            }), { queueEdit: true });
         },
 
         wouldCreateCycle,
@@ -661,101 +675,84 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
             return resolveDisplayName(ownerId, segment);
         },
 
-        heal,
+        async heal(roots, currentFolders, removedRootKey) {
+            await commitEdit(() => healedFavorites(roots, currentFolders, removedRootKey),
+                { queueEdit: true, origin: 'sync' });
+        },
         async save() {
-            await saveLocal();
-            scheduleOneDriveUploadFireAndForget();
+            await serializeWrite(async () => {
+                loadedMembership = true;
+                await deps.dbPut(IDB_KEY, toData()).catch(logCatch('favorites:dbPut'));
+                scheduleOneDriveUploadFireAndForget();
+            });
         },
         loadFromCache,
         pullFavoritesFromOneDrive,
 
         async rename(id, newName) {
             const trimmed = newName.trim();
-            if (!trimmed) return; // reject empty/whitespace-only
-            const fav = findById(id);
-            if (!fav) return;
-            favorites = favorites.map(f => f.id === id ? { ...f, name: trimmed } : f);
-            updatedAt = Date.now();
-            await saveLocal();
-            scheduleOneDriveUploadFireAndForget();
-            await onChange();
+            if (!trimmed) return;
+            await commitEdit(() => findById(id)
+                ? favorites.map(f => f.id === id ? { ...f, name: trimmed } : f) : undefined);
         },
 
         async addMembers(playlistId, members) {
-            const fav = findById(playlistId);
-            if (!fav || fav.kind !== 'playlist') return;
-            const existing = fav.members;
-            /** Dedup key for a member: "item:driveId:itemId" or "fav:favId". */
-            const memberKey = (m: PlaylistMember): string =>
-                isFavRef(m) ? `fav:${m.favId}` : `item:${m.driveId}:${m.itemId}`;
-            const seen = new Set(existing.map(memberKey));
-            const toAdd = members.filter(m => {
-                if (isFavRef(m) && wouldCreateCycle(playlistId, m.favId)) return false;
-                const key = memberKey(m);
-                if (seen.has(key)) return false;
-                seen.add(key); // also prevents intra-batch duplicates
-                return true;
-            });
-            if (toAdd.length === 0) return;
-            favorites = favorites.map(f =>
-                f.id === playlistId ? { ...f, members: [...existing, ...toAdd] } : f,
-            );
-            updatedAt = Date.now();
-            await saveLocal(true);
-            scheduleOneDriveUploadFireAndForget();
-            await onChange();
+            await commitEdit(() => {
+                const fav = findById(playlistId);
+                if (!fav || fav.kind !== 'playlist') return;
+                const memberKey = (m: PlaylistMember): string =>
+                    isFavRef(m) ? `fav:${m.favId}` : `item:${m.driveId}:${m.itemId}`;
+                const seen = new Set(fav.members.map(memberKey));
+                const toAdd = members.filter(m => {
+                    if (isFavRef(m) && wouldCreateCycle(playlistId, m.favId)) return false;
+                    const key = memberKey(m);
+                    if (seen.has(key)) return false;
+                    seen.add(key); // also prevents intra-batch duplicates
+                    return true;
+                });
+                if (toAdd.length) return favorites.map(f =>
+                    f === fav ? { ...fav, members: [...fav.members, ...toAdd] } : f);
+            }, { queueEdit: true });
         },
 
         async removeMembers(playlistId, indices) {
-            const fav = findById(playlistId);
-            if (!fav || fav.kind !== 'playlist') return;
-            // Sort descending to avoid index-shift bugs during removal
-            const sorted = [...indices].sort((a, b) => b - a);
-            const newMembers = [...fav.members];
-            for (const i of sorted) newMembers.splice(i, 1);
-            favorites = favorites.map(f =>
-                f.id === playlistId ? { ...f, members: newMembers } : f,
-            );
-            updatedAt = Date.now();
-            await saveLocal(true);
-            scheduleOneDriveUploadFireAndForget();
-            await onChange();
+            const displayed = findById(playlistId);
+            if (displayed?.kind !== 'playlist') return;
+            const rows = new Set(indices);
+            await commitEdit(() => {
+                const fav = findById(playlistId);
+                if (!fav || fav.kind !== 'playlist') return;
+                let members: readonly PlaylistMember[];
+                if (fav.members === displayed.members) {
+                    members = fav.members.filter((_, i) => !rows.has(i));
+                } else {
+                    // Local edits retain surviving member objects. If sync replaced a row or
+                    // its object also appeared in an unselected row, discard the ambiguous removal.
+                    const targets = new Set(displayed.members.filter((_, i) => rows.has(i)));
+                    displayed.members.forEach((m, i) => { if (!rows.has(i)) targets.delete(m); });
+                    members = fav.members.filter(m => !targets.has(m));
+                }
+                if (members.length === fav.members.length) return;
+                return favorites.map(f => f === fav ? { ...fav, members } : f);
+            }, { queueEdit: true });
         },
 
         async setHasPrivatePlayback(id, value) {
-            const fav = findById(id);
-            if (!fav) return;
-            favorites = favorites.map(f =>
-                f.id === id ? { ...f, hasPrivatePlayback: value } : f,
-            );
-            updatedAt = Date.now();
-            await saveLocal();
-            scheduleOneDriveUploadFireAndForget();
-            await onChange();
+            await commitEdit(() => findById(id)
+                ? favorites.map(f => f.id === id ? { ...f, hasPrivatePlayback: value } : f) : undefined);
         },
 
         async setMode(id, mode) {
-            const fav = findById(id);
-            if (!fav || fav.mode === mode) return; // no-op if unchanged
-            favorites = favorites.map(f =>
-                f.id === id ? { ...f, mode } : f,
-            );
-            updatedAt = Date.now();
-            await saveLocal();
-            scheduleOneDriveUploadFireAndForget();
-            await onChange();
+            await commitEdit(() => {
+                const fav = findById(id);
+                if (!fav || fav.mode === mode) return;
+                return favorites.map(f => f === fav ? { ...f, mode } : f);
+            });
         },
 
         async setOfflinePin(id, pin) {
-            const fav = findById(id);
-            if (!fav) return;
-            favorites = favorites.map(f =>
-                f.id === id ? { ...f, offlinePin: pin } : f,
-            );
-            updatedAt = Date.now();
-            await saveLocal();
-            scheduleOneDriveUploadFireAndForget();
-            await onChange();
+            await commitEdit(() => findById(id)
+                ? favorites.map(f => f.id === id ? { ...f, offlinePin: pin } : f) : undefined);
         },
 
         _testOnlySuppressSave(suppress) {

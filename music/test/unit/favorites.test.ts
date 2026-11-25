@@ -19,7 +19,7 @@ import assert from 'node:assert/strict';
 import {
     createFavorites, type FavoritesDeps, type Favorites,
     type RootsMap, type Root, type Shortcut, type Playlist,
-    type ItemRef, type FavRef, type PlaylistMember,
+    type ItemRef, type FavRef, type PlaylistMember, type FavoritesData,
 } from '../../src/favorites.js';
 import { type MusicFolder, type AccountInfo } from '../../src/indexer.js';
 
@@ -644,5 +644,80 @@ describe('setOfflinePin', () => {
         await favs.setOfflinePin('pl1', { paused: true });
         const fav = favs.getAll()[0] as Playlist;
         assert.deepEqual(fav.offlinePin, { paused: true });
+    });
+});
+
+describe('playlist edit acknowledgment', () => {
+    it('rapid deletions resolve their displayed members after earlier edits move the rows', async () => {
+        const {favs} = makeFavs();
+        const [a, b, c, d] = ['A', 'B', 'C', 'D'].map(id => itemRef([id], id, false));
+        await favs.add(playlist('p', 'Playlist', [a, b, c, d]));
+        await Promise.all([favs.removeMembers('p', [1]), favs.removeMembers('p', [1]), favs.removeMembers('p', [3])]);
+        assert.deepEqual((favs.getAll()[0] as Playlist).members, [a, c]);
+    });
+
+    it('a later rename cannot commit or upload membership from a rejected removal', async () => {
+        const writes: FavoritesData[] = [];
+        const uploads: FavoritesData[] = [];
+        let rejectFence!: (reason: Error) => void;
+        let reachedFence!: () => void;
+        const started = new Promise<void>(resolve => { reachedFence = resolve; });
+        const favs = createFavorites({...sinkDeps,
+            fenceQueueEdit: () => new Promise<void>((_, reject) => { rejectFence = reject; reachedFence(); }),
+            dbPut: async (_, data) => { writes.push(data as FavoritesData); },
+            authFetch: async (_, __, options) => {
+                uploads.push(JSON.parse(String(options?.body)) as FavoritesData);
+                return new Response();
+            },
+        }, () => {});
+        const a = itemRef(['A'], 'A', false);
+        await favs.add(playlist('p', 'Original', [a]));
+        const removal = assert.rejects(favs.removeMembers('p', [0]), /fence rejected/);
+        await started;
+        const renamed = favs.rename('p', 'Renamed');
+        rejectFence(new Error('fence rejected'));
+        await Promise.all([removal, renamed]);
+        const expected = playlist('p', 'Renamed', [a]);
+        assert.deepEqual(favs.getAll(), [expected]);
+        assert.deepEqual(writes.map(w => w.favorites), [[playlist('p', 'Original', [a])], [expected]]);
+        assert.deepEqual(uploads.map(w => w.favorites), writes.map(w => w.favorites));
+    });
+
+    it('accepts another edit while the previous queue publication waits for a share', async () => {
+        let markStarted!: () => void, resume!: () => void;
+        const started = new Promise<void>(resolve => { markStarted = resolve; });
+        const publication = new Promise<void>(resolve => { resume = resolve; });
+        let waitForShare = false;
+        const favs = createFavorites({...sinkDeps, fenceQueueEdit: async () => {}}, () => {
+            if (waitForShare) { waitForShare = false; markStarted(); return publication; }
+        });
+        const a = itemRef(['A'], 'A', false);
+        await favs.add(playlist('p', 'Playlist', []));
+        waitForShare = true;
+        const addition = favs.addMembers('p', [a]);
+        await started;
+        await favs.removeMembers('p', [0]);
+        resume();
+        await addition;
+        assert.deepEqual((favs.getAll()[0] as Playlist).members, []);
+    });
+
+    it('republishes the durable queue and rejects an edit if its storage write aborts', async () => {
+        let full = false;
+        const events: string[] = [];
+        const favs = createFavorites({...sinkDeps,
+            fenceQueueEdit: async () => { events.push('fence'); },
+            dbPut: async () => { if (full) throw new Error('storage full'); },
+        }, () => { events.push('publish'); });
+        const a = itemRef(['A'], 'A', false);
+        await favs.add(playlist('p', 'Playlist', [a]));
+        events.length = 0;
+        full = true;
+        await assert.rejects(favs.removeMembers('p', [0]), /storage full/);
+        assert.deepEqual(events, ['fence', 'publish']);
+        assert.deepEqual((favs.getAll()[0] as Playlist).members, [a]);
+        full = false;
+        await favs.removeMembers('p', [0]);
+        assert.deepEqual((favs.getAll()[0] as Playlist).members, []);
     });
 });

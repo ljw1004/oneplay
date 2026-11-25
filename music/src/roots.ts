@@ -24,6 +24,21 @@ export function isWalkableRoot(root: Root | undefined): root is WalkableRoot {
         && root.folder !== undefined;
 }
 
+/** Follow playlist member segments to the source whose access applies to this row. */
+export function isPathDeniedByShare(path: readonly string[], denied: ReadonlySet<string>, roots: RootsMap): boolean {
+    if (!denied.size) return false;
+    if (denied.has(path[1])) return true;
+    let root = roots.get(path[1]);
+    for (let depth = 2; root?.type === 'playlist'; depth++) {
+        const memberIndex = /^m:(\d+)$/.exec(path[depth] ?? '');
+        const member = memberIndex && root.members[Number(memberIndex[1])];
+        if (!member) return false;
+        if (!('favId' in member)) return !!member.sourceRootKey && denied.has(member.sourceRootKey);
+        root = roots.get('fav:' + member.favId);
+    }
+    return root?.type === 'shortcut' && !!root.target.sourceRootKey && denied.has(root.target.sourceRootKey);
+}
+
 /** Returns a root's backing driveId when available. */
 function rootDriveId(root: Root): string | undefined {
     if (root.type === 'onedrive') return root.info.driveId;

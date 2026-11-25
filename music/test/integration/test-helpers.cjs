@@ -600,7 +600,27 @@ async function enterSelectViaRightClick(page, rowSelector = "#children .tree-row
 // ---------------------------------------------------------------------------
 
 
+/** A seekable two-minute PCM fixture. Used by browser playback and bookmark fixtures. */
+function silentWav() {
+    const samples = 120 * 8000;
+    const header = Buffer.alloc(44);
+    header.write('RIFF');
+    header.writeUInt32LE(36 + samples, 4);
+    header.write('WAVEfmt ', 8);
+    header.writeUInt32LE(16, 16);
+    header.writeUInt16LE(1, 20); // PCM, mono, 8-bit
+    header.writeUInt16LE(1, 22);
+    header.writeUInt32LE(8000, 24);
+    header.writeUInt32LE(8000, 28);
+    header.writeUInt16LE(1, 32);
+    header.writeUInt16LE(8, 34);
+    header.write('data', 36);
+    header.writeUInt32LE(samples, 40);
+    return Buffer.concat([header, Buffer.alloc(samples, 128)]);
+}
+
 module.exports = {
+    silentWav,
     chromium,
     fs,
     os,

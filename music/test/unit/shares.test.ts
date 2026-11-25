@@ -146,3 +146,63 @@ describe('shares:addFromUrl', () => {
         );
     });
 });
+
+it('verifies the resolved share on reconnect and withdraws it before local cache cleanup completes', async () => {
+    const grants: string[] = [];
+    const disconnected: Array<[string[], string]> = [];
+    let finishSave!: () => void;
+    let pendingSave: Promise<void> | undefined;
+    const shares = createShares({
+        ...makeDeps(() => ({status: 404})),
+        async authFetch(url) {
+            const item = url.includes('/driveItem');
+            return new Response(JSON.stringify(item
+                ? {id:'root', folder:{}, name:'Shared', parentReference:{driveId:'drive'}}
+                : {id:'same'}), {headers:{'X-OnePlay-Account-Proof':item ? 'verified item' : 'metadata'}});
+        },
+        async dbPut() { await pendingSave; },
+        beginSourceProbe(root) {
+            return async (r, allowed, connected) => {
+                assert.equal(root, 'share:same');
+                assert.ok(allowed && connected());
+                grants.push(r.headers.get('X-OnePlay-Account-Proof')!);
+                return true;
+            };
+        },
+        async onDisconnect(remaining, root) { disconnected.push([remaining, root]); },
+    }, () => {});
+    const original = await shares.addFromUrl('https://example.test/s');
+    pendingSave = new Promise(resolve => { finishSave = resolve; });
+    const removing = shares.remove(original.id);
+    assert.deepEqual(disconnected, [[[], 'share:same']]);
+    assert.equal(shares.getAll().length, 0);
+    finishSave();
+    await removing;
+    const replacement = await shares.addFromUrl('https://example.test/s');
+    assert.notEqual(replacement.id, original.id);
+    assert.deepEqual(grants, ['verified item', 'verified item']);
+});
+
+it('renders cached share denials before any probe and counts only connected shares', async () => {
+    const denied = ['share:book', 'share:removed'];
+    const calls: string[] = [];
+    const { createNativeLibrary } = await import('../../src/native-library.js');
+    const native = createNativeLibrary({ async postMessage(message) {
+        calls.push(String(message.action ?? message.op));
+        if (message.op === 'state') return {driveID:'library', evidence:'evidence:not-online'};
+        assert.equal(message.action, 'readAccess');
+        return {subscription:'replacement', denied, snapshot:{accessRevision:7}};
+    } });
+    await native.loadAccountState('state');
+    const shares = createShares({
+        authFetch: async () => { throw Error('No Graph request is needed to show the cached permissions'); },
+        dbGet: async <T>() => ({shares:[{id:'book', shareId:'book', rootKey:'share:book'}]} as T),
+        dbPut: async () => {},
+        readPlaybackDenials: native.readPlaybackDenials,
+    }, () => {});
+    await shares.loadFromCache();
+    assert.deepEqual([...shares.getDeniedRootKeys()], denied);
+    assert.ok(shares.getDeniedReason('share:book'));
+    assert.equal(shares.getDeniedCount(), 1);
+    assert.deepEqual(calls, ['state','readAccess'], 'replaying cached denials must never publish a new grant or denial');
+});

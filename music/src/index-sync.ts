@@ -51,7 +51,6 @@ export interface IndexSyncDeps {
     readonly startupErrorMessage: string;
     readonly accountData: Map<string, { folder: MusicFolder; driveId: string }>;
     readonly getTree: () => TreeView | undefined;
-    readonly onShareAccessConfirmed?: (rootKey: string) => void;
     readonly onPlaybackRootsChange?: () => void;
     readonly getPlayback: () => Playback | undefined;
     readonly getFavorites: () => Favorites | undefined;
@@ -300,7 +299,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         updateAccountDataFromTreeRoots();
         const favorites = getFavorites();
         const playback = getPlayback();
-        if (playback && favorites) playback.setContext(favorites, tree.getRoots());
+        if (playback && favorites) playback.setContext(favorites, tree.getRoots(), shares.getDeniedRootKeys(), shares.hasLoadedMembership?.());
         deps.onPlaybackRootsChange?.();
         getSelect()?.setRoots(tree.getRoots());
         deps.invalidateSearchData();
@@ -495,6 +494,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         const records = shares.getAll();
         const results = await Promise.all(records.map(async (share): Promise<ShareProbeResult> => {
             const startedAt = Date.now();
+            const applyAccess = native?.beginSourceProbe(share.rootKey);
             try {
                 const r = await deps.auth.fetch(
                     `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(share.driveId)}/items/${encodeURIComponent(share.rootItemId)}?$select=name,id,cTag,eTag,size,lastModifiedDateTime,folder`,
@@ -504,12 +504,13 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
                 const durationMs = Date.now() - startedAt;
                 if (!stillConnected(share)) return { share, status: 'skipped' };
                 if (!r.ok) {
-                    if (native && (r.status === 401 || (r.status === 403 && deps.auth.getEvidence() === 'evidence:signed-out'))) {
+                    if (native && (r.status === 401 || r.headers.has('X-OnePlay-Account-Error'))) {
                         // MSAL lost the account. Keep this share's last permission state and cached tracks.
                         log(`share probe requires reconnect (${durationMs}ms, status=401)`);
                         return { share, status: 'failed' };
                     }
                     if (r.status === 401 || r.status === 403 || r.status === 404) {
+                        if (applyAccess && !await applyAccess(r, false, () => stillConnected(share))) return {share, status: 'skipped'};
                         shares.setDeniedState(share.rootKey, deniedReasonFromStatus(r.status));
                         log(`share probe denied: ${share.name} (${durationMs}ms, status=${r.status})`);
                         return { share, status: 'denied' };
@@ -521,12 +522,16 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
                 }
                 const item = await readGraphJson(r, 'share probe');
                 if (!stillConnected(share)) return { share, status: 'skipped' };
+                // Missing/malformed metadata is not a permission result. A verified response
+                // for this exact item can establish that it is no longer a folder.
+                if (native && item?.id !== share.rootItemId) return {share, status: 'failed'};
+                if (applyAccess && !await applyAccess(r, !!item?.folder, () => stillConnected(share))) return {share, status: 'skipped'};
                 if (!item?.folder) {
                     shares.setDeniedState(share.rootKey, 'Shared folder is no longer accessible');
                     return { share, status: 'denied' };
                 }
                 shares.setDeniedState(share.rootKey, undefined);
-                deps.onShareAccessConfirmed?.(share.rootKey);
+                if (native) deps.onPlaybackRootsChange?.();
                 log(`share probe ok: ${share.name} (${durationMs}ms)`);
                 return { share, status: 'ok', driveItem: item };
             } catch (e) {

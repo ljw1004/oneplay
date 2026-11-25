@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 
 /** Reuse the real account cache and JS sync controller with a deterministic native reply handler.
  * The first details request disagrees with the drive admitted by Swift. On the next refresh an
- * account-wide 401 and a share-specific 403 arrive during the same set of probes. */
+ * account-wide 401 and two share-specific 403s arrive together. One 403 belongs to a retired grant. */
 async function checkNativeAccountIsolation(page) {
     const result = await page.evaluate(async () => {
         const { createNativeLibrary } = await import('./dist/native-library.js');
@@ -11,21 +11,29 @@ async function checkNativeAccountIsolation(page) {
         const { dbGet } = await import('./dist/db.js');
         let detailsDrive = 'wrong-drive';
         const calls = [];
+        let accessRevision = 0;
         const native = createNativeLibrary({ async postMessage(m) {
             if (m.op === 'state') return { driveID: 'fixture-drive', evidence: 'no-evidence' };
+            if (m.op === 'playback') {
+                const staleProof = m.proof === 'retired-before-commit';
+                const applied = m.action === 'access' && m.subscription === 'fixture' && m.base === accessRevision && !staleProof;
+                if (applied) accessRevision++;
+                return {subscription: 'fixture', applied, staleProof, snapshot: {accessRevision}};
+            }
             calls.push(m.url);
             const reply = (status, value, headers = {}) => ({
                 status, headers, statusText: '', body: value === undefined ? '' : btoa(JSON.stringify(value)),
             });
             if (m.url.includes('/me/drive?')) return reply(200, { id: detailsDrive });
             if (m.url.includes('/items/available')) return reply(401, undefined, { 'X-OnePlay-Account-Error': 'interactionRequired' });
-            if (m.url.includes('/items/revoked')) return reply(403);
+            if (m.url.includes('/items/renewing')) return reply(403, undefined, {'X-OnePlay-Account-Proof':'retired-before-commit'});
+            if (m.url.includes('/items/revoked')) return reply(403, undefined, {'X-OnePlay-Account-Proof':'verified'});
             return reply(404);
         } });
         await native.loadAccountState('state');
         const shares = createShares({
             authFetch: native.fetch, dbPut: async () => {},
-            dbGet: async () => ({ shares: ['available', 'revoked'].map(id => ({
+            dbGet: async () => ({ shares: ['available', 'renewing', 'revoked'].map(id => ({
                 id, shareId: id, name: id, rootKey: 'share:' + id, rootItemId: id, driveId: 'shared',
             })) }),
         }, () => {});

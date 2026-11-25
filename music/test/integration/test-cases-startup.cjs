@@ -14,6 +14,75 @@ module.exports = {
         assert(await page.locator(".startup-error").isVisible(), "Late indexing replaced Reload");
     },
 
+    /** A cold launch upgrades both old stores before an edit can reuse a playlist row. */
+    async "startup: browser bookmarks follow shifted rows and reject removed recordings"(page) {
+        await page.route(URL + "seed-bookmarks", r => r.fulfill({contentType: "text/html", body: "<title>Seed</title>"}));
+        await page.route(URL + "bookmark-fixture.wav", r => r.fulfill({contentType: "audio/wav", body: silentWav()}));
+        await page.goto(URL + "seed-bookmarks");
+        await page.evaluate(async () => {
+            const {dbPut, audioPut} = await import("./dist/db.js");
+            const blob = await (await fetch("bookmark-fixture.wav")).blob();
+            for (const id of ["A", "B", "C"]) await audioPut("primary:" + id, blob);
+            const files = ["A", "B", "C"].map(itemId => ({driveId: "primary", itemId,
+                path: [itemId + ".mp3"], isFolder: false}));
+            await dbPut("index:primary", {kind: "MusicData", count: 3, folder: {id: "p",
+                children: Object.fromEntries(files.map(f => [f.path[0], {id: f.itemId}]))}});
+            await dbPut("favorites", {version: 1, updatedAt: 1, favorites: ["global", "private", "disabled"].map(id =>
+                ({kind: "playlist", id, name: id, members: [...files], offlinePin: {paused: true}, hasPrivatePlayback: id === "private"}))});
+            await dbPut("playback:private", {trackPath: ["OnePlay Music", "fav:private", "m:1"], currentTime: 13.5});
+            await dbPut("playback:disabled", {trackPath: ["OnePlay Music", "fav:disabled", "m:2"], currentTime: 6});
+            localStorage.account_info = JSON.stringify({driveId: "primary", displayName: "OneDrive"});
+            const folder = ["OnePlay Music", "fav:global"];
+            localStorage.oneplay_music_playback = JSON.stringify({folder, track: [...folder, "m:1"], mode: "all"});
+            localStorage.oneplay_music_time = "7.25";
+        });
+        await page.addInitScript(() => Object.defineProperty(navigator, "onLine", {get: () => false}));
+        await page.goto(URL);
+        await page.waitForFunction(() => JSON.parse(localStorage.oneplay_music_playback)?.key
+            && JSON.parse(localStorage.getItem("oneplay_music_fav:private"))?.key
+            && JSON.parse(localStorage.getItem("oneplay_music_fav:disabled"))?.key);
+        const before = await page.evaluate(() => [JSON.parse(localStorage.oneplay_music_playback),
+            JSON.parse(localStorage.getItem("oneplay_music_fav:private")), JSON.parse(localStorage.oneplay_music_time)]);
+        assert(before[1].time === 13.5 && before[2].generation === before[0].generation && before[2].time === 7.25,
+            "Legacy times must survive migration into matched checkpoints");
+        // Simulate a library edit while closed, with no opportunity to rewrite the active bookmark.
+        await page.goto(URL + "seed-bookmarks");
+        await page.evaluate(async () => {
+            const {dbGet, dbPut} = await import("./dist/db.js");
+            const data = await dbGet("favorites");
+            for (const fav of data.favorites) fav.members.shift();
+            await dbPut("favorites", data);
+        });
+        await page.goto(URL);
+        await page.waitForFunction(() => window._testPlayback?.getInfo()?.track?.at(-1) === "m:0");
+        const shifted = await page.evaluate(() => JSON.parse(localStorage.oneplay_music_playback));
+        assert(shifted.key === before[0].key && shifted.track.at(-1) === "m:0", "B must move from row 1 to row 0");
+        const playPrivate = async () => {
+            await page.evaluate(() => window._testTree.setSelectedPath(["OnePlay Music", "fav:private"]));
+            await page.locator("#breadcrumbs .selected .play-btn").click();
+            await page.waitForFunction(() => !document.querySelector("audio").paused && document.querySelector("audio").currentTime > 0);
+        };
+        await playPrivate();
+        let position = await page.evaluate(() => [window._testPlayback.getInfo()?.track.at(-1), document.querySelector("audio").currentTime]);
+        assert(position[0] === "m:0" && position[1] >= 13 && position[1] < 16, "Private Play must resume B at its new row");
+
+        await page.goto(URL + "seed-bookmarks");
+        await page.evaluate(async () => {
+            const {dbGet, dbPut} = await import("./dist/db.js");
+            const data = await dbGet("favorites");
+            for (const fav of data.favorites) fav.members.shift();
+            await dbPut("favorites", data);
+        });
+        await page.evaluate(saved => { localStorage.oneplay_music_playback = JSON.stringify(saved); }, shifted);
+        await page.goto(URL);
+        await page.locator("#tree-container:visible").waitFor();
+        await page.waitForFunction(() => window._testPlayback && !localStorage.getItem("oneplay_music_playback"));
+        assert(!await page.evaluate(() => window._testPlayback.getInfo()), "C must never inherit B's position");
+        await playPrivate();
+        position = await page.evaluate(() => document.querySelector("audio").currentTime);
+        assert(position < 3, "A missing private occurrence must start the first playable track at zero");
+    },
+
     /** All cached roots participate in the first validation of a restored shared-folder path. */
     async "startup: offline share restores folder and scroll"(page) {
         await page.route(URL + "seed-share", r => r.fulfill({ contentType: "text/html", body: "<title>Seed</title>" }));

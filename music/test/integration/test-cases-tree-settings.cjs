@@ -604,6 +604,10 @@ module.exports = {
 
     /** OneDrive auth button label follows evidence state (Sign out vs Reconnect). */
     async "settings: auth button label follows evidence state"(page) {
+        // Keep a late startup response from changing the evidence under this controlled UI case.
+        await page.route("https://graph.microsoft.com/**", () => {});
+        await page.reload({waitUntil: "domcontentloaded"});
+        await page.waitForFunction(() => !!window._testPlayback);
         await page.evaluate(() => window._testAuth.transition("evidence:signed-in"));
         await openSettingsPage(page);
         const signedInLabel = await page.locator("#settings-container .settings-section", { hasText: "OneDrive" })
@@ -872,6 +876,12 @@ module.exports = {
     /** Synthetic denied-share state shows warning icon and denied reason row text. */
     async "settings: denied share warning and reason are visible"(page) {
         await page.evaluate(() => {
+            // The menu counts currently connected roots. A remembered disconnect has no visible row.
+            const shares = window._testShares;
+            const original = shares.getAll;
+            shares.getAll = () => [...original(), {id: "s-denied", rootKey: "share:test-denied",
+                name: "Denied Library", shareId: "test-denied", driveId: "shared", rootItemId: "folder"}];
+            window.restoreConnectedShares = () => { shares.getAll = original; };
             window._testShares.setDeniedState("share:test-denied", "Permission denied (403)");
             window._testSettingsShareRows = [{
                 id: "s-denied",
@@ -894,6 +904,7 @@ module.exports = {
         await closeSettingsPage(page);
 
         await page.evaluate(() => {
+            window.restoreConnectedShares();
             window._testShares.setDeniedState("share:test-denied", undefined);
             delete window._testSettingsShareRows;
         });

@@ -39,13 +39,28 @@ export async function dbPut(key: string, value: unknown): Promise<void> {
     const db = await dbOpen();
     try {
         await new Promise<void>((resolve, reject) => {
-            const req = db.transaction('data', 'readwrite').objectStore('data').put(value, key);
-            req.onsuccess = () => resolve();
-            req.onerror = () => reject(req.error);
+            const transaction = db.transaction('data', 'readwrite');
+            // A successful put can still roll back. Callers may acknowledge a library edit on return.
+            transaction.oncomplete = () => resolve();
+            transaction.onabort = () => reject(transaction.error ?? new Error('IndexedDB write aborted'));
+            transaction.objectStore('data').put(value, key);
         });
     } finally {
         db.close();
     }
+}
+
+/** Discover legacy private positions without reading every favorite or loading unrelated index data. */
+export async function dbKeysWithPrefix(prefix: string): Promise<string[]> {
+    const db = await dbOpen();
+    try {
+        return await new Promise<string[]>((resolve, reject) => {
+            const store = db.transaction('data', 'readonly').objectStore('data');
+            const request = store.getAllKeys(IDBKeyRange.bound(prefix, prefix + '\uffff'));
+            request.onsuccess = () => resolve(request.result.filter((key): key is string => typeof key === 'string'));
+            request.onerror = () => reject(request.error);
+        });
+    } finally { db.close(); }
 }
 
 /** Retrieves the value for the given key, or undefined if absent. */

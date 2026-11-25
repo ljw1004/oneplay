@@ -12,6 +12,7 @@ import WebKit
     private var account: NativeAccount?
     private(set) var player: NativePlayback?
     private var playbackSequence = 0
+    private var subscription = UUID().uuidString
     /// Only one document can stage a queue. Every append checks its build ID and offset.
     private var selectionIntent: String?
     private var staged: (id: String, count: Int, tracks: [IndexedTrack])?
@@ -101,13 +102,17 @@ import WebKit
     }
 
     /// Replies and pushed transitions share one sequence so a delayed command reply cannot rewind the drawer.
-    private func playbackSample(_ player: NativePlayback, _ account: NativeAccount) -> [String: Any] {
+    private func playbackSample(_ player: NativePlayback, _ account: NativeAccount, includeDenied: Bool = false) -> [String: Any] {
         var lookups: [IndexedTrack]?
         #if DEBUG
         if showingAudioRanges { lookups = Array(account.mediaRequests.values) }
         #endif
         playbackSequence += 1
-        return ["sequence": playbackSequence, "snapshot": player.snapshot(lookups: lookups)]
+        var snapshot = player.snapshot(lookups: lookups, includeDenied: includeDenied)
+        let denied = snapshot.removeValue(forKey: "denied")
+        var reply: [String: Any] = ["sequence": playbackSequence, "subscription": subscription, "snapshot": snapshot]
+        reply["denied"] = denied
+        return reply
     }
 
     private func showUnavailable() {
@@ -137,6 +142,7 @@ import WebKit
 
     func loadPage() {
         guard webView == nil, let account, !account.cleanupPending else { return }
+        subscription = UUID().uuidString
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = store
         configuration.setURLSchemeHandler(shell, forURLScheme: "oneplay")
@@ -247,8 +253,10 @@ import WebKit
                 case "playback":
                     guard args["version"] as? Int == 1, let player, account.snapshot["driveID"] is String,
                           let action = args["action"] as? String else { throw NativeAccountError.invalidRequest }
+                    var applied: Bool?
+                    var staleProof = false
                     switch action {
-                    case "snapshot": break
+                    case "snapshot", "readAccess": break
                     case "importSpot":
                         guard let favorite = args["favorite"] as? String, let value = args["spot"] as? [String: Any] else { throw NativeAccountError.invalidRequest }
                         let spot = try JSONDecoder().decode(FavoriteSpot.self, from: JSONSerialization.data(withJSONObject: value))
@@ -265,12 +273,17 @@ import WebKit
                     case "fence":
                         guard let session = args["session"] as? String, let revision = args["revision"] as? Int else { throw NativeAccountError.invalidRequest }
                         player.fence(session: session, revision: revision)
-                    case "allow":
-                        guard let root = args["root"] as? String else { throw NativeAccountError.invalidRequest }
-                        player.updateAccess(connected: nil, denied: [], allowed: [root])
                     case "access":
-                        guard let denied = args["denied"] as? [String] else { throw NativeAccountError.invalidRequest }
-                        player.updateAccess(connected: (args["connected"] as? [String]).map(Set.init), denied: Set(denied))
+                        guard let expected = args["subscription"] as? String, let base = args["base"] as? Int,
+                              let denied = args["denied"] as? [String], base >= 0 else { throw NativeAccountError.invalidRequest }
+                        let allowed = args["allowed"] as? [String] ?? []
+                        let proof = args["proof"] as? String
+                        staleProof = (!denied.isEmpty || !allowed.isEmpty) && (proof == nil || proof != account.currentShareProof)
+                        applied = expected == subscription && !staleProof
+                            ? try player.updateAccess(base: base, connected: (args["connected"] as? [String]).map(Set.init),
+                                                      denied: Set(denied), allowed: Set(allowed),
+                                                      disconnected: Set(args["disconnected"] as? [String] ?? []))
+                            : false
                     case "timer":
                         guard let setting = args["timer"] as? String else { throw NativeAccountError.invalidRequest }
                         try player.changeTimer(setting)
@@ -326,10 +339,12 @@ import WebKit
                     #if DEBUG
                     showingAudioRanges = args["debugRanges"] as? Bool == true
                     #endif
-                    if ["start", "revise", "fence", "seek", "skip", "pause", "cycleMode", "next", "previous", "allow", "access", "timer", "play"].contains(action) {
+                    if ["start", "revise", "fence", "seek", "skip", "pause", "cycleMode", "next", "previous", "access", "timer", "play"].contains(action) {
                         try await player.waitForCheckpointWrites()
                     }
-                    var sample = playbackSample(player, account)
+                    var sample = playbackSample(player, account, includeDenied: action == "readAccess")
+                    if let applied { sample["applied"] = applied }
+                    if staleProof { sample["staleProof"] = true }
                     if action == "intent" { sample["base"] = player.sessionID }
                     reply = sample
                 case "request":

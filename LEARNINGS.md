@@ -27,6 +27,8 @@
 
 ## Architecture and refactorability
 
+- When another component acts on a persisted edit, acknowledge IndexedDB writes on transaction completion. An individual request can succeed before the transaction aborts. Compute each overlapping edit from the last committed model so a failed change cannot leak into a later full-document write.
+
 - **Bias toward purity from the first implementation.** Pure functional-style input→output logic is far cheaper to move, test, and recombine later than mixed logic/effects.
 - **Separate decision logic from effects early.** Keep computation in pure helpers/reducers; keep I/O, storage, DOM, and network writes in thin orchestration layers.
 - **Design modules around effect boundaries.** A module should either decide what should happen (pure) or perform side effects (impure), not both.

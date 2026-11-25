@@ -21,6 +21,13 @@ interface NativeResponse {
     readonly chunked?: boolean;
 }
 
+interface AccessReply {
+    readonly subscription: string;
+    readonly snapshot: {readonly accessRevision: number};
+    readonly applied?: boolean;
+    readonly staleProof?: boolean;
+}
+
 /** One acknowledged chunk at a time keeps large index bytes out of control messages.
  * Response decodes the concatenated bytes, so split UTF-8 codepoints survive intact. */
 export function createNativeLibrary(handler: ReplyHandler) {
@@ -87,6 +94,33 @@ export function createNativeLibrary(handler: ReplyHandler) {
         }
     }
 
+    // This queue belongs to one admitted document. Swift persists the revision and rejects an older
+    // subscription even if its delayed callback presents the current revision after reconnection.
+    let access: AccessReply | undefined;
+    let writes: Promise<unknown> = Promise.resolve();
+    let membership: {signature: string; completion: Promise<boolean>} | undefined;
+    const probes = new Map<string, symbol>();
+    const retryDenials = new Map<string, () => Promise<boolean>>();
+    function commitAccess(args: Record<string, unknown>, current: () => boolean): Promise<boolean> {
+        const commit = writes.then(async () => {
+            if (!current()) return false;
+            access ??= await library.playback('snapshot') as AccessReply;
+            while (current()) {
+                const {subscription, snapshot: {accessRevision: base}} = access;
+                const reply = await library.playback('access', {subscription, base, denied: [], ...args}) as AccessReply;
+                if (reply.subscription !== subscription) throw new Error('Playback document was replaced');
+                access = reply;
+                if (reply.applied) return true;
+                if (reply.staleProof) return false;
+                if (!(reply.snapshot.accessRevision > base)) throw new Error('Playback access revision was rejected');
+                // A concurrent writer won the base. Recheck this proposal's owner before retrying.
+            }
+            return false;
+        });
+        writes = commit.catch(() => {}); // Each caller receives its own error. Later proposals still run.
+        return commit;
+    }
+
     const library = {
         get state() { return state; },
         getEvidence: () => state.evidence,
@@ -109,6 +143,70 @@ export function createNativeLibrary(handler: ReplyHandler) {
         fetch: request,
         followContent: (url: string, signal?: AbortSignal) => request(url, false, { signal, timeoutMs: 30000 }, true),
         playback: (action: string, args: Record<string, unknown> = {}) => post({op: 'playback', version: 1, action, ...args}),
+        /** Read the last durable decisions before rendering cached shares. This read also
+         * binds the document's first write to the observed account revision. */
+        async readPlaybackDenials(): Promise<readonly string[]> {
+            if (!state.driveID) return [];
+            const read = writes.then(async () => {
+                const reply = await library.playback('readAccess') as AccessReply & {denied: string[]};
+                if (access && reply.subscription !== access.subscription) throw new Error('Playback document was replaced');
+                access = reply;
+                return reply.denied;
+            });
+            writes = read.catch(() => {});
+            return read;
+        },
+        /** Only a completed membership load or an explicit edit establishes the connected roots. */
+        async syncPlaybackMembership(connected: readonly string[], disconnected?: string): Promise<void> {
+            const signature = JSON.stringify(connected);
+            if (!disconnected && membership?.signature === signature) { await membership.completion; return; }
+            // A subsequent reconnect still needs a fresh verified probe. Even if membership
+            // changes during the write, commit the explicit removal before its successor.
+            const completion = commitAccess({connected, ...(disconnected && {disconnected: [disconnected]})},
+                () => !!disconnected || membership?.signature === signature);
+            membership = {signature, completion};
+            try {
+                if (await completion && disconnected) retryDenials.delete(disconnected);
+            }
+            catch (error) { if (membership?.completion === completion) membership = undefined; throw error; }
+        },
+        /** Capture the request at issue time. Reconnection changes the share record ID, and a
+         * newer probe of that same record supersedes its predecessor before either result arrives. */
+        beginSourceProbe(root: string) {
+            const ticket = Symbol();
+            probes.set(root, ticket);
+            return async (response: Response, allowed: boolean, connected: () => boolean): Promise<boolean> => {
+                const proof = response.headers.get('X-OnePlay-Account-Proof');
+                if (!proof || response.headers.has('X-OnePlay-Account-Error')) return false;
+                const current = () => probes.get(root) === ticket && connected();
+                const commit = () => commitAccess({[allowed ? 'allowed' : 'denied']: [root], proof}, current);
+                try {
+                    const applied = await commit();
+                    if (applied) retryDenials.delete(root);
+                    return applied && current();
+                } catch (error) {
+                    if (!allowed && current()) retryDenials.set(root, async () => {
+                        // A newer probe supersedes this one. Until it supplies an actual verdict,
+                        // the last confirmed denial is still unresolved for this source.
+                        if (connected() && !current()) throw new Error('Waiting for confirmed playback access');
+                        return commit();
+                    });
+                    throw error;
+                }
+            };
+        },
+        /** Any in-flight confirmed denial or disconnect precedes admission of a new queue. */
+        async waitForPlaybackAccess(inQueue: (root: string) => boolean = () => true): Promise<void> {
+            await writes;
+            // A successful update for some other root cannot acknowledge this denied source.
+            // Recheck the captured proof on retry; Swift rejects a grant invalidated in between.
+            for (const [root, retry] of retryDenials) {
+                if (!inQueue(root)) continue;
+                // A retired account proof has no authority to change Swift's new policy.
+                await retry();
+                if (retryDenials.get(root) === retry) retryDenials.delete(root);
+            }
+        },
         playIndexed: (tracks: {driveId: string; itemId: string}[], nearEnd: boolean, forceRefresh: boolean, delaySeconds: number) =>
             post({ op: 'playIndexed', tracks, nearEnd, forceRefresh, delaySeconds }),
         playLocal: (nearEnd: boolean) => post({ op: 'playLocal', nearEnd }),

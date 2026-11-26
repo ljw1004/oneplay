@@ -38,7 +38,7 @@ private struct PinManifest: Codable, Equatable {
     private var tickets = [String: Int]()
     private var missing = Set<String>()
     private var eligible = Set<String>()
-    private var sizes = [String: Int]()
+    private(set) var sizes = [String: Int]()
     private var leased = [String: Int]()
     var playerHolds: (String) -> Bool = { _ in false }
     private var opening: Task<(PinManifest, [String: Int]), Error>?

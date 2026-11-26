@@ -150,7 +150,7 @@ import WebKit
         if showingAudioRanges { lookups = Array(account.mediaRequests.values) }
         #endif
         playbackSequence += 1
-        var snapshot = player.snapshot(lookups: lookups, includeDenied: includeDenied)
+        var snapshot = player.snapshot(lookups: lookups, pinSizes: lookups == nil ? [:] : pins.sizes, includeDenied: includeDenied)
         let denied = snapshot.removeValue(forKey: "denied")
         var reply: [String: Any] = ["sequence": playbackSequence, "subscription": subscription, "snapshot": snapshot]
         reply["denied"] = denied

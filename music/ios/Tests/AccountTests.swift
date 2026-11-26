@@ -112,6 +112,7 @@ private final class TestAudioCDN: URLProtocol {
         var page = try await readyPage(in: controller)
         _ = try await page.callAsyncJavaScript("""
             const {dbPut} = await import('./dist/db.js');
+            localStorage.setItem('oneplay_music_debug_enabled', '1');
             localStorage.setItem('account_info', JSON.stringify({driveId:'library',displayName:'Listener'}));
             await dbPut('index:library',{kind:'MusicData',count:1,size:20,folder:{id:'album',children:{'First.mp3':{id:'a'}}}});
             await dbPut('favorites',{updatedAt:1,favorites:[{kind:'playlist',id:'reader',name:'Offline album',members:[
@@ -163,6 +164,20 @@ private final class TestAudioCDN: URLProtocol {
         let play = ContinuousClock.now + .seconds(5)
         while controller.player?.snapshot["state"] as? String != "playing", .now < play { try await Task.sleep(for: .milliseconds(25)) }
         XCTAssertEqual(controller.player?.snapshot["state"] as? String, "playing", controller.player?.status ?? "")
+        _ = try await page.evaluateJavaScript("document.querySelector('.footer-gripper').click()")
+        let rail = "document.querySelector('.audio-ranges > :nth-child(2) .audio-range-rail.offline')"
+        let blue = ContinuousClock.now + .seconds(4)
+        while try await page.evaluateJavaScript("!!" + rail) as? Bool != true, .now < blue {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let color = try await page.evaluateJavaScript("getComputedStyle(" + rail + ").backgroundColor") as? String
+        XCTAssertEqual(color, "rgb(43, 101, 148)")
+        let label = try await page.evaluateJavaScript(rail + ".getAttribute('aria-label')") as? String
+        XCTAssertTrue(label?.contains("\(size) bytes available offline") == true)
+        let ranges = XCTAttachment(image: try await page.takeSnapshot(configuration: nil))
+        ranges.name = "Expanded player with complete offline file"
+        ranges.lifetime = .keepAlways
+        add(ranges)
     }
 
     func testOfflineColdStartAndBothInterruptedCleanupPoints() async throws {

@@ -147,6 +147,7 @@ to{transform:rotate(360deg);}
 .audio-ranges .empty{opacity:.4;}
 .audio-range-rail{position:relative;background:#101310;border-radius:2px;height:9px;margin-top:3px;}
 .audio-range-rail i{position:absolute;top:0;bottom:0;min-width:1px;}
+.audio-range-rail.offline{background:#2b6594;}
 .audio-range-rail .cached{background:#277242;}
 .audio-range-rail .fetching{background:#eb503f80;box-shadow:inset 0 0 0 1px #ff6655,0 0 4px #f54d3d;animation:range-pulse .8s ease-in-out infinite alternate;}
 .audio-range-rail .marker{width:2px;background:white;transform:translateX(-1px);}

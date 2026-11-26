@@ -8,6 +8,7 @@ import type { PlaybackMode, PlaybackInfo } from './playback.js';
 interface RangeBar {
     readonly name?: string;
     readonly size?: number;
+    readonly offlineBytes?: number;
     readonly cached?: [number, number][];
     readonly fetching?: [number, number][];
     readonly lookup?: boolean;
@@ -406,10 +407,11 @@ function paintRanges(strip: HTMLElement, sample: NativeSample): void {
         slot.title = bar.name ? role + ' · ' + bar.name : 'No ' + role.toLowerCase() + ' track';
         if (!bar.name) { slot.className = 'empty'; return slot; }
         const bytes = bar.cached?.reduce((total, [start, end]) => total + end - start, 0) ?? 0;
+        rail.classList.toggle('offline', !!bar.offlineBytes);
         rail.setAttribute('role', 'img');
-        rail.setAttribute('aria-label', [slot.title, `${bytes} bytes cached`, bar.lookup ? 'Graph lookup' : '',
+        rail.setAttribute('aria-label', [slot.title, `${bytes} bytes cached`, bar.offlineBytes && `${bar.offlineBytes} bytes available offline`, bar.lookup ? 'Graph lookup' : '',
             ...(bar.fetching ?? []).map(([start, end]) => `fetching bytes ${start} through ${end - 1}`)].filter(Boolean).join(', '));
-        for (const [kind, ranges] of [['cached', bar.cached], ['fetching', bar.fetching]] as const) {
+        for (const [kind, ranges] of [['cached', bar.offlineBytes ? undefined : bar.cached], ['fetching', bar.fetching]] as const) {
             for (const [start, end] of ranges ?? []) {
                 const segment = document.createElement('i');
                 segment.className = kind;

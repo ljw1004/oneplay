@@ -361,9 +361,9 @@ final class NativePlayback: @unchecked Sendable {
     /// A fresh document samples the running node without restarting the decoder.
     var snapshot: [String: Any] { snapshot(lookups: nil) }
 
-    func snapshot(lookups: [IndexedTrack]?, includeDenied: Bool = false) -> [String: Any] {
+    func snapshot(lookups: [IndexedTrack]?, pinSizes: [String: Int] = [:], includeDenied: Bool = false) -> [String: Any] {
         lock.withLock {
-            var result = active?.snapshot(lookups: lookups) ?? [:]
+            var result = active?.snapshot(lookups: lookups, pinSizes: pinSizes) ?? [:]
             result["accessRevision"] = accessRevision
             if includeDenied { result["denied"] = Array(deniedRoots) }
             result["hasHistory"] = hasHistory
@@ -772,7 +772,7 @@ private final class PlaybackRun: @unchecked Sendable {
         }
     }
 
-    func snapshot(lookups: [IndexedTrack]?) -> [String: Any] {
+    func snapshot(lookups: [IndexedTrack]?, pinSizes: [String: Int]) -> [String: Any] {
         lock.withLock {
             expireIfDue()
             let rendered = renderedFrame()
@@ -790,7 +790,7 @@ private final class PlaybackRun: @unchecked Sendable {
             result["sourceRootKey"] = track.sourceRootKey
             if entry.cursor.held != nil { result.removeValue(forKey: "path") }
             #if DEBUG
-            if let lookups { result["bars"] = debugBars(at: entry, lookups: lookups) }
+            if let lookups { result["bars"] = debugBars(at: entry, lookups: lookups, pinSizes: pinSizes) }
             #endif
             return result
         }
@@ -825,11 +825,13 @@ private final class PlaybackRun: @unchecked Sendable {
         }
     }
     #if DEBUG
-    private func debugBars(at entry: Anchor, lookups: [IndexedTrack]) -> [[String: Any]] {
+    private func debugBars(at entry: Anchor, lookups: [IndexedTrack], pinSizes: [String: Int]) -> [[String: Any]] {
         return [entry.cursor.neighbor(-1, mode: mode)?.index, entry.index, nextPolicy == .fenced ? nil : entry.next?.index].map { index in
             guard let ordinal = index, let track = tracks[ordinal].indexed else { return [:] }
             let file = sources.last { $0.occurrence == ordinal+1 }?.file
             var bar = pool.debugRanges(drive: track.driveId, item: track.itemId, admitted: file)
+            // An active decoder can still read the whole file after the last favorite unpins it.
+            bar["offlineBytes"] = pinLeases[track.fileKey].map { Int($0.size) } ?? pinSizes[track.fileKey]
             bar["name"] = track.title ?? track.path?.last
             bar["lookup"] = lookups.contains { $0.driveId == track.driveId && $0.itemId == track.itemId }
             return bar

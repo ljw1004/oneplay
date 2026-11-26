@@ -1,5 +1,13 @@
 # OnePlay TODO
 
+## Show OneDrive’s contents at home in Music
+
+When the listener has only their OneDrive account, with no shares or favorites, show its folders and tracks directly under **OnePlay**. Tapping **OnePlay** returns to that list, and breadcrumbs read **OnePlay › Jazz**. This is a display change only. Folders marked for offline use still qualify.
+
+Show one spinner after **OnePlay** whenever either breadcrumb would show one. Otherwise, show OneDrive’s dotted download arrow whenever it would normally appear.
+
+When the first share or favorite is added, show the new top-level list if the listener is at home. If they are inside a folder, keep it open and expand the trail to **OnePlay › OneDrive › Jazz**. Removing the last share or favorite folds the trail back when OneDrive is again the only entry.
+
 ## Google Drive support for Music
 
 **Decision pending.** Defer implementation until we have guidance on whether Google would approve public use of `drive.readonly` for OnePlay. The feature would let a listener choose an existing Drive folder, play its music, and pin folders or playlists for offline listening. The narrower `drive.file` scope does not grant recursive access to existing tracks when the user selects their parent folder. Google lists local file sync as an eligible use for restricted scopes. The uncertainty is whether optional offline sync qualifies when music playback is the app’s primary purpose. [Drive scope policy](https://developers.google.com/workspace/drive/api/guides/api-specific-auth)

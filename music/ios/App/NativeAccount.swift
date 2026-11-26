@@ -660,7 +660,7 @@ enum MediaLookup: Sendable {
                   let fields = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   fields["id"] as? String == itemID,
                   let tag = fields["eTag"] as? String, !tag.isEmpty,
-                  let size = fields["size"] as? Int64, size > 0,
+                  let size = fields["size"] as? Int64, size >= 0,
                   let raw = fields["@microsoft.graph.downloadUrl"] as? String, let location = URL(string: raw),
                   GraphTransport.isHTTPS(location) else { throw NativeAccountError.unavailable }
             let media = MediaLocation(url: location, etag: tag, size: size)

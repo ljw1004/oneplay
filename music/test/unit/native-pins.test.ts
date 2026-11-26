@@ -17,7 +17,7 @@ it('updates 500 pinned tracks in a 30k library without walking favorites again a
         }}}]]);
     const favorite: Favorite = {id: 'f', name: 'Music', kind: 'shortcut', hasPrivatePlayback: false,
         target: {driveId:'d', sourceRootKey:'share:s', itemId:'folder', path:['Album'], isFolder:true}, offlinePin:{paused:false}};
-    const owners: {complete: boolean; sources: Record<string,string[]>}[][] = [];
+    const owners: {complete: boolean; sources: Record<string, Record<string, string>>}[][] = [];
     let fragments = "";
     const api = createNativeLibrary({async postMessage(message) {
         if (message.action === 'ownerPart') {

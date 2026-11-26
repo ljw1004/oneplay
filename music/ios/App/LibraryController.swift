@@ -236,7 +236,7 @@ import WebKit
         switch action {
         case "snapshot":
             let reply = pins.snapshot(after: args["after"] as? Int)
-            guard let files = reply["files"] as? [String: Int], let unavailable = reply["unavailable"] as? [String],
+            guard let files = reply["files"] as? [String: Int], let unavailable = reply["unavailable"] as? [String: String],
                   files.count + unavailable.count > 512, let revision = reply["revision"] as? Int else { return reply }
             let data = try JSONSerialization.data(withJSONObject: reply)
             inventoryParts = (revision, data)
@@ -262,7 +262,8 @@ import WebKit
                 try pins.apply(owners: rows)
                 pinRevision = revision
             }
-        default: try pins.control(action, quota: args["quota"] as? Int)
+        case "quota": try pins.setQuota(args["quota"] as? Int)
+        default: throw NativeAccountError.invalidRequest
         }
         return true
     }

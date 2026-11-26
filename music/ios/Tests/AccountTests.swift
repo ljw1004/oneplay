@@ -115,7 +115,9 @@ private final class TestAudioCDN: URLProtocol {
             }
             if let id = req.url?.lastPathComponent, ["a", "b", "c"].contains(id) {
                 if id == "c" && holdShareMedia { await withCheckedContinuation { releaseShareMedia = $0 } }
-                let media: [String: Any] = ["id": id, "size": size, "eTag": "v", "@microsoft.graph.downloadUrl": "https://pin.test/tone"]
+                let unreadable = id == "b"
+                let media: [String: Any] = ["id": id, "size": unreadable ? 3 : size, "eTag": "v",
+                    "@microsoft.graph.downloadUrl": unreadable ? "https://pin.test/not-audio" : "https://pin.test/tone"]
                 return try response(req, data: JSONSerialization.data(withJSONObject: media))
             }
             return try response(req, status: 404, data: Data())
@@ -224,8 +226,25 @@ private final class TestAudioCDN: URLProtocol {
         }
         let drive = ["OnePlay Music","library"]
         try await confirmFolderAction(parent: drive + ["Books"], child: "Dune", action: "Make available offline")
+        _ = try await page.callAsyncJavaScript("""
+            const row = [...document.querySelectorAll('#children .tree-row')].find(r => r.querySelector('.row-name').textContent === 'Dune');
+            row.dispatchEvent(new PointerEvent('pointerdown',{pointerType:'mouse',pointerId:1,isPrimary:true,button:2,bubbles:true}));
+            row.dispatchEvent(new MouseEvent('contextmenu',{button:2,bubbles:true,cancelable:true}));
+            document.querySelector('.action-dropdown button').click();
+            const modal = document.querySelector('.modal'), deadline = performance.now() + 8000;
+            while (!modal.querySelector('.offline-progress').textContent.includes('✓')) {
+                if (performance.now() > deadline) throw Error(modal.innerText);
+                await new Promise(resolve => setTimeout(resolve, 20));
+            }
+            if (modal.querySelector('.offline-warning').textContent) throw Error(modal.innerText);
+            """, arguments: [:], in: nil, contentWorld: .page)
+        let complete = XCTAttachment(image: try await page.takeSnapshot(configuration: nil))
+        complete.name = "Both indexed recordings available offline"
+        complete.lifetime = .keepAlways
+        add(complete)
+        _ = try await page.evaluateJavaScript("document.querySelector('.modal-close').click()")
         try await waitForFiles(["library:a", "library:b", "remote:c"])
-        XCTAssertTrue(FileManager.default.fileExists(atPath: storage.pinURL("library:b").path))
+        XCTAssertEqual(try Data(contentsOf: storage.pinURL("library:b", suffix: "mp3")), Data([1,2,3]))
         let partialCrumbs = try await page.callAsyncJavaScript("""
             return [...document.querySelectorAll('#breadcrumbs .offline-badge.partial')].map(badge => {
                 const dots = [...badge.querySelector('path').getAttribute('d').matchAll(/M([\\d.]+) ([\\d.]+)h0/g)]
@@ -249,7 +268,7 @@ private final class TestAudioCDN: URLProtocol {
         account.updateNetworkPath(offline: true, interfaces: [])
         try await confirmFolderAction(parent: drive, child: "Books", action: "Make unavailable offline")
         try await waitForFiles(["library:a", "remote:c"])
-        XCTAssertFalse(FileManager.default.fileExists(atPath: storage.pinURL("library:b").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storage.pinURL("library:b", suffix: "mp3").path))
 
         // This device still has the share and its pin, but has lost the cached listing.
         _ = try await page.callAsyncJavaScript("""
@@ -274,7 +293,7 @@ private final class TestAudioCDN: URLProtocol {
         XCTAssertEqual(saved?.sources, [:])
         XCTAssertEqual(saved?.retained, ["remote:c"])
         try await waitForFiles(["library:a", "remote:c"])
-        XCTAssertEqual(try Data(contentsOf: storage.pinURL("remote:c")), try Data(contentsOf: tone))
+        XCTAssertEqual(try Data(contentsOf: storage.pinURL("remote:c", suffix: "mp3")), try Data(contentsOf: tone))
         try await openDialog()
         let ready = ContinuousClock.now + .seconds(3)
         var progress = ""
@@ -362,8 +381,8 @@ private final class TestAudioCDN: URLProtocol {
         XCTAssertNotEqual(replacementIDs.last,"connection")
         try await waitForFiles(["library:a"])
         XCTAssertEqual(Set(try XCTUnwrap(storage.read(Owners.self,"pins")).owners.keys),["keep","reader"])
-        XCTAssertEqual(try Data(contentsOf:storage.pinURL("library:a")),try Data(contentsOf:tone))
-        XCTAssertFalse(FileManager.default.fileExists(atPath:storage.pinURL("remote:c").path))
+        XCTAssertEqual(try Data(contentsOf:storage.pinURL("library:a", suffix: "mp3")),try Data(contentsOf:tone))
+        XCTAssertFalse(FileManager.default.fileExists(atPath:storage.pinURL("remote:c", suffix: "mp3").path))
         // Remove the unrelated cross-device fixtures, leaving the playing playlist as
         // the sole native owner. Exercise its final removal through the visible dialog.
         graphOffline = true
@@ -399,7 +418,7 @@ private final class TestAudioCDN: URLProtocol {
         let lastOwners = try XCTUnwrap(storage.read(Owners.self,"pins")).owners
         XCTAssertTrue(lastOwners.isEmpty, "Final native owners: \(lastOwners)")
         XCTAssertTrue(controller.pins.completeKeys.isEmpty, "Completed files after dialog removal: \(controller.pins.completeKeys)")
-        let lastFile = storage.pinURL("library:a")
+        let lastFile = storage.pinURL("library:a", suffix: "mp3")
         XCTAssertTrue(player.holdsPin("library:a"))
         XCTAssertTrue(FileManager.default.fileExists(atPath:lastFile.path))
         let end = ContinuousClock.now + .seconds(16)
@@ -563,7 +582,7 @@ private final class TestAudioCDN: URLProtocol {
         XCTAssertEqual(controller.pins.completeKeys, ["library:song-0"])
         XCTAssertEqual(controller.pins.snapshot(after:nil)["total"] as? Int,size)
         let store = try XCTUnwrap(account.openPlaybackStore())
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath:store.pinDirectory.path),[PlaybackStore.pinName("library:song-0")])
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath:store.pinDirectory.path),[PlaybackStore.pinName("library:song-0") + ".mp3"])
         print("Bulk unpin 499/500: main-actor timer max \(mainGap); bundled JS ms \(cleanupMetrics)")
         account.updateNetworkPath(offline:true,interfaces:[])
         _ = try await page.callAsyncJavaScript("""

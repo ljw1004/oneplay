@@ -1,5 +1,4 @@
 import Foundation
-import AudioToolbox
 import OSLog
 
 /// One owner's last complete membership survives a cold launch with only part of the library loaded.
@@ -13,6 +12,8 @@ private struct PinManifest: Codable, Equatable {
     var binding = UUID()
     var quota = 1 << 30
     var owners = [String: PinOwner]()
+    // Background transfers may finish before the page republishes the index on relaunch.
+    var suffixes: [String:String]?
 }
 
 /// URLSession owns partial files. The account's audio directory contains only validated, atomically
@@ -41,14 +42,13 @@ private struct PinManifest: Codable, Equatable {
     private var leased = [String: Int]()
     private var cleanup: Task<Void,Never>?
     var playerHolds: (String) -> Bool = { _ in false }
-    private var opening: Task<(PinManifest, [String: Int]), Error>?
+    private var opening: Task<(PlaybackStore, PinManifest, [String: Int], [String: String]), Error>?
     private var accountGeneration = 0
     private var total = 0
     private var failures = [String: String]()
     private var retryCount = [String: Int]()
     private var delayed = [String: Task<Void, Never>]()
     private var renew = Set<String>()
-    private var lastError: String? { failures.count == missing.count ? failures.values.first : nil }
     private var attached = false
     private var evidence = "no-evidence"
     private var revision = 0
@@ -83,18 +83,20 @@ private struct PinManifest: Codable, Equatable {
         let task = opening ?? Task.detached(priority: .utility) { try Self.restore(store) }
         opening = task
         defer { if generation == accountGeneration { opening = nil } }
-        let (saved, inventory) = try await task.value
+        // All waiters adopt the first caller’s account store, which the player already bound.
+        let (bound, saved, inventory, extensions) = try await task.value
         guard generation == accountGeneration else { throw NativeAccountError.cancelled }
         guard storage == nil else { return }
-        storage = store
+        storage = bound
         manifest = saved
+        bound.localSuffixes.withLock { $0 = extensions }
         sizes = inventory
         tickets = try store.read([String: Int].self, "pin-transfers") ?? [:]
         total = sizes.values.reduce(0, +)
         try reconcile()
     }
 
-    nonisolated private static func restore(_ store: PlaybackStore) throws -> (PinManifest, [String: Int]) {
+    nonisolated private static func restore(_ store: PlaybackStore) throws -> (PlaybackStore, PinManifest, [String: Int], [String: String]) {
         var folder = store.pinDirectory
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true,
             attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication])
@@ -105,14 +107,15 @@ private struct PinManifest: Codable, Equatable {
         try store.save(saved, "pins")
         let retained = saved.owners.values.reduce(into: Set<String>()) { $0.formUnion($1.retained) }
         let names = Dictionary(uniqueKeysWithValues: retained.map { (PlaybackStore.pinName($0), $0) })
-        var inventory = [String: Int]()
+        var inventory = [String: Int](), extensions = [String: String]()
         for url in try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.fileSizeKey]) {
-            if let key = names[url.lastPathComponent], let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
-               size > 0, try PinReceipt.read(from: url)?.size == size {
+            if let key = names[url.deletingPathExtension().lastPathComponent], let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+               try PinReceipt.read(from: url)?.size == size {
                 inventory[key] = size
+                extensions[key] = url.pathExtension
             } else { try FileManager.default.removeItem(at: url) }
         }
-        return (saved, inventory)
+        return (store, saved, inventory, extensions)
     }
 
     /// Close admission synchronously with the sign-out marker, before WebKit retirement yields.
@@ -161,11 +164,17 @@ private struct PinManifest: Codable, Equatable {
         guard let storage else { throw NativeAccountError.unbound }
         var next = manifest
         next.owners.removeAll()
+        next.suffixes = [:]
         for row in rows {
             guard let id = row["id"] as? String, next.owners[id] == nil, let paused = row["paused"] as? Bool,
-                  let complete = row["complete"] as? Bool, let groups = row["sources"] as? [String: [String]]
+                  let complete = row["complete"] as? Bool, let groups = row["sources"] as? [String: [String: String]]
             else { throw NativeAccountError.invalidRequest }
-            let sources = groups.mapValues(Set.init)
+            for members in groups.values {
+                for (key, name) in members where next.suffixes?[key] == nil {
+                    next.suffixes?[key] = PlaybackStore.recordingSuffix(name)
+                }
+            }
+            let sources = groups.mapValues { Set($0.keys) }
             var retained = complete ? Set<String>() : manifest.owners[id]?.retained ?? []
             for keys in sources.values { retained.formUnion(keys) }
             next.owners[id] = PinOwner(sources: sources, retained: retained, paused: paused)
@@ -173,7 +182,20 @@ private struct PinManifest: Codable, Equatable {
         if next != manifest {
             try storage.save(next, "pins")
             manifest = next
-            failures.removeAll()
+        }
+        // Existing descriptors survive rename. Migrate the bounded offline inventory in
+        // place, once per physical file. A failed rename leaves the old path playable.
+        for (key, suffix) in next.suffixes ?? [:] {
+            storage.localSuffixes.withLock { stored in
+                guard let previous = stored[key], previous != suffix else { return }
+                do {
+                    try FileManager.default.moveItem(at: storage.pinURL(key, suffix: previous),
+                                                     to: storage.pinURL(key, suffix: suffix))
+                    stored[key] = suffix
+                } catch {
+                    Logger(subsystem: "me.unto.oneplay.music", category: "Offline").error("Could not rename a cached recording")
+                }
+            }
         }
         try reconcile()
     }
@@ -214,13 +236,14 @@ private struct PinManifest: Codable, Equatable {
         let before = total
         defer { if total != before { changed(); pump() } }
         for (key, size) in leased where !playerHolds(key) {
-            do { try storage.unlinkPin(key) }
+            do { try storage.unlinkPin(key, suffix: storage.localSuffixes.withLock { $0[key] ?? "" }) }
             catch {
                 // Keep the failed file accounted for. The next owner or player change retries it.
                 Logger(subsystem: "me.unto.oneplay.music", category: "Offline").error("Could not remove an unowned recording")
                 return false
             }
             leased[key] = nil
+            storage.localSuffixes.withLock { $0[key] = nil }
             total -= size
             if .now >= deadline { return true }
         }
@@ -236,16 +259,13 @@ private struct PinManifest: Codable, Equatable {
         }
     }
 
-    func control(_ action: String, quota: Int?) throws {
+    func setQuota(_ quota: Int?) throws {
         guard let storage else { throw NativeAccountError.unbound }
-        if action == "quota" {
-            guard let quota, [1,2,5,10].contains(quota) else { throw NativeAccountError.invalidRequest }
-            var next = manifest
-            next.quota = quota << 30
-            try storage.save(next, "pins")
-            manifest = next
-        } else if action == "retry" { resumePending() }
-        else { throw NativeAccountError.invalidRequest }
+        guard let quota, [1,2,5,10].contains(quota) else { throw NativeAccountError.invalidRequest }
+        var next = manifest
+        next.quota = quota << 30
+        try storage.save(next, "pins")
+        manifest = next
         changed()
         pump()
     }
@@ -253,12 +273,11 @@ private struct PinManifest: Codable, Equatable {
     /// A gap or policy change requires a full inventory. Ordinary completions cross WebKit as bounded deltas.
     func snapshot(after: Int?) -> [String: Any] {
         var result: [String: Any] = ["revision": revision, "quota": manifest.quota, "total": total, "queuedCount": missing.count]
-        result["error"] = lastError
         if let after, after <= revision, after == revision || after >= (deltas.first?.revision ?? revision + 1) - 1 {
             result["added"] = Dictionary(uniqueKeysWithValues: deltas.filter { $0.revision > after }.compactMap { d in sizes[d.key].map { (d.key, $0) } })
         } else {
             result["files"] = sizes
-            result["unavailable"] = Array(failures.keys)
+            result["unavailable"] = failures
         }
         return result
     }
@@ -285,12 +304,16 @@ private struct PinManifest: Codable, Equatable {
     private func failed(_ key: String, transient: Bool, message: String, minimumDelay: Int = 0) {
         guard eligible.contains(key) else { return }
         let count = retryCount[key] ?? 0
-        if transient && count < 4 {
-            retryCount[key] = count + 1
-            let seconds = max(minimumDelay, 1 << (count * 2))
+        if transient {
+            // Keep trying while this recording is wanted, backing off to once an hour.
+            retryCount[key] = min(count + 1, 6)
+            let seconds = max(minimumDelay, min(3600, 1 << (count * 2)))
+            if count > 0 { failures[key] = message + " Retrying automatically." }
             delayed[key] = Task {
                 do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
                 delayed[key] = nil
+                failures[key] = nil
+                changed()
                 pump()
             }
         } else { failures[key] = message }
@@ -302,7 +325,7 @@ private struct PinManifest: Codable, Equatable {
         guard attached, storage != nil, evidence == "evidence:signed-in", total <= manifest.quota else { return }
         for key in missing where resolving[key] == nil && running[key] == nil && failures[key] == nil && delayed[key] == nil {
             if resolving.count + running.count >= 2 { break }
-            startLookup(key, retry: renew.remove(key) != nil)
+            startLookup(key, retry: renew.contains(key))
         }
     }
 
@@ -323,16 +346,29 @@ private struct PinManifest: Codable, Equatable {
                 var admitted = tickets
                 admitted[key] = task.taskIdentifier
                 do { try storage?.save(admitted, "pin-transfers") }
-                catch { task.cancel(); throw error }
+                catch {
+                    task.cancel()
+                    resolving[key] = nil
+                    failedToSave(key, error: error)
+                    return
+                }
                 tickets = admitted
+                renew.remove(key)
                 running[key] = task
                 resolving[key] = nil
                 task.resume()
             } catch {
                 guard !Task.isCancelled, manifest.binding == binding else { return }
                 resolving[key] = nil
-                failed(key, transient: NativeAccountError.classify(error) == .transient,
-                       message: "Recording unavailable. Tap Resume to retry.")
+                let cause = NativeAccountError.classify(error)
+                let message: String
+                switch cause {
+                case .transient: message = "Couldn’t reach OneDrive for this recording."
+                case .forbidden: message = "This recording is unavailable to this account on OneDrive."
+                case .interactionRequired: message = "Sign in to OneDrive to download this recording."
+                default: message = "OneDrive didn’t provide download details for this recording."
+                }
+                failed(key, transient: cause == .transient, message: message)
             }
         }
     }
@@ -345,47 +381,67 @@ private struct PinManifest: Codable, Equatable {
     }
 
     func urlSession(_ session: URLSession, downloadTask task: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        guard let ticket = ticket(for: task), let storage, eligible.contains(ticket.key), sizes[ticket.key] == nil,
-              (!attached || running[ticket.key]?.taskIdentifier == task.taskIdentifier) else { return }
+        guard let ticket = ticket(for: task), let storage, eligible.contains(ticket.key), sizes[ticket.key] == nil else { return }
         let http = task.response as? HTTPURLResponse
         if let status = http?.statusCode, status != 200 {
-            if [401,403,404].contains(status), !ticket.retry { renew.insert(ticket.key) }
+            if status == 206 {
+                renew.insert(ticket.key)
+                failed(ticket.key, transient: true, message: "The server sent only part of the recording.")
+            } else if [401,403,404].contains(status), !ticket.retry { renew.insert(ticket.key) }
             else {
                 failed(ticket.key, transient: status == 408 || status == 429 || status >= 500,
-                       message: "Download returned HTTP " + String(status) + ". Tap Resume to retry.",
+                       message: "Download returned HTTP " + String(status) + ".",
                        minimumDelay: min(3600, Int(http?.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 0))
             }
             return
         }
+        guard http?.statusCode == 200, http?.url.map(GraphTransport.isHTTPS) == true else {
+            failed(ticket.key, transient: false, message: "The download did not return a secure HTTP response.")
+            return
+        }
         do {
-            guard http?.statusCode == 200, http?.url.map(GraphTransport.isHTTPS) == true,
-                  let size = try location.resourceValues(forKeys: [.fileSizeKey]).fileSize, size == ticket.size else {
-                throw NativeAccountError.unavailable
+            guard let size = try location.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+                throw CocoaError(.fileReadUnknown)
             }
-            // Reject a successful HTML page, JSON error, or other same-length non-audio body.
-            var audio: AudioFileID?
-            guard AudioFileOpenURL(location as CFURL, .readPermission, 0, &audio) == noErr, let audio else {
-                throw NativeAccountError.unavailable
+            guard size == ticket.size else {
+                // A short transfer or a changed recording needs current Graph metadata and a new URL.
+                renew.insert(ticket.key)
+                failed(ticket.key, transient: true, message: "The downloaded size differs from OneDrive’s.")
+                return
             }
-            AudioFileClose(audio)
             try PinReceipt(size: size, version: ticket.version).write(to: location)
             try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: location.path)
-            try FileManager.default.moveItem(at: location, to: storage.pinURL(ticket.key))
+            // A pre-upgrade transfer has no indexed suffix until the page reattaches.
+            let suffix = manifest.suffixes?[ticket.key] ?? ""
+            try FileManager.default.moveItem(at: location, to: storage.pinURL(ticket.key, suffix: suffix))
+            storage.localSuffixes.withLock { $0[ticket.key] = suffix }
             sizes[ticket.key] = size
             total += size
             missing.remove(ticket.key)
+            retryCount[ticket.key] = nil
             changed(ticket.key)
-        } catch { failed(ticket.key, transient: false, message: "Download incomplete or unsupported. Tap Resume to retry.") }
+        } catch { failedToSave(ticket.key, error: error) }
+    }
+
+    private func failedToSave(_ key: String, error: Error) {
+        let full = (error as? CocoaError)?.code == .fileWriteOutOfSpace || (error as? POSIXError)?.code == .ENOSPC
+        failed(key, transient: !full, message: full
+            ? "There isn’t enough free space on this device." : "Couldn’t save the recording on this device.")
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard let ticket = ticket(for: task), eligible.contains(ticket.key), !attached || running[ticket.key]?.taskIdentifier == task.taskIdentifier else { return }
+        guard let ticket = ticket(for: task), eligible.contains(ticket.key) else { return }
         running[ticket.key] = nil
         tickets[ticket.key] = nil
         // Once the daemon has completed this ID it cannot deliver another body. The next admission
         // overwrites this tiny journal even if a cleanup write fails under disk pressure.
         try? storage?.save(tickets, "pin-transfers")
-        if error != nil { failed(ticket.key, transient: true, message: "Download interrupted. Tap Resume to retry.") }
+        if let error, missing.contains(ticket.key), delayed[ticket.key] == nil, failures[ticket.key] == nil {
+            if task.countOfBytesReceived > 0 && task.countOfBytesReceived < ticket.size { renew.insert(ticket.key) }
+            if let urlError = error as? URLError, [.cannotCreateFile, .cannotOpenFile, .cannotWriteToFile, .cannotMoveFile].contains(urlError.code) {
+                failedToSave(ticket.key, error: (error as NSError).userInfo[NSUnderlyingErrorKey] as? Error ?? error)
+            } else { failed(ticket.key, transient: true, message: "The download was interrupted.") }
+        }
         pump()
     }
 

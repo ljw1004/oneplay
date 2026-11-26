@@ -9,9 +9,8 @@ interface Inventory {
     revision: number;
     files?: Record<string, number>;
     queuedCount: number;
-    unavailable?: string[];
+    unavailable?: Record<string, string>;
     added?: Record<string, number>;
-    error?: string;
     quota: number;
     total: number;
 }
@@ -25,7 +24,7 @@ interface Sources {
 /** Expand an owner's logical references into physical files. The visited sets deduplicate
  * overlapping playlist routes. Missing indexes and pending renames make the result incomplete. */
 async function walkOwner(start: PlaylistMember, sources: Sources, current: () => boolean,
-    visitFile: (source: string, key: string) => void): Promise<boolean> {
+    visitFile: (source: string, key: string, name: string) => void): Promise<boolean> {
     const refs = [start];
     const seenFavorites = new Set<string>();
     const seenFolders = new Map<string, Set<MusicFolder>>();
@@ -54,15 +53,15 @@ async function walkOwner(start: PlaylistMember, sources: Sources, current: () =>
         if (root.reindexing) complete = false;
         let seen = seenFolders.get(root.key);
         if (!seen) seenFolders.set(root.key, seen = new Set());
-        const pending = [node];
+        const pending: [string, typeof node][] = [[ref.path.at(-1) ?? '', node]];
         while (pending.length) {
-            const item = pending.pop()!;
+            const [name, item] = pending.pop()!;
             if (isMusicFolder(item)) {
                 if (!seen.has(item)) {
                     seen.add(item);
-                    for (const child of Object.values(item.children)) pending.push(child);
+                    for (const child of Object.entries(item.children)) pending.push(child);
                 }
-            } else visitFile(root.key, ref.driveId + ':' + item.id);
+            } else visitFile(root.key, ref.driveId + ':' + item.id, name);
             if (performance.now() - slice > 6) {
                 await new Promise(resolve => setTimeout(resolve, 0));
                 if (!current()) return false;
@@ -82,7 +81,7 @@ export function createOfflinePins(backend: NativeLibrary | Downloads, render: (p
     // The browser supplies its live map on each full notification. Swift supplies deltas.
     let sizes: ReadonlyMap<string, number> = nativeFiles;
     let queuedCount = 0;
-    let unavailable = new Set<string>();
+    let unavailable = new Map<string, string | undefined>();
     let reverse = new Map<string, Set<string>>();
     let counts = new Map<string, PinProgress>();
     let folderCoverage = new Map<string, {partial: boolean; blocked: boolean; owners: string[]}>();
@@ -106,7 +105,7 @@ export function createOfflinePins(backend: NativeLibrary | Downloads, render: (p
         if (full) {
             unavailable.clear();
             if (library) nativeFiles.clear();
-            for (const count of counts.values()) { count.downloaded = 0; count.bytes = 0; delete count.unavailable; }
+            for (const count of counts.values()) { count.downloaded = 0; count.bytes = 0; delete count.unavailable; delete count.warnings; }
         }
         let changed = full;
         for (const [key, bytes] of files) {
@@ -126,12 +125,13 @@ export function createOfflinePins(backend: NativeLibrary | Downloads, render: (p
 
     /** A terminal response blocks only the owners waiting for that recording. A fresh
      * queue or native inventory supplies a new baseline before transfers resume. */
-    function markUnavailable(key: string): void {
+    function markUnavailable(key: string, reason?: string): void {
         if (unavailable.has(key) || sizes.has(key)) return;
-        unavailable.add(key);
+        unavailable.set(key, reason);
         for (const owner of reverse.get(key) ?? []) {
             const count = counts.get(owner)!;
             count.unavailable = (count.unavailable ?? 0) + 1;
+            if (reason) (count.warnings ??= new Set()).add(reason);
         }
     }
 
@@ -160,9 +160,9 @@ export function createOfflinePins(backend: NativeLibrary | Downloads, render: (p
                     const sample = await library.pins('snapshot', {after: revision ?? null}) as Inventory;
                     queuedCount = sample.queuedCount;
                     const changed = applyInventory(Object.entries(sample.files ?? sample.added ?? {}), !!sample.files);
-                    for (const key of sample.unavailable ?? []) markUnavailable(key);
+                    for (const [key, reason] of Object.entries(sample.unavailable ?? {})) markUnavailable(key, reason);
                     revision = sample.revision;
-                    lastError = sample.error;
+                    lastError = undefined;
                     totalBytes = sample.total;
                     quotaBytes = sample.quota;
                     render(changed);
@@ -175,12 +175,6 @@ export function createOfflinePins(backend: NativeLibrary | Downloads, render: (p
         window.addEventListener('oneplay-pins', refresh);
         window.addEventListener('pageshow', refresh);
         document.addEventListener('visibilitychange', () => { if (!document.hidden) return refresh(); });
-    }
-
-    /** Send a native download control and paint its confirmed inventory. */
-    async function control(action: string, args?: Record<string, unknown>) {
-        try { await library!.pins(action, args); await refresh(); }
-        catch (error) { lastError = 'Could not update offline downloads.'; render(false); logCatch('offline controls')(error); }
     }
 
     /** Publish the latest committed owners and their coverage. Only marked subtrees enter this walk. */
@@ -212,13 +206,13 @@ export function createOfflinePins(backend: NativeLibrary | Downloads, render: (p
             entries.push({id, ref: pin, paused: false});
         }
         for (const {id, ref, paused} of entries) {
-            const groups = new Map<string, Set<string>>();
+            const groups = new Map<string, Record<string, string>>();
             const keys = new Set<string>();
-            const complete = await walkOwner(ref, context, () => version === projection, (source, key) => {
+            const complete = await walkOwner(ref, context, () => version === projection, (source, key, name) => {
                 if (library) {
                     let group = groups.get(source);
-                    if (!group) groups.set(source, group = new Set());
-                    group.add(key);
+                    if (!group) groups.set(source, group = Object.create(null) as Record<string, string>);
+                    group[key] = name;
                 }
                 if (keys.has(key)) return;
                 keys.add(key);
@@ -235,7 +229,7 @@ export function createOfflinePins(backend: NativeLibrary | Downloads, render: (p
             nextCounts.set(id, {total: keys.size, downloaded: 0, bytes: 0, complete});
             if (library) {
                 owners.push({id, paused, complete,
-                    sources: Object.fromEntries(Array.from(groups, ([root, members]) => [root, [...members]]))});
+                    sources: Object.fromEntries(groups)});
             }
         }
         // Inventory can change across a yielded library walk. Count against the latest snapshot at commit.
@@ -246,8 +240,8 @@ export function createOfflinePins(backend: NativeLibrary | Downloads, render: (p
         counts = nextCounts;
         // A moved folder or a newly overlapping playlist inherits existing terminal results.
         const blocked = unavailable;
-        unavailable = new Set();
-        for (const key of blocked) markUnavailable(key);
+        unavailable = new Map();
+        for (const [key, reason] of blocked) markUnavailable(key, reason);
         folderCoverage = coverage;
         sources = context;
         preview = undefined;
@@ -282,8 +276,12 @@ export function createOfflinePins(backend: NativeLibrary | Downloads, render: (p
             return {files:sizes, queuedCount, overQuota: totalBytes > quotaBytes, lastError,
                 evidence: library!.getEvidence(), quotaBytes, totalBytes};
         },
-        setQuota: (gb: number) => browser ? browser.setQuota(gb) : control('quota', {quota: gb}),
-        clearError: () => browser ? browser.clearError() : control('retry'),
+        async setQuota(gb: number) {
+            if (browser) return browser.setQuota(gb);
+            try { await library!.pins('quota', {quota: gb}); await refresh(); }
+            catch (error) { lastError = 'Could not update the storage limit.'; render(false); logCatch('offline quota')(error); }
+        },
+        clearError: browser?.clearError,
         favoriteProgress(id: string) {
             const favorite = sources?.favorites.get(id);
             return counts.get(id) ?? (favorite && !favorite.offlinePin ? previewProgress(id, {favId:id}) : undefined);
@@ -306,8 +304,12 @@ export function createOfflinePins(backend: NativeLibrary | Downloads, render: (p
                 const keys = preview.keys!;
                 let downloaded = 0, bytes = 0, blocked = 0;
                 for (const [file, size] of sizes) if (keys.has(file)) { downloaded++; bytes += size; }
-                for (const file of unavailable) if (keys.has(file)) blocked++;
-                return {total:keys.size, childFolders:branch.owners.length, downloaded, bytes, unavailable:blocked,
+                const warnings = new Set<string>();
+                for (const [file, reason] of unavailable) if (keys.has(file)) {
+                    blocked++;
+                    if (reason) warnings.add(reason);
+                }
+                return {total:keys.size, childFolders:branch.owners.length, downloaded, bytes, unavailable:blocked, warnings,
                     complete:branch.owners.every(id => counts.get(id)?.complete)};
             }
             const root = sources?.roots.get(folder.sourceRootKey);

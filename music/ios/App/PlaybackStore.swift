@@ -1,9 +1,13 @@
 import CryptoKit
 import Foundation
+import os
 
 /// Each account pairing has its own protected directory. Bridge-provided identifiers never become path components.
 struct PlaybackStore {
     let directory: URL
+    // The account binds its downloader and player to the same store. Only completed
+    // files enter this inventory. Queue titles can be stale after an indexed rename.
+    let localSuffixes = OSAllocatedUnfairLock(initialState: [String:String]())
 
     init(root: URL, home: String, drive: String) throws {
         directory = root.appendingPathComponent("v1", isDirectory: true).appendingPathComponent(Self.digest(try JSONEncoder().encode([home, drive])), isDirectory: true)
@@ -17,11 +21,19 @@ struct PlaybackStore {
 
     var pinDirectory: URL { directory.appendingPathComponent("Audio", isDirectory: true) }
     static func pinName(_ key: String) -> String { Data(SHA256.hash(data: Data(key.utf8))).base64EncodedString().replacingOccurrences(of: "/", with: "_") }
-    func pinURL(_ key: String) -> URL { pinDirectory.appendingPathComponent(Self.pinName(key)) }
+    /// The index recognizes the final dotted suffix, including a filename consisting only of ".mp3".
+    static func recordingSuffix(_ name: String) -> String {
+        let filename = (name as NSString).lastPathComponent
+        return filename.lastIndex(of: ".").map { filename[filename.index(after: $0)...].lowercased() } ?? ""
+    }
+    func pinURL(_ key: String, suffix: String = "") -> URL {
+        let base = pinDirectory.appendingPathComponent(Self.pinName(key))
+        return suffix.isEmpty ? base : base.appendingPathExtension(suffix)
+    }
 
     /// Pin paths name regular files. Unlink leaves an open decoder descriptor readable.
-    func unlinkPin(_ key: String) throws {
-        guard unlink(pinURL(key).path) == 0 || errno == ENOENT else {
+    func unlinkPin(_ key: String, suffix: String) throws {
+        guard unlink(pinURL(key, suffix: suffix).path) == 0 || errno == ENOENT else {
             throw POSIXError(POSIXErrorCode(rawValue:errno) ?? .EIO)
         }
     }

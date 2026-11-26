@@ -141,6 +141,8 @@
 
 ## Media playback and MediaSession
 
+- A complete indexed download counts as available offline. Preserve its filename suffix on disk. A real MP3 with 419,201 bytes before its first frame exposed why asking a decoder to approve a temporary download rejects valid files.
+
 - An exact-duration query can turn a streaming MP3 open into a full-file scan. Test cached startup with an unindexed file and withhold every middle byte until audio plays. Indexed synthetic files miss this failure. [Phone trace and decoder measurements](music/ai/AUDIO-FETCHING.md#build-28-cellular-next-on-an-unindexed-mp3)
 
 - A streaming regression test can hold back a response after its first block until the decoder asks for a distant tail. This proves incremental delivery without a timing threshold. Surface fixture timeouts on the main test thread so a closed socket cannot accidentally pass the test. [Transport checks](experiments/ios-playback/tools/check-ranges.py)
@@ -153,7 +155,7 @@
 
 - **Reset media element state before async track switches to prevent stale event races.**
 - **Drive play/pause UI from media events, not optimistic click updates.**
-- **Do not auto-advance on media errors.** Stop, surface failure, and preserve user control.
+- Skip unreadable recordings during playback. A network interruption is a separate failure and leaves the current track selected.
 - **Scrubbing should preserve prior play/pause intent.**
 - **On iOS, ended-to-next transitions must avoid async gaps where possible.** Sync-ready next URLs reduce background suspension risk.
 - **Sync-first async wrappers are useful when handlers must branch on immediate availability.**

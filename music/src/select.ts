@@ -675,10 +675,10 @@ export function createSelect(
             saveError = '';
             renderOfflineModal();
             try {
-                if (action === 'retry') await downloads.clearError();
+                if (action === 'retry') await downloads.clearError?.();
                 else if (folder && membership) await favorites.setFolderPinned(folder, action === 'pin', roots);
                 else if (typeof target === 'string') {
-                    if (action === 'resume' && downloads.getSnapshot().lastError) await downloads.clearError();
+                    if (action === 'resume' && downloads.getSnapshot().lastError) await downloads.clearError?.();
                     await favorites.setOfflinePin(target, action === 'unpin' ? undefined : {paused: action === 'pause'});
                 }
             } catch (error) {
@@ -732,9 +732,10 @@ export function createSelect(
                 const trackLabel = `${cached.total} track${cached.total === 1 ? '' : 's'}`;
                 statsEl.textContent = !marked ? trackLabel
                     : !incomplete ? `${trackLabel}, ${formatBytes(cached.bytes)} ✓`
+                    : cached.warnings?.size && !downloading && !fav?.offlinePin?.paused ? `${cached.downloaded}/${cached.total} tracks available offline`
                     : `${downloading ? 'Downloading' : 'Paused'} ${cached.downloaded}/${cached.total} tracks`;
             }
-            const canRetry = snap.lastError || (!downloading && cached?.unavailable);
+            const canRetry = downloads.clearError && (snap.lastError || (!downloading && cached?.unavailable));
             if (incomplete && (fav?.offlinePin?.paused || canRetry || (fav && downloading))) {
                 progressAction = fav?.offlinePin?.paused ? 'resume' : canRetry ? 'retry' : 'pause';
                 pauseBtn.textContent = progressAction === 'pause' ? '⏸︎' : '▶︎';
@@ -742,12 +743,13 @@ export function createSelect(
                     : progressAction === 'resume' ? 'Resume downloads' : 'Retry downloads');
                 statsEl.appendChild(pauseBtn);
             }
-            warningEl.textContent = changedFolder ? 'The folder has changed. Select it again.' : saveError || (
-                !incomplete || downloading || fav?.offlinePin?.paused ? ''
+            warningEl.innerText = changedFolder ? 'The folder has changed. Select it again.' : saveError || (
+                !incomplete || fav?.offlinePin?.paused ? ''
                 : snap.overQuota ? 'Reached storage limit'
                 : snap.evidence === 'evidence:signed-out' ? 'Not signed in'
                 : snap.evidence === 'evidence:not-online' ? 'Not online'
-                : snap.lastError ?? '');
+                : cached?.warnings?.size ? [...cached.warnings].join('\n')
+                : downloading ? '' : snap.lastError ?? '');
 
             const downloaded = snap.files.size;
             const queued = snap.queuedCount;

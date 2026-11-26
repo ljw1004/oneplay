@@ -1,6 +1,9 @@
 import AVFoundation
 import AudioToolbox
 
+/// The player can skip an unreadable recording. Transport and output errors keep their own policy.
+struct UnreadableRecording: Error {}
+
 /// Core Audio makes synchronous compressed-byte reads. The successor worker hands this decoder to
 /// playback only after its last prefix read. Exactly one worker owns the cursor at any time.
 final class MP3RangeDecoder {
@@ -27,7 +30,7 @@ final class MP3RangeDecoder {
     var frames: Int64 { length.frames }
     private(set) var hasDeclaredTiming = false
 
-    init(bytes: Int64, knownLength: Length = .unknown, read: @escaping Read) throws {
+    init(bytes: Int64, knownLength: Length = .unknown, typeHint: AudioFileTypeID = kAudioFileMP3Type, read: @escaping Read) throws {
         source = Source(bytes, read)
         guard let stereo = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2) else {
             throw PlaybackError("CD audio format unavailable")
@@ -48,7 +51,7 @@ final class MP3RangeDecoder {
                 return kAudioFileUnspecifiedError
             }
         }, nil, { ctx in Unmanaged<Source>.fromOpaque(ctx).takeUnretainedValue().length }, nil,
-        kAudioFileMP3Type, &audio))
+        typeHint, &audio))
         var timing = AudioFilePacketTableInfo()
         var timingBytes = UInt32(MemoryLayout.size(ofValue: timing))
         if AudioFileGetProperty(audio!, kAudioFilePropertyPacketTableInfo, &timingBytes, &timing) == noErr {
@@ -60,7 +63,7 @@ final class MP3RangeDecoder {
         var formatBytes = UInt32(MemoryLayout.size(ofValue: native))
         try check(ExtAudioFileGetProperty(decoder!, kExtAudioFileProperty_FileDataFormat, &formatBytes, &native))
         guard native.mSampleRate > 0, (1...2).contains(native.mChannelsPerFrame) else {
-            throw PlaybackError("Unsupported MP3 format")
+            throw UnreadableRecording()
         }
         nativeRate = native.mSampleRate
         // Asking ExtAudioFile for an exact length indexes every packet of an unindexed MP3.
@@ -128,7 +131,7 @@ final class MP3RangeDecoder {
 
     private func check(_ status: OSStatus) throws {
         if let error = source.error { throw error }
-        if status != noErr { throw PlaybackError("Core Audio status \(status)") }
+        if status != noErr { throw UnreadableRecording() }
     }
 
     /// Cache misses resolve on the worker. The render thread only sees ready PCM.

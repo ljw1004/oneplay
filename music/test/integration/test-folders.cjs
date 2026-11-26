@@ -123,6 +123,34 @@ async function seedFolderDevice(page, {cloud = {}, holdSecond = false, scale = f
 }
 
 module.exports = {
+    async 'folders: unreadable indexed bytes remain offline and playback skips to the next song'(page) {
+        const device = await seedFolderDevice(page);
+        await page.route('**/fixture-second.wav', r => r.fulfill({contentType:'audio/wav', body:Buffer.from([1,2,3])}));
+        await device.child('OneDrive').click();
+        await device.child('Books').click();
+        await device.choose(device.child('Dune'), add);
+        await device.child('Dune').locator('.offline-badge.complete').waitFor();
+        await page.context().setOffline(true);
+        await device.child('Dune').click();
+        await device.child('Disc').click();
+        await device.child('Ending.wav').click();
+        await page.waitForFunction(() => window._testPlayback.getInfo()?.track.at(-1) === 'Opening.wav'
+            && document.querySelector('audio').currentSrc.startsWith('blob:') && document.querySelector('audio').currentTime > 0.1);
+        assert.equal(await page.evaluate(() => window._testDownloads.getSnapshot().files.get('drive:second')), 3);
+    },
+
+    async 'folders: an unreachable stream stays selected for playback'(page) {
+        const device = await seedFolderDevice(page);
+        await page.route('**/fixture-second.wav', r => r.abort('internetdisconnected'));
+        await device.child('OneDrive').click();
+        await device.child('Books').click();
+        await device.child('Dune').click();
+        await device.child('Disc').click();
+        await device.child('Ending.wav').click();
+        await page.waitForFunction(() => document.querySelector('audio').error && window._testPlayback.getInfo()?.phase === 'loaded');
+        assert.equal(await page.evaluate(() => window._testPlayback.getInfo().track.at(-1)), 'Ending.wav');
+    },
+
     /** Use real button clicks so capture-phase pointerdown and the ensuing click are both exercised. */
     async 'folders: action menus open on selection entry and toggle at the same anchor'(page) {
         const {child} = await seedFolderDevice(page);

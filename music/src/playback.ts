@@ -143,7 +143,7 @@ export function createPlayback(
     let selection = 0;
     let libraryRevision = 0;
     let refreshRequest = 0;
-    let boundary: 'ended' | 'next' | 'prev' | undefined;
+    let boundary: 'ended' | 'skip' | 'next' | 'prev' | undefined;
     let edit: {saved: boolean; done: Promise<void>; resolve: () => void} | undefined;
     let pendingSave: {done: Promise<void>; resolve: () => void} | undefined;
     // Integration harness watches this for deterministic readiness checks.
@@ -196,7 +196,9 @@ export function createPlayback(
     const urlEngine = new PlaybackUrlEngine(authFetch);
 
     let isEntryCachedFn: ((entry: QueueEntry) => boolean) | undefined;
-    const isPlayable = (entry: QueueEntry): boolean => !deniedRoots.has(entry.sourceRootKey)
+    const unreadable = new Set<string>();
+    let playRequested = false;
+    const isPlayable = (entry: QueueEntry): boolean => !unreadable.has(entry.driveId + ':' + entry.itemId) && !deniedRoots.has(entry.sourceRootKey)
         && isTrackPlayableNow(entry.path, evidenceState, path => isEntryCachedFn?.(entry) ?? isTrackCachedFn(path),
             path => current === entry && held ? false : isTrackBlockedFn(path));
 
@@ -239,7 +241,7 @@ export function createPlayback(
         const trackName = current?.title ?? '<none>';
         log(`timer: fired (${reason}) track=${trackName} at=${audioEl.currentTime.toFixed(2)}s`);
         clearTimerDeadline(`expire:${reason}`);
-        audioEl.pause();
+        pausePlayback();
         updateFooter();
         view.onPlaybackChange(getInfo()!);
     };
@@ -327,6 +329,7 @@ export function createPlayback(
     // -- Playback controls ---------------------------------------------------
     /** Starts playback without toggling pause state. */
     function doPlay(playErrorTag = 'play-on-play'): void {
+        playRequested = true;
         // Cold-start: visual state may be restored while audio has no src.
         // First explicit play resolves URL and seeks to restored position.
         if (audioEl.paused && !audioEl.src && current) {
@@ -335,6 +338,12 @@ export function createPlayback(
         }
         if (!audioEl.paused) return;
         audioEl.play().catch(logCatch(playErrorTag));
+    }
+
+    /** Record the pause even if a loading or failed media element emits no pause event. */
+    function pausePlayback(): void {
+        playRequested = false;
+        audioEl.pause();
     }
 
     /** Moves to previous playable track using mode-aware wrap rules. */
@@ -347,8 +356,9 @@ export function createPlayback(
     }
 
     /** Manual Next may leave One and end-of-track Timer, including a removed song. */
-    function doNext(): void {
-        if (edit) { boundary = 'next'; return; }
+    function doNext(reason: 'next' | 'skip' = 'next'): void {
+        if (edit) { boundary = reason; return; }
+        if (reason === 'skip' && playbackMode === 'timer' && isTimerExpiredNow(Date.now())) return;
         let idx = held ? heldNeighbor('after') : playbackMode === 'repeat'
             ? findNextPlayableIdxWrappedInList(trackList, currentTrackIdx, isPlayable)
             : findNextPlayableIdxAfterInList(trackList, currentTrackIdx, isPlayable);
@@ -357,7 +367,7 @@ export function createPlayback(
             idx = computeFirstPlayableIdxAfterReshuffle(trackList, isPlayable);
         }
         if (idx === undefined) { if (held) clearSession(); return; }
-        rearmTimerFromUserInteractionIfPlaying('next');
+        if (reason === 'next') rearmTimerFromUserInteractionIfPlaying('next');
         playNext(trackList[idx], idx, true, 0, true);
     }
 
@@ -412,7 +422,7 @@ export function createPlayback(
                     if (duration !== undefined) {
                         if (Math.abs(duration - seconds) < 0.1) {
                             audioEl.currentTime = duration - 0.02;
-                            audioEl.pause();
+                            pausePlayback();
                         } else {
                             audioEl.currentTime = seconds;
                             if (wasPlaying && audioEl.paused) audioEl.play().catch(logCatch('play-on-scrub-release'));
@@ -451,7 +461,7 @@ export function createPlayback(
         onChevronClick: () => { if (!held) view.onChevronClick(); },
         onFooterPlayPauseClick: () => {
             if (audioEl.paused) doPlay('play-on-playpause');
-            else audioEl.pause();
+            else pausePlayback();
         },
         onCenterTapToggle: () => {
             if (audioEl.paused && !audioEl.src && current) {
@@ -460,7 +470,7 @@ export function createPlayback(
             }
             const willPlay = audioEl.paused;
             if (willPlay) audioEl.play().catch(logCatch('play-on-center-tap'));
-            else audioEl.pause();
+            else pausePlayback();
             return willPlay ? 'play' : 'pause';
         },
         onPrev: doPrev,
@@ -479,6 +489,7 @@ export function createPlayback(
     // Drive play/pause affordance from media events, never optimistically.
     // This avoids UI desync when `audio.play()` is rejected by autoplay policy.
     audioEl.addEventListener('play', () => {
+        playRequested = true;
         ui.setPlayPausePlaying(true);
         if (playbackMode === 'timer') {
             if (suppressTimerPauseClear) {
@@ -493,6 +504,7 @@ export function createPlayback(
     });
 
     audioEl.addEventListener('pause', () => {
+        if (audioEl.paused && !audioEl.error && phase !== 'loading') playRequested = false;
         ui.setPlayPausePlaying(false);
         if (playbackMode === 'timer') {
             if (!suppressTimerPauseClear) {
@@ -517,9 +529,9 @@ export function createPlayback(
         };
 
         registerMediaSessionAction('play', () => doPlay('play-on-mediasession'));
-        registerMediaSessionAction('pause', () => audioEl.pause());
+        registerMediaSessionAction('pause', pausePlayback);
         registerMediaSessionAction('previoustrack', doPrev);
-        registerMediaSessionAction('nexttrack', doNext);
+        registerMediaSessionAction('nexttrack', () => doNext());
         registerMediaSessionAction('seekto', (details) => {
             if (details.seekTime == null || !Number.isFinite(audioEl.duration)) return;
             audioEl.currentTime = Math.max(0, Math.min(details.seekTime, audioEl.duration));
@@ -673,8 +685,17 @@ export function createPlayback(
         if (!audioEl.src || audioEl.src === window.location.href) return;
         const e = audioEl.error;
         logError(`ERROR: code=${e?.code ?? '?'} ${e?.message ?? 'unknown'}`);
-        // Deliberately do not auto-advance on errors; preserve user control.
         phase = 'loaded';
+        // Before metadata, browsers can report an unreachable stream as unsupported.
+        // A blob or a successful media response gives us evidence that bytes arrived.
+        const response = performance.getEntriesByName(audioEl.currentSrc, 'resource').at(-1) as PerformanceResourceTiming | undefined;
+        const local = audioEl.currentSrc.startsWith('blob:');
+        const received = local || response?.responseStatus === 200 || response?.responseStatus === 206;
+        const unreadableSource = e?.code === MediaError.MEDIA_ERR_DECODE || (e?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED && received);
+        if (current && playRequested && (local || navigator.onLine) && unreadableSource) {
+            unreadable.add(current.driveId + ':' + current.itemId);
+            doNext('skip');
+        }
         updateFooter();
         bumpTestPlaybackSeq();
         view.onPlaybackChange(getInfo()!);
@@ -726,6 +747,7 @@ export function createPlayback(
         cancelSeekDebounce();
         suppressTimerPauseClear = false;
         if (!isPlayable(entry)) return;
+        playRequested = shouldPlay;
         const path = entry.path;
         if (idx >= 0) held = undefined;
         asyncCounter += 1;
@@ -780,7 +802,7 @@ export function createPlayback(
                     if (clamped > 0) audioEl.currentTime = clamped;
                 }, { once: true });
             }
-            if (shouldPlay) {
+            if (playRequested) {
                 audioEl.play().catch((e) => {
                     suppressTimerPauseClear = false;
                     logCatch('play-offline')(e);
@@ -818,7 +840,7 @@ export function createPlayback(
                 if (clamped > 0) audioEl.currentTime = clamped;
             }, { once: true });
         }
-        if (shouldPlay) {
+        if (playRequested) {
             audioEl.play().catch((e) => {
                 suppressTimerPauseClear = false;
                 logCatch('play')(e);
@@ -856,7 +878,7 @@ export function createPlayback(
         restoredCurrentTime = undefined;
         cancelSeekDebounce();
         clearTimerDeadline('stop');
-        audioEl.pause();
+        pausePlayback();
         audioEl.removeAttribute('src');
         audioEl.load();
         urlEngine.clearPrefetchState();
@@ -916,7 +938,7 @@ export function createPlayback(
             const waiting = boundary;
             boundary = undefined;
             if (waiting === 'ended') handleNaturalEnd();
-            else if (waiting === 'next') doNext();
+            else if (waiting === 'next' || waiting === 'skip') doNext(waiting);
             else if (waiting === 'prev') doPrev();
         }
     }
@@ -969,6 +991,7 @@ export function createPlayback(
         }
         if (intent !== selection) return;
         if (!chosen) { view.onPlayBlockedNoPlayableTracks(folder); return; }
+        unreadable.clear(); // An explicit selection can retry a repaired recording.
         const firstIdx = findFirstPlayableIdxInList(chosen.tracks, isPlayable);
         const selectedIdx = tapped ? chosen.tracks.findIndex(t => t.key === tappedKey && isPlayable(t)) : firstIdx;
         if (selectedIdx === undefined || selectedIdx < 0) {

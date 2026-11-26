@@ -74,10 +74,11 @@ export interface DownloadSnapshot {
 }
 
 /** Counts are local to this device. An incomplete index cannot certify the total. */
-export interface PinProgress { total: number; downloaded: number; bytes: number; complete: boolean; unavailable?: number }
+export interface PinProgress { total: number; downloaded: number; bytes: number; complete: boolean; unavailable?: number; warnings?: Set<string> }
 
 /** Both offline dialogs share quota, inventory and owner progress controls. */
-export type DownloadControls = Pick<Downloads, 'getSnapshot' | 'setQuota' | 'clearError'> & {
+export type DownloadControls = Pick<Downloads, 'getSnapshot' | 'setQuota'> & {
+    clearError?: Downloads['clearError'];
     favoriteProgress(id: string): PinProgress | undefined;
     folderProgress(folder?: FolderPin): (PinProgress & {childFolders?: number}) | undefined;
 };

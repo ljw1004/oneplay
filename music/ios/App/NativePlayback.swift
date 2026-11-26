@@ -152,10 +152,11 @@ final class NativePlayback: @unchecked Sendable {
     }
     func allowsPinSource(_ root: String) -> Bool { lock.withLock { !blocked(root) } }
     func holdsPin(_ key: String) -> Bool { lock.withLock { active?.lease(for: key) != nil } }
+    private var unreadable = Set<String>()
     private var offlineKeys: Set<String>?
     private var playableOrder: [Int] {
-        guard let offlineKeys else { return canonical }
-        return canonical.filter { offlineKeys.contains(catalog[$0].fileKey) }
+        guard offlineKeys != nil || !unreadable.isEmpty else { return canonical }
+        return canonical.filter { !unreadable.contains(catalog[$0].fileKey) && offlineKeys?.contains(catalog[$0].fileKey) != false }
     }
 
     /// Preserve the canonical library and bookmark while restricting the next pass to complete files.
@@ -409,6 +410,7 @@ final class NativePlayback: @unchecked Sendable {
             mode = startingMode
             deadline = nil
             catalog = tracks
+            unreadable.removeAll()
             slots.removeAll()
             for (i, entry) in tracks.enumerated() { if let key = entry.key { slots[key] = i } }
             canonical = allowed
@@ -461,8 +463,25 @@ final class NativePlayback: @unchecked Sendable {
         worker.async { [self] in
             releaseIdleAudioSession()
             if !run.startsAtEnd {
-                run.playAndReport(issuedAt: issuedAt, delaySeconds: delaySeconds, nearEnd: nearEnd,
-                                  forceRefresh: forceRefresh, setOutputActive: setOutputActive)
+                if let failed = run.playAndReport(issuedAt: issuedAt, delaySeconds: delaySeconds, nearEnd: nearEnd,
+                                                  forceRefresh: forceRefresh, setOutputActive: setOutputActive) {
+                    lock.withLock {
+                        guard active === run else { return }
+                        unreadable.insert(catalog[failed.index].fileKey)
+                        guard fencedRevision == nil, run.shouldContinueAfterUnreadable,
+                              deadline.map({ .now < $0 }) != false else { return }
+                        // Removal keeps the relative order of the current pass, including Shuffle.
+                        let allowed = Set(playableOrder)
+                        let order = failed.order.filter(allowed.contains)
+                        guard !order.isEmpty else { return }
+                        let skipped = failed.revised(for: order, from: .all, to: .all)
+                        if let next = skipped.neighbor(1, mode: mode) {
+                            replaceRun(cursor: next, advanced: true)
+                        } else if mode == .repeat || mode == .shuffle {
+                            replaceRun(cursor: PlayCursor(order: mode == .shuffle ? order.shuffled() : order, slot: 0), advanced: true)
+                        }
+                    }
+                }
             }
             releaseIdleAudioSession()
         }
@@ -928,6 +947,7 @@ private final class PlaybackRun: @unchecked Sendable {
         }
     }
 
+    var shouldContinueAfterUnreadable: Bool { lock.withLock { !paused } }
     var wantsPlay: Bool { lock.withLock { !paused && terminal == nil } }
     var status: String {
         lock.withLock {
@@ -1293,7 +1313,8 @@ private final class PlaybackRun: @unchecked Sendable {
     }
 
     /// Convert operational errors into safe diagnostics. Native account errors expose a bounded category.
-    func playAndReport(issuedAt: Double, delaySeconds: Int, nearEnd: Bool, forceRefresh: Bool, setOutputActive: (Bool) throws -> Void) {
+    func playAndReport(issuedAt: Double, delaySeconds: Int, nearEnd: Bool, forceRefresh: Bool, setOutputActive: (Bool) throws -> Void) -> PlayCursor? {
+        var failed: PlayCursor?
         let queuedMs = Int((ProcessInfo.processInfo.systemUptime - issuedAt) * 1000)
         log.info("Start item=\(self.startIndex + 1) seekSeconds=\(self.startSeconds) workerWaitMs=\(queuedMs)")
         do {
@@ -1301,6 +1322,9 @@ private final class PlaybackRun: @unchecked Sendable {
             report("Finished \(lock.withLock { anchor.cursor.order.count }) track(s)", terminal: "ended")
         } catch is CancellationError {
             report("Stopped", terminal: "ended")
+        } catch is UnreadableRecording {
+            failed = lock.withLock { anchor.duration = .unknown; return anchor.cursor }
+            report("Skipped unreadable recording", terminal: "ended")
         } catch let error as PlaybackError {
             diagnostics?.record("Playback stopped: \(error.errorDescription ?? "decoder error")")
             report(error.errorDescription ?? "Playback failed", terminal: "error")
@@ -1327,6 +1351,7 @@ private final class PlaybackRun: @unchecked Sendable {
         if capturing { node.removeTap(onBus: 0) }
         #endif
         engine.stop()
+        return failed
     }
 
     /// Defer decoding a paused seek until Play. Replacing or stopping the run also releases this wait.
@@ -1616,14 +1641,20 @@ private final class PlaybackRun: @unchecked Sendable {
     }
 
     private func open(_ track: IndexedTrack, ordinal: Int, input: Int, speculative: Bool, admitted: MediaLocation? = nil, successorWindow: MediaRanges.SuccessorWindow? = nil, awaitDemand: (() throws -> Void)? = nil) throws -> (MediaRanges?, MP3RangeDecoder) {
-        if let file = lease(for: track.fileKey) { return (nil, try MP3RangeDecoder(bytes: file.size, read: file.read)) }
+        let suffix = PlaybackStore.recordingSuffix(track.title ?? track.path?.last ?? "")
+        let hint: AudioFileTypeID = suffix == "mp3" || suffix.isEmpty ? kAudioFileMP3Type : 0
+        if let file = lease(for: track.fileKey) { return (nil, try file.decoder(fallback: hint)) }
         if let pinStore {
             do {
-                let url = pinStore.pinURL(track.fileKey)
-                let file = try LocalMP3(url)
-                // A streaming seek remains on its admitted version when a newer pin has arrived.
-                if admitted == nil || (try? PinReceipt.read(from: url))?.version == admitted?.etag {
-                    let decoder = try MP3RangeDecoder(bytes: file.size, read: file.read)
+                let file = try pinStore.localSuffixes.withLock { suffixes -> LocalMP3? in
+                    let url = pinStore.pinURL(track.fileKey, suffix: suffixes[track.fileKey] ?? "")
+                    // Hold the name stable until the descriptor is open. A streaming seek
+                    // keeps its admitted version when a newer pin has arrived.
+                    guard admitted == nil || (try? PinReceipt.read(from: url))?.version == admitted?.etag else { return nil }
+                    return try LocalMP3(url)
+                }
+                if let file {
+                    let decoder = try file.decoder(fallback: hint)
                     lock.withLock { pinLeases[track.fileKey] = file }
                     return (nil, decoder)
                 }
@@ -1642,6 +1673,7 @@ private final class PlaybackRun: @unchecked Sendable {
             defer { if coldLookup { setWaiting(false) } }
             media = try resolve(track, .reuse(admitted))
         }
+        if media.size == 0 { throw UnreadableRecording() }
         if let successorWindow {
             while successorWindow.early && successorWindow.prefix() == 0 {
                 try checkCancellation()
@@ -1678,7 +1710,7 @@ private final class PlaybackRun: @unchecked Sendable {
         if warm { lock.withLock { _ = cachedStarts.insert(input) } }
         // Only a continuation whose admitted version matched above can inherit a proven duration.
         let knownLength = admitted == nil ? .unknown : lock.withLock { anchor.duration }
-        return (source, try MP3RangeDecoder(bytes: media.size, knownLength: knownLength, read: source.read))
+        return (source, try MP3RangeDecoder(bytes: media.size, knownLength: knownLength, typeHint: hint, read: source.read))
     }
 
     private struct Chunk {
@@ -1696,7 +1728,7 @@ private final class PlaybackRun: @unchecked Sendable {
         let n = Int(pcm.frameLength)
         // MP3 duration is an estimate. A successful zero-frame read at a positive cursor is clean EOF,
         // including a seek past the last playable frame. A recording must still decode some audio at zero.
-        guard n > 0 || position > 0 else { throw PlaybackError("Recording contains no decodable audio") }
+        guard n > 0 || position > 0 else { throw UnreadableRecording() }
         func quiet(_ limit: Int, tail: Bool) -> Int {
             for i in 0..<limit {
                 let at = tail ? n-1-i : i
@@ -1717,13 +1749,21 @@ private final class LocalMP3 {
     private let lock = NSLock()
     private let file: FileHandle
     let size: Int64
+    let suffix: String
 
     init(_ url: URL) throws {
+        suffix = url.pathExtension
         file = try FileHandle(forReadingFrom: url)
         size = try Int64(file.seekToEnd())
     }
 
     deinit { try? file.close() }
+
+    /// A lease carries the on-disk format hint through seeks and queue renames.
+    func decoder(fallback: AudioFileTypeID) throws -> MP3RangeDecoder {
+        let hint = suffix.isEmpty ? fallback : (suffix == "mp3" ? kAudioFileMP3Type : 0)
+        return try MP3RangeDecoder(bytes: size, typeHint: hint, read: read)
+    }
 
     func read(_ offset: Int64, _ count: Int) throws -> Data {
         try lock.withLock {

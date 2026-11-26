@@ -39,7 +39,7 @@ If the user asks you to plan a milestone, these are the steps to take.
    - The user always wants things done the right way, with clean engineering, good architecture. Never any shortcuts. It's normal that your plan work discovers a structural architectural problem that must be fixed before your plan can proceed.
    - If the architectural problem is small enough to solve, then include that as a phase in your plan. But if it's a major one, worthy of a whole separate plan in its own right, then you should bail, tell the user the problem, and leave them to insert a new milestone specifically for that better engineering.
    - The user is always delighted to hear about better engineering.
-9. Present your PLAN_M{n}.md file to Claude and ask for its feedback.
+9. Present your PLAN_M{n}.md file to a dedicated Claude KISS reviewer. Run only the specialist roles specified for the plan. Include KISS in every round.
    - If you couldn't get Claude to run for whatever reason, the user wants you to abort and report what's wrong.
    - You can trust Claude has already read AGENTS.md, and is able to do its own autonomous research.
    - If Claude found no problems with your plan, you may proceed.
@@ -96,7 +96,7 @@ If the user asks you to execute on a plan, these are the steps to take.
    - You might have discovered better engineering
 2. Perform your testing and validation
    - Update the "AI VALIDATION RESULTS" section of your PLAN_M{n}.md file
-3. Review your own code. Also, ask Claude to review your work
+3. Review your own code. For peer review, use only the five specialist roles in step 4. Every round, including review after fixes, requires a dedicated KISS reviewer.
    - You will need to provide it contect: your plan document PLAN_M{n}.md, and tell it which files or functions you've worked on. Ask it also to review your validation steps.
    - If Claude found no blockers or problems with your work, you may proceed. Do static checking (formatting, eslint, typechecking). If you need any fixes, static check again to make sure it's clean.
    - If you couldn't get Claude to run for whatever reason, the user wants you to abort and report what's wrong.
@@ -105,7 +105,7 @@ If the user asks you to execute on a plan, these are the steps to take.
    - Do NOT reference previous rounds when you invoke it: Claude does best if starting from scratch each round, so it can re-examine the whole ask from fundamentals. Note that each time you invoke Claude it has no memory of previous invocations, which is good and will help this goal! Also, avoid asking it something like "please review the updated files" since (1) you should not reference previous rounds implicitly or explicitly, (2) it has no understanding of what the updates were; it only knows about the current state of files+repo on disk.
 4. After implementation, do a "better engineering" phase
    - Clean up LEARNINGS.md and ARCHITECTURE.md. If any information there is just restating information from other files then delete it. If it would belong better elsewhere, move it. Please be careful to follow the "learnings decision tree" -- LEARNINGS.md for durable engineering wisdom, ARCHITECTURE.md for things that will apply to CodexAgent.ts in its finished state, PLAN_M{n}.md for milestone-specific notes
-   - You will have several Claude review tasks to do, below. You must launch all the following Claude review tasks in parallel, since they each take some time: prepare all their inputs, then execute them all in parallel. You should start addressing the first findings as soon as you get them, rather than waiting for all to be consolidated. You can be doing your own review while you wait for Claude.
+   - Launch the five Claude specialists below in parallel on the same revision. Read the KISS findings alongside the other reports before deciding which suggestions warrant a change. Give the KISS reviewer the accepted product trade-offs and ask which proposed guarantees or existing machinery can be dropped.
    - (1) Review the code for correctness. Also ask Claude to evaluate this.
    - (2) Validate whether work obeys the codebase style guidelines in AGENTS.md. Also ask Claude to evaluate this. The user is INSISTENT that they must be obeyed.
    - (3) Validate whether the work obeys each learning you gathered in LEARNINGS.md. Also ask Claude to evaluate this. (A separate instance of Claude; it can't do too much in one go).

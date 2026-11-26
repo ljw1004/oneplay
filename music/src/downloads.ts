@@ -22,15 +22,16 @@
  * - GC: downloaded − retainKeys → audioDelete. GC skipped when
  *   retainKeys is empty (guards against incomplete index state).
  * - Single-flight queue recalculation via dirty-flag loop.
- * - AbortController + generation counter for abort safety.
+ * - Rebuilding the queue cancels its previous requests before reading the local inventory.
  * - activeKeys ⊆ retainKeys (enforced in setPinnedKeys).
  */
 
 import {
-    audioGet, audioPut, audioDelete, audioKeys, audioTotalBytes, audioClear,
+    audioGet, audioPut, audioDeleteBatch, audioFileSizes, audioClear,
 } from './db.js';
+import type { FolderPin } from './favorites.js';
 import { readGraphJson, type EvidenceState, type AuthFetch } from './auth.js';
-import { log, logError, errorMessage, errorDetail } from './logger.js';
+import { log, logError, logCatch, errorMessage, errorDetail } from './logger.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -41,17 +42,14 @@ const DEFAULT_QUOTA_BYTES = 1 * 1024 * 1024 * 1024; // 1 GB
 export const QUOTA_OPTIONS_GB = [1, 2, 5, 10];
 const QUOTA_LS_KEY = 'oneplay_music_quota_bytes';
 
-/** Shared offline-badge classifier used by tree + modal rendering.
- *  Incomplete favorites are "paused" whenever they are blocked for any reason. */
-export function classifyOfflineBadgeState(
-    hasMissingTracks: boolean,
-    evidence: EvidenceState,
-    pausedByUser: boolean,
-    overQuota: boolean,
-    hasError: boolean,
-): 'complete' | 'downloading' | 'paused' {
-    if (!hasMissingTracks) return 'complete';
-    if (pausedByUser || overQuota || hasError || evidence !== 'evidence:signed-in') return 'paused';
+/** Both the tree arrow and the open dialog report the same local progress. Until an
+ * index tells us about a missing file, an incomplete owner has nothing it can download. */
+export function classifyOfflineBadgeState(progress: PinProgress | undefined,
+    snapshot: Pick<DownloadSnapshot, 'evidence' | 'overQuota' | 'lastError'>,
+    paused: boolean): 'complete' | 'downloading' | 'paused' {
+    if (progress?.complete && progress.downloaded === progress.total) return 'complete';
+    if (!progress || progress.downloaded + (progress.unavailable ?? 0) >= progress.total || paused || snapshot.overQuota
+        || snapshot.lastError || snapshot.evidence !== 'evidence:signed-in') return 'paused';
     return 'downloading';
 }
 
@@ -64,10 +62,10 @@ interface QueueItem {
     readonly itemId: string;
 }
 
-/** Atomic snapshot of download engine state. */
+/** Current download state. File sizes share the live read-only inventory exposed to playback and search. */
 export interface DownloadSnapshot {
-    readonly downloadedKeys: ReadonlySet<string>;
-    readonly queuedKeys: ReadonlySet<string>;
+    readonly files: ReadonlyMap<string, number>;
+    readonly queuedCount: number;
     readonly overQuota: boolean;
     readonly lastError: string | undefined;
     readonly evidence: EvidenceState;
@@ -75,9 +73,13 @@ export interface DownloadSnapshot {
     readonly totalBytes: number;
 }
 
-/** Public API returned by createDownloads. */
+/** Counts are local to this device. An incomplete index cannot certify the total. */
+export interface PinProgress { total: number; downloaded: number; bytes: number; complete: boolean; unavailable?: number }
+
+/** Both offline dialogs share quota, inventory and owner progress controls. */
 export type DownloadControls = Pick<Downloads, 'getSnapshot' | 'setQuota' | 'clearError'> & {
-    favoriteProgress?(id: string): { total: number; downloaded: number; bytes: number; complete: boolean } | undefined;
+    favoriteProgress(id: string): PinProgress | undefined;
+    folderProgress(folder?: FolderPin): (PinProgress & {childFolders?: number}) | undefined;
 };
 
 export interface Downloads {
@@ -87,23 +89,23 @@ export interface Downloads {
      * INVARIANT: activeKeys ⊆ retainKeys.
      * Triggers queue recalculation immediately (pump remains evidence-gated).
      */
-    setPinnedKeys(activeKeys: ReadonlySet<string>, retainKeys: ReadonlySet<string>): void;
+    setPinnedKeys(activeKeys: ReadonlySet<string>, retainKeys: ReadonlySet<string>, membershipComplete?: boolean): Promise<void>;
     /** Notifies the download engine that evidence changed externally.
      *  Reads current state from deps.getEvidence() and reacts (start/stop
      *  pump, clear errors, notifyUI). */
     handleEvidenceTransition(): void;
     /** Returns an offline blob for a track, or undefined if not cached. */
     getOfflineBlob(driveId: string, itemId: string): Promise<Blob | undefined>;
-    /** Returns an atomic snapshot of engine state. */
+    /** Read the current inventory and queue state. */
     getSnapshot(): DownloadSnapshot;
     /** Updates the storage quota (persists to localStorage). */
     setQuota(gb: number): void;
-    /** Clears the latched error, allowing downloads to retry. */
-    clearError(): void;
+    /** Rebuild the pending queue, including recordings that returned a terminal error. */
+    clearError(): Promise<void>;
     /** Clears all downloaded audio and resets state. */
     clear(): Promise<void>;
     /** Called by the engine when state changes (download progress, errors, etc.). */
-    onStateChange: () => void;
+    onStateChange: (inventory?: { files: ReadonlyMap<string, number> } | { added: [string, number] } | { unavailable: string }) => void;
 }
 
 export interface DownloadsDeps {
@@ -111,9 +113,8 @@ export interface DownloadsDeps {
     fetcher: (url: string, options?: RequestInit) => Promise<Response>;
     audioPut: typeof audioPut;
     audioGet: typeof audioGet;
-    audioDelete: typeof audioDelete;
-    audioKeys: typeof audioKeys;
-    audioTotalBytes: typeof audioTotalBytes;
+    audioDeleteBatch: typeof audioDeleteBatch;
+    audioFileSizes: typeof audioFileSizes;
     audioClear: typeof audioClear;
     loadQuotaBytes(): number;
     saveQuotaBytes(bytes: number): void;
@@ -131,7 +132,7 @@ export interface DownloadsDeps {
 
 const defaultDeps = {
     fetcher: (url: string, options?: RequestInit) => fetch(url, options),
-    audioPut, audioGet, audioDelete, audioKeys, audioTotalBytes, audioClear,
+    audioPut, audioGet, audioDeleteBatch, audioFileSizes, audioClear,
     loadQuotaBytes: () => {
         const raw = localStorage.getItem(QUOTA_LS_KEY);
         return raw ? parseInt(raw, 10) || DEFAULT_QUOTA_BYTES : DEFAULT_QUOTA_BYTES;
@@ -161,8 +162,9 @@ export function createDownloads(
     let dirty = true;
     let queue: QueueItem[] = [];
     let overQuota = false;
+    let controller = new AbortController();
     let activeDownloads = 0;
-    let generation = 0; // monotonic epoch; bumped on abort to invalidate old tasks
+    const pendingSaves = new Set<Promise<void>>();
     let quotaBytes: number = d.loadQuotaBytes();
     let lastError: string | undefined;
     let totalBytes = 0; // tracked incrementally
@@ -170,112 +172,79 @@ export function createDownloads(
 
     // -- Pinned keys (pushed by caller via setPinnedKeys) --------------------
 
+    let membershipComplete = true;
     let activeKeys: ReadonlySet<string> = new Set();
     let retainKeys: ReadonlySet<string> = new Set();
 
-    // -- Downloaded keys set (refreshed during recalculation) ----------------
-
-    let downloadedKeys: Set<string> = new Set();
-
-    // -- AbortController for in-flight downloads -----------------------------
-
-    let abortController: AbortController | undefined;
+    // Completed writes update the map in place; a disk inventory replaces it.
+    let files = new Map<string, number>();
 
     // -- Single-flight guard for recalculateQueue ----------------------------
 
-    let recalculating = false;
+    let recalculating: Promise<void> | undefined;
 
     // -- Notify UI -----------------------------------------------------------
 
-    const notifyUI = (): void => {
-        try { downloads.onStateChange(); } catch { /* caller error must not break engine */ }
+    const notifyUI: Downloads['onStateChange'] = inventory => {
+        try { downloads.onStateChange(inventory); } catch { /* caller error must not break engine */ }
     };
 
     // -- Queue recalculation -------------------------------------------------
 
-    /**
-     * Recalculates the download queue from activeKeys/retainKeys, then
-     * starts the download pump. Returns void (not Promise) — all errors
-     * are handled internally, enforcing fire-and-forget at the type level.
-     * Single-flight: if already running, sets dirty and returns.
-     * The running call loops if dirty was re-set during execution.
-     */
-    function recalculate(): void {
-        if (recalculating) { dirty = true; return; }
-        recalculating = true;
-
-        // Abort any in-flight downloads from previous queue
-        abortController?.abort();
-        abortController = new AbortController();
-        generation++;
-        activeDownloads = 0; // orphaned workers skip decrement; reset here
-
-        (async () => {
+    /** Confirm the inventory and queue before acknowledging a pin edit. Edits that
+     * arrive during a scan share its promise and repeat the scan for the newest keys. */
+    function recalculate(): Promise<void> {
+        if (recalculating) { dirty = true; return recalculating; }
+        controller.abort();
+        controller = new AbortController();
+        activeDownloads = 0;
+        queue = [];
+        recalculating = Promise.resolve().then(async () => {
+            let inventory = files;
             try {
+                // A cancelled request may already have submitted its write to IndexedDB.
+                if (pendingSaves.size) await Promise.allSettled(pendingSaves);
                 do {
                     dirty = false;
-
-                    // 1. Get existing downloaded keys
-                    const existingKeys = await d.audioKeys().catch((e: unknown) => {
-                        logError(`downloads: audioKeys failed: ${e}`);
-                        return [] as string[];
-                    });
-                    const existingSet = new Set(existingKeys);
-                    downloadedKeys = existingSet;
-
-                    // 2. Queue = activeKeys − downloaded
-                    queue = Array.from(activeKeys)
-                        .filter(k => !existingSet.has(k))
-                        .map(k => { const [driveId, itemId] = k.split(':'); return { driveId, itemId }; });
-                    queueDrainedLogged = false;
-                    log(`downloads: queue recalculated queued=${queue.length} active=${activeKeys.size} retain=${retainKeys.size} downloaded=${downloadedKeys.size}`);
-
-                    // 3. Garbage collect: downloaded − retainKeys → delete
-                    //    GC safety: skip when retainKeys is empty (incomplete index guard)
-                    if (retainKeys.size > 0) {
-                        for (const key of existingKeys) {
-                            if (!retainKeys.has(key)) {
-                                const blob = await d.audioGet(key).catch(() => undefined);
-                                const blobSize = blob?.size ?? 0;
-                                await d.audioDelete(key).catch((e: unknown) => {
-                                    logError(`downloads: audioDelete failed for ${key}: ${e}`);
-                                });
-                                downloadedKeys.delete(key);
-                                totalBytes = Math.max(0, totalBytes - blobSize);
-                            }
-                        }
+                    inventory = await d.audioFileSizes();
+                    // Unresolved membership and the M11 empty-set guard both defer cleanup.
+                    const orphans = membershipComplete && retainKeys.size ? [...inventory.keys()].filter(key => !retainKeys.has(key)) : [];
+                    if (orphans.length) {
+                        await d.audioDeleteBatch(orphans);
+                        for (const key of orphans) inventory.delete(key);
                     }
-
-                    // 4. Recalculate totalBytes from scratch (accurate baseline)
-                    totalBytes = await d.audioTotalBytes().catch((e: unknown) => {
-                        logError(`downloads: audioTotalBytes failed: ${e}`);
-                        return 0;
-                    });
-
-                    // 5. Check quota
-                    overQuota = totalBytes > quotaBytes;
-                    lastError = undefined;
-
                 } while (dirty);
-            } catch (e) {
-                logError(`downloads: recalculate failed: ${e}`);
+                for (const key of activeKeys) {
+                    if (inventory.has(key)) continue;
+                    const [driveId, itemId] = key.split(':');
+                    queue.push({driveId, itemId});
+                }
+                queueDrainedLogged = false;
+                lastError = undefined;
+                log(`downloads: queue recalculated queued=${queue.length} active=${activeKeys.size} retain=${retainKeys.size} downloaded=${inventory.size}`);
+            } catch (error) {
+                dirty = true;
+                lastError = 'Could not read or update offline storage.';
+                throw error;
             } finally {
-                recalculating = false;
+                files = inventory;
+                totalBytes = 0;
+                for (const bytes of files.values()) totalBytes += bytes;
+                overQuota = totalBytes > quotaBytes;
+                recalculating = undefined;
+                pumpDownloads();
+                notifyUI({files});
             }
-
-            // Start pump
-            pumpDownloads();
-            notifyUI();
-        })();
+        });
+        return recalculating;
     }
 
     // -- Download pump -------------------------------------------------------
 
     function pumpDownloads(): void {
-        while (activeDownloads < MAX_CONCURRENT && queue.length > 0
+        while (!recalculating && activeDownloads < MAX_CONCURRENT && queue.length > 0
             && d.getEvidence() === 'evidence:signed-in' && !overQuota) {
             const item = queue.shift()!;
-            activeDownloads++;
             downloadOneTrack(item);
         }
     }
@@ -283,8 +252,7 @@ export function createDownloads(
     /**
      * Downloads a single track. Returns void (not Promise) — all errors
      * are handled internally, enforcing fire-and-forget at the type level.
-     * Captures the current generation at start; refuses to commit writes
-     * if the generation has advanced (abort safety).
+     * A replaced queue cancels its requests through their shared signal.
      *
      * Error classification per DESIGN.md:
      * - 404 → remove from queue (track deleted/moved)
@@ -296,8 +264,9 @@ export function createDownloads(
      */
     function downloadOneTrack(item: QueueItem): void {
         const key = `${item.driveId}:${item.itemId}`;
-        const signal = abortController?.signal;
-        const myGeneration = generation;
+        activeDownloads++;
+        const {signal} = controller;
+        let result: Parameters<Downloads['onStateChange']>[0];
 
         (async () => {
             try {
@@ -307,40 +276,43 @@ export function createDownloads(
                     false,
                     { signal },
                 );
-                if (signal?.aborted || myGeneration !== generation) return;
+                if (signal.aborted) return;
 
                 if (!metaR.ok) {
-                    classifyHttpError(metaR.status, item);
+                    result = classifyHttpError(metaR.status, item);
                     return;
                 }
 
                 const meta = await readGraphJson(metaR, 'download URL');
                 const downloadUrl: string | undefined = meta['@microsoft.graph.downloadUrl'];
                 if (!downloadUrl) {
+                    result = {unavailable: key};
                     logError(`download: no URL for ${key}`);
                     return; // remove from queue (don't re-add)
                 }
 
                 // 2. Fetch the audio data (plain fetch, SAS-token URL)
                 const audioR = await d.fetcher(downloadUrl, { signal });
-                if (signal?.aborted || myGeneration !== generation) return;
+                if (signal.aborted) return;
 
                 if (!audioR.ok) {
-                    classifyHttpError(audioR.status, item);
+                    result = classifyHttpError(audioR.status, item);
                     return;
                 }
 
                 const blob = await audioR.blob();
-                if (signal?.aborted || myGeneration !== generation) return;
+                if (signal.aborted) return;
 
-                // 3. Store in IndexedDB (generation guard prevents stale writes)
-                await d.audioPut(key, blob);
-                if (myGeneration !== generation) return;
-                downloadedKeys.add(key);
+                const save = d.audioPut(key, blob);
+                pendingSaves.add(save);
+                try { await save; } finally { pendingSaves.delete(save); }
+                if (signal.aborted) return;
+                files.set(key, blob.size);
                 totalBytes += blob.size;
+                result = {added: [key, blob.size]};
 
             } catch (e) {
-                if (signal?.aborted || myGeneration !== generation) return;
+                if (signal.aborted) return;
                 const msg = errorMessage(e);
                 if (msg.includes('timeout') || msg.includes('abort')) {
                     lastError = msg;
@@ -358,7 +330,7 @@ export function createDownloads(
                     logError(`download error for ${key}: ${errorDetail(e)}`);
                 }
             } finally {
-                if (myGeneration === generation) {
+                if (!signal.aborted) {
                     activeDownloads--;
                     // Check if quota is now exceeded
                     overQuota = totalBytes > quotaBytes;
@@ -371,11 +343,10 @@ export function createDownloads(
                         && d.getEvidence() === 'evidence:signed-in'
                     ) {
                         queueDrainedLogged = true;
-                        log(`downloads: queue drained downloaded=${downloadedKeys.size} retain=${retainKeys.size}`);
+                        log(`downloads: queue drained downloaded=${files.size} retain=${retainKeys.size}`);
                     }
-                    notifyUI();
+                    notifyUI(result);
                 }
-                // If generation advanced, this task is orphaned — don't touch state.
             }
         })();
     }
@@ -385,7 +356,7 @@ export function createDownloads(
      * For plain fetches (SAS-token audio), evidence classification is delegated
      * to auth via deps.provideEvidenceFromHttpStatus.
      * Queue management: 404 → remove, 429/5xx → retry, timeout → pause. */
-    function classifyHttpError(status: number, item: QueueItem): void {
+    function classifyHttpError(status: number, item: QueueItem): {unavailable: string} | undefined {
         if (status === 429 || status === 500 || status === 502 || status === 503) {
             // Transient: push to back of queue for retry
             queue.push(item);
@@ -411,6 +382,7 @@ export function createDownloads(
         } else {
             // Other (including 404): remove from queue
             logError(`download: ${status} for ${item.driveId}:${item.itemId}, removing`);
+            return {unavailable: `${item.driveId}:${item.itemId}`};
         }
     }
 
@@ -423,33 +395,27 @@ export function createDownloads(
         return true;
     }
 
-    /** Builds a Set of queued keys for the snapshot. */
-    function queuedKeysSet(): ReadonlySet<string> {
-        return new Set(queue.map(item => `${item.driveId}:${item.itemId}`));
-    }
-
     // -- Public API ----------------------------------------------------------
 
     const downloads: Downloads = {
-        setPinnedKeys(newActiveKeys, newRetainKeys) {
+        async setPinnedKeys(newActiveKeys, newRetainKeys, complete = true) {
             // Enforce invariant: activeKeys ⊆ retainKeys
             const enforced = new Set(newRetainKeys);
             for (const k of newActiveKeys) enforced.add(k);
 
-            // Skip if unchanged (prevents feedback loop: onStateChange → computeAndPush → setPinnedKeys → recalculate → onStateChange)
-            if (setsEqual(newActiveKeys, activeKeys) && setsEqual(enforced, retainKeys)) return;
-
+            if (!dirty && complete === membershipComplete && setsEqual(newActiveKeys, activeKeys) && setsEqual(enforced, retainKeys)) return recalculating;
+            membershipComplete = complete;
             activeKeys = new Set(newActiveKeys); // defensive copy
             retainKeys = enforced;
             dirty = true;
-            recalculate();
+            return recalculate();
         },
 
         handleEvidenceTransition() {
             const newState = d.getEvidence();
 
             if (newState === 'evidence:signed-in' && dirty) {
-                recalculate();  // recalculate calls notifyUI internally
+                recalculate().catch(logCatch('downloads: evidence inventory'));
             } else if (newState === 'evidence:signed-in' && !dirty) {
                 // Not dirty but signed in: clear latched error, resume pump
                 lastError = undefined;
@@ -463,7 +429,7 @@ export function createDownloads(
             // All non-signed-in states (no-evidence, signed-out, not-online):
             // pump is already guarded by the d.getEvidence() === 'evidence:signed-in' check.
             // No special action needed. In-flight downloads fail naturally via
-            // error classification; the generation counter prevents stale writes.
+            // error classification.
         },
 
         async getOfflineBlob(driveId, itemId) {
@@ -472,8 +438,8 @@ export function createDownloads(
 
         getSnapshot(): DownloadSnapshot {
             return {
-                downloadedKeys: new Set(downloadedKeys), // defensive copy for snapshot immutability
-                queuedKeys: queuedKeysSet(),
+                files,
+                queuedCount: queue.length,
                 overQuota,
                 lastError,
                 evidence: d.getEvidence(),
@@ -487,32 +453,30 @@ export function createDownloads(
             d.saveQuotaBytes(quotaBytes);
             dirty = true;
             if (d.getEvidence() === 'evidence:signed-in') {
-                recalculate();
+                recalculate().catch(logCatch('downloads: refresh inventory'));
             }
         },
 
-        clearError() {
-            if (!lastError) return;
+        async clearError() {
             lastError = undefined;
             dirty = true;
-            if (d.getEvidence() === 'evidence:signed-in') {
-                recalculate();
-            }
-            notifyUI();
+            if (d.getEvidence() === 'evidence:signed-in') await recalculate();
+            else notifyUI();
         },
 
         async clear() {
-            abortController?.abort();
-            abortController = new AbortController();
-            generation++; // orphan any in-flight tasks
-            queue = [];
+            controller.abort();
             activeDownloads = 0;
-            downloadedKeys.clear();
+            activeKeys = new Set();
+            retainKeys = new Set();
+            queue = [];
+            await Promise.allSettled([...pendingSaves, ...(recalculating ? [recalculating] : [])]);
+            await d.audioClear();
+            files = new Map();
             overQuota = false;
             lastError = undefined;
             totalBytes = 0;
-            await d.audioClear();
-            notifyUI();
+            notifyUI({files});
         },
 
         onStateChange: () => {},

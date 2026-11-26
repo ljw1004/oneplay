@@ -1,16 +1,13 @@
 import Foundation
-import os
 import XCTest
 @testable import OnePlayMusic
 
 final class PinCDN: URLProtocol {
-    static let requests = OSAllocatedUnfairLock(initialState: [String]())
     override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "pin.test" }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func stopLoading() {}
     override func startLoading() {
         let url = request.url!
-        Self.requests.withLock { $0.append(url.path) }
         let bytes = url.path == "/tone" ? try! Data(contentsOf: Bundle(for: Self.self).url(forResource: "ScaleTone", withExtension: "mp3")!) : url.path == "/short" ? Data([1]) : Data([1, 2, 3])
         client?.urlProtocol(self, didReceive: HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1",
             headerFields: ["Content-Length": String(bytes.count)])!, cacheStoragePolicy: .notAllowed)
@@ -55,13 +52,11 @@ final class PinCDN: URLProtocol {
         XCTAssertEqual(try Data(contentsOf: store.pinURL(key)), song)
         try pins.control("quota", quota: 2)
         try pins.apply(owners: [owner("two", paused: true, complete: false, keys: [])])
-        // A crash between the native fence and the IndexedDB transaction cannot resume obsolete work.
-        try pins.control("fence", quota: nil)
         let cold = OfflinePins(configuration: .ephemeral)
         try await cold.bind(store)
         XCTAssertEqual(cold.completeKeys, [key])
         XCTAssertEqual(cold.snapshot(after: nil)["quota"] as? Int, 2 << 30)
-        XCTAssertEqual(cold.snapshot(after: nil)["missing"] as? [String], [])
+        XCTAssertEqual(cold.snapshot(after: nil)["queuedCount"] as? Int, 0)
         try cold.apply(owners: [owner("restored", paused: false)])
         // An open descriptor (the decoder's lease) stays usable after the last owner unpins.
         let lease = try FileHandle(forReadingFrom: store.pinURL(key))
@@ -70,6 +65,80 @@ final class PinCDN: URLProtocol {
         XCTAssertEqual(try lease.readToEnd(), song)
         try lease.close()
         await pins.unbindAndCancel()
+    }
+
+    /// Reopen an over-quota album, discover a new recording under its stable folder ID,
+    /// then admit only that download and play its durable MP3 on another cold open.
+    func testColdInventoryRetains500TracksAboveQuotaAndResumesAfterAnIncrease() async throws {
+        let dir = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = try PlaybackStore(root: dir, home: "listener", drive: "library")
+        let seed = OfflinePins(configuration: .ephemeral)
+        try await seed.bind(store)
+        let keys = (0..<500).map { "library:track-\($0)" }
+        let pending = "library:next"
+        func folder(_ files: [String]) -> [String: Any] {
+            ["id":"folder:[\"library\",null,\"album\"]", "paused":false, "complete":true, "sources":["library":files]]
+        }
+        try seed.apply(owners: [folder(keys)])
+        try seed.control("quota", quota: 2)
+        let trackBytes = 5_600_000
+        for key in keys {
+            let file = store.pinURL(key)
+            try Data().write(to: file)
+            let handle = try FileHandle(forWritingTo: file)
+            try handle.truncate(atOffset: UInt64(trackBytes))
+            try handle.close()
+            try PinReceipt(size: trackBytes, version: "fixture").write(to: file)
+        }
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [PinCDN.self]
+        let cold = OfflinePins(configuration: config)
+        let start = ContinuousClock.now
+        try await cold.bind(store)
+        print("Cold pin inventory: 500 files, \(trackBytes * keys.count) bytes in \(start.duration(to: .now))")
+        let snapshot = cold.snapshot(after: nil)
+        XCTAssertEqual(snapshot["total"] as? Int, 2_800_000_000)
+        XCTAssertEqual(snapshot["quota"] as? Int, 2 << 30)
+        XCTAssertEqual(cold.completeKeys, Set(keys))
+        XCTAssertEqual(snapshot["queuedCount"] as? Int, 0)
+        try cold.apply(owners: [folder(keys + [pending])])
+        XCTAssertEqual(cold.snapshot(after: nil)["queuedCount"] as? Int, 1)
+        await cold.connectSession()
+        let overQuota = expectation(description: "A 2 GiB quota holds the remaining lookup")
+        overQuota.isInverted = true
+        cold.lookup = { _,_,_ in overQuota.fulfill(); throw NativeAccountError.unavailable }
+        cold.updateEvidence("evidence:signed-in")
+        await fulfillment(of: [overQuota], timeout: 0.15)
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "ScaleTone", withExtension: "mp3"))
+        let song = try Data(contentsOf: file)
+        var lookups = [String]()
+        cold.lookup = { _, id, _ in
+            lookups.append(id)
+            return MediaLocation(url: URL(string: "https://pin.test/tone")!, etag: "v2", size: Int64(song.count))
+        }
+        let finished = expectation(description: "The 5 GiB quota admits and finishes the new track")
+        cold.onChange = {
+            if cold.completeKeys.contains(pending) { cold.onChange = nil; finished.fulfill() }
+        }
+        try cold.control("quota", quota: 5)
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(lookups, ["next"])
+        await cold.unbindAndCancel()
+        let offline = OfflinePins(configuration: config)
+        try await offline.bind(store)
+        XCTAssertEqual(offline.completeKeys, Set(keys + [pending]))
+        XCTAssertEqual(offline.snapshot(after: nil)["total"] as? Int, 2_800_000_000 + song.count)
+        XCTAssertEqual(try Data(contentsOf: store.pinURL(pending)), song)
+        let player = NativePlayback { _,_,_,_ in XCTFail("The cached track requested the network"); throw NativeAccountError.transient }
+        try player.restoreIfNeeded(from: store)
+        player.setOfflineAvailability(offline.completeKeys)
+        let next = IndexedTrack(driveId:"library", itemId:"next", path:["Music","library","Album","New.mp3"])
+        try player.start(tracks: [next], delaySeconds:0, nearEnd:false, forceRefresh:false)
+        let deadline = ContinuousClock.now + .seconds(5)
+        while (player.snapshot["position"] as? Double ?? 0) < 0.05, .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertGreaterThanOrEqual(player.snapshot["position"] as? Double ?? 0, 0.05, player.status)
+        try await player.stopAndDrain()
     }
 
     func testMissingItemDoesNotStopHealthyPinAndTruncatedColdFileIsQueuedAgain() async throws {
@@ -100,32 +169,40 @@ final class PinCDN: URLProtocol {
         let cold = OfflinePins(configuration: .ephemeral)
         try await cold.bind(store)
         XCTAssertTrue(cold.completeKeys.isEmpty)
-        XCTAssertEqual(Set(cold.snapshot(after:nil)["missing"] as? [String] ?? []), ["d:gone","d:ok"])
+        XCTAssertEqual(cold.snapshot(after:nil)["queuedCount"] as? Int, 2)
         await pins.unbindAndCancel()
     }
 
-    func testLastOwnerLeaseLeavesQuotaAtNaturalEnd() async throws {
+    func testUnpinFolderThenPlayPlaylistOfflineAndReleaseLastOwnerAtNaturalEnd() async throws {
         let dir = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = try PlaybackStore(root: dir, home: "listener", drive: "library")
         let intent = OfflinePins(configuration: .ephemeral)
         try await intent.bind(store)
-        try intent.apply(owners: [["id":"solo","paused":true,"complete":true,"sources":["d":["d:A"]]]])
+        let playlist: [String: Any] = ["id":"mix", "paused":false, "complete":true, "sources":["d":["d:A"]]]
+        let folder: [String: Any] = ["id":"folder:[\"d\",null,\"album\"]", "paused":false, "complete":true, "sources":["d":["d:A"]]]
+        try intent.apply(owners: [folder, playlist])
         let fixture = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "AudibleTail", withExtension: "mp3"))
         let file = store.pinURL("d:A"), length = try Data(contentsOf: fixture).count
         try FileManager.default.copyItem(at: fixture, to: file)
         try PinReceipt(size: length, version: "v").write(to: file)
         let pins = OfflinePins(configuration: .ephemeral)
         try await pins.bind(store)
+        // Removing the album leaves the playlist's verified copy available offline.
+        try pins.apply(owners: [playlist])
+        XCTAssertEqual(pins.completeKeys, ["d:A"])
         let player = NativePlayback { _,_,_,_ in XCTFail("The pin is local"); throw NativeAccountError.transient }
         try player.restoreIfNeeded(from: store)
+        player.setOfflineAvailability(pins.completeKeys)
         pins.playerHolds = player.holdsPin
         player.onChange = { debug in if !debug { pins.releaseUnusedLeases() } }
         try player.start(tracks: [IndexedTrack(driveId:"d", itemId:"A", path:["Music","d","A"], key:"A")],
                          delaySeconds:0, nearEnd:false, forceRefresh:false)
         defer { player.stop() }
         let start = ContinuousClock.now + .seconds(4)
-        while !player.holdsPin("d:A"), .now < start { try await Task.sleep(for: .milliseconds(10)) }
+        while player.snapshot["state"] as? String != "playing", .now < start { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(player.snapshot["state"] as? String, "playing", player.status)
+        XCTAssertTrue(player.holdsPin("d:A"))
         try pins.apply(owners: [])
         XCTAssertTrue(pins.completeKeys.isEmpty)
         XCTAssertEqual(pins.snapshot(after:nil)["total"] as? Int, length)

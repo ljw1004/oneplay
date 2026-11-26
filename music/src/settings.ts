@@ -10,6 +10,7 @@
 import { logCatch } from './logger.js';
 import { type EvidenceState } from './auth.js';
 import { type IndexProgress } from './indexer.js';
+import type { RemoveImpact } from './shares.js';
 import { showModal, addModalActions } from './modal.js';
 
 export type TimerDuration = '15m' | '30m' | '45m' | '60m' | 'end-of-track';
@@ -20,7 +21,7 @@ export interface SettingsShareRow {
     readonly id: string;
     readonly label: string;
     readonly deniedReason?: string;
-    readonly getRemoveImpact: () => { uniqueTrackCount: number; affectedFavoriteCount: number };
+    readonly getRemoveImpact: () => RemoveImpact;
 }
 
 export interface SettingsShareIndexRow {
@@ -314,10 +315,15 @@ export function createSettings(container: HTMLElement): SettingsView {
                 removeBtn.innerHTML = ACTION_DELETE_ICON_SVG;
                 removeBtn.addEventListener('click', () => {
                     showModal('Disconnect from share', (modal, close) => {
-                        const { uniqueTrackCount, affectedFavoriteCount } = share.getRemoveImpact();
+                        const { uniqueTrackCount, affectedFavoriteCount, folderPinCount } = share.getRemoveImpact();
                         if (affectedFavoriteCount > 0) {
                             const p = document.createElement('p');
                             p.textContent = `This will remove ${uniqueTrackCount} tracks from ${affectedFavoriteCount} playlists.`;
+                            modal.appendChild(p);
+                        }
+                        if (folderPinCount) {
+                            const p = document.createElement('p');
+                            p.textContent = `This will clear the offline setting for ${folderPinCount} folder${folderPinCount === 1 ? '' : 's'} in this share.`;
                             modal.appendChild(p);
                         }
                         addModalActions(modal, close, 'Disconnect', async () => {

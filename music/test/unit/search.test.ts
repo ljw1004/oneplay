@@ -94,6 +94,7 @@ function buildRoots(options?: {
     });
     roots.set(shareKey, {
         type: 'share',
+        connectionId: 'connection',
         key: shareKey,
         name: 'Shared',
         driveId: shareDriveId,

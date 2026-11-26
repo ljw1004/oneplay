@@ -44,7 +44,7 @@ I am adamant about clean engineering. What I look for:
 
 ## Agent peer review
 
-Agents can and should get opinions from other agents:
+Use only the reviewer roles named in the instructions. Every review round requires a dedicated KISS reviewer, including rounds after fixes. Never launch a general reviewer.
 - Claude is invoked by writing your request for claude to a file, then asking the user to ask claude on your behalf and give the user the prompt to use in triple backticks, "Please read XYZ.md and write your response in ABC.md". The user will let you know when it's done.
 - Codex can be invoked `codex exec "prompt goes here"`
 - A great prompt is "Please read instructions in /tmp/instr.txt and write your answers in markdown to /tmp/result.md"
@@ -130,7 +130,7 @@ Common symptoms and where to look:
 - **App doesn't render / stuck at sign-in** — `music/src/index.ts:onBodyLoad()`, `music/src/auth.ts:handleOauthRedirect()`, `music/src/auth.ts:isSignedIn()`.
 - **Index seems stale / missing folders** — `music/src/index.ts:pullMusicFolderFromOneDrive()`, `music/src/indexer.ts:buildIndex()`, `music/src/indexer.ts:SCHEMA_VERSION`.
 - **Tree navigation wrong / broken paths after reindex** — `music/src/tree.ts:resolveFolder()`, `music/src/favorites.ts:heal()`.
-- **Playback skips / wrong order / wrong track** — `music/src/playback.ts` track list + mode logic, `music/src/tracks.ts:collectLogicalTracks()` sort invariants.
+- **Playback skips / wrong order / wrong track** — `music/src/playback.ts` track list + mode logic, `music/src/tracks.ts:buildLibraryQueue()` sort invariants.
 - **Offline downloads not progressing / icons wrong** — `music/src/downloads.ts` evidence transitions + snapshot, `music/src/index.ts:computeAndPushOfflineState()`.
 
 

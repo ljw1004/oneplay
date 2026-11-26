@@ -114,9 +114,10 @@ export async function audioPut(key: string, blob: Blob): Promise<void> {
     const db = await dbOpen();
     try {
         await new Promise<void>((resolve, reject) => {
-            const req = db.transaction('audio', 'readwrite').objectStore('audio').put(blob, key);
-            req.onsuccess = () => resolve();
-            req.onerror = () => reject(req.error);
+            const tx = db.transaction('audio', 'readwrite');
+            tx.oncomplete = () => resolve();
+            tx.onabort = () => reject(tx.error ?? new Error('Audio cache transaction aborted'));
+            tx.objectStore('audio').put(blob, key);
         });
     } finally {
         db.close();
@@ -137,56 +138,37 @@ export async function audioGet(key: string): Promise<Blob | undefined> {
     }
 }
 
-/** Deletes an audio blob by key. */
-export async function audioDelete(key: string): Promise<void> {
+/** Delete the unowned files in one transaction. The caller updates its inventory after the commit. */
+export async function audioDeleteBatch(keys: readonly string[]): Promise<void> {
     const db = await dbOpen();
     try {
         await new Promise<void>((resolve, reject) => {
-            const req = db.transaction('audio', 'readwrite').objectStore('audio').delete(key);
-            req.onsuccess = () => resolve();
-            req.onerror = () => reject(req.error);
+            const tx = db.transaction('audio', 'readwrite');
+            tx.oncomplete = () => resolve();
+            tx.onabort = () => reject(tx.error ?? new Error('Audio cache transaction aborted'));
+            const store = tx.objectStore('audio');
+            for (const key of keys) store.delete(key);
         });
-    } finally {
-        db.close();
-    }
+    } finally { db.close(); }
 }
 
-/** Returns all keys in the audio store. */
-export async function audioKeys(): Promise<string[]> {
+/** Reads keys and blob sizes in one cursor pass without loading audio bytes into JS. */
+export async function audioFileSizes(): Promise<Map<string, number>> {
     const db = await dbOpen();
     try {
-        return await new Promise<string[]>((resolve, reject) => {
-            const req = db.transaction('audio', 'readonly').objectStore('audio').getAllKeys();
-            req.onsuccess = () => resolve(req.result as string[]);
-            req.onerror = () => reject(req.error);
-        });
-    } finally {
-        db.close();
-    }
-}
-
-/** Returns the total size in bytes of all audio blobs (cursor walk). */
-export async function audioTotalBytes(): Promise<number> {
-    const db = await dbOpen();
-    try {
-        return await new Promise<number>((resolve, reject) => {
-            let total = 0;
+        return await new Promise<Map<string, number>>((resolve, reject) => {
+            const sizes = new Map<string, number>();
             const req = db.transaction('audio', 'readonly').objectStore('audio').openCursor();
             req.onsuccess = () => {
                 const cursor = req.result;
                 if (cursor) {
-                    const blob = cursor.value as Blob;
-                    total += blob.size;
+                    sizes.set(cursor.key as string, (cursor.value as Blob).size);
                     cursor.continue();
-                } else {
-                    resolve(total);
-                }
+                } else resolve(sizes);
             };
             req.onerror = () => reject(req.error);
         });
-    } finally {
-        db.close();
-    }
+    } finally { db.close(); }
 }
 
 /** Wipes every entry in the audio store. */
@@ -194,9 +176,10 @@ export async function audioClear(): Promise<void> {
     const db = await dbOpen();
     try {
         await new Promise<void>((resolve, reject) => {
-            const req = db.transaction('audio', 'readwrite').objectStore('audio').clear();
-            req.onsuccess = () => resolve();
-            req.onerror = () => reject(req.error);
+            const tx = db.transaction('audio', 'readwrite');
+            tx.oncomplete = () => resolve();
+            tx.onabort = () => reject(tx.error ?? new Error('Audio cache transaction aborted'));
+            tx.objectStore('audio').clear();
         });
     } finally {
         db.close();

@@ -222,6 +222,97 @@ module.exports = {
         assert.equal(await page.locator('#footer').getAttribute('aria-busy'), null);
     },
 
+    /** Exercise selection, mode picks and bookmarks through the browser player with a known pass. */
+    async 'wheel: favorite modes follow the playing route independently of Remember my spot'(page) {
+        const url = globalThis.__ONEPLAY_TEST_URL;
+        await page.route(url, r => r.fulfill({contentType: 'text/html', body:
+            '<link rel="stylesheet" href="index.css"><audio muted></audio><div id="footer"></div>'}));
+        await page.route('**/mode.wav', r => r.fulfill({contentType: 'audio/wav', body: silentWav()}));
+        await page.goto(url);
+        await page.evaluate(async () => {
+            const [{createPlayback}, {createFavorites}] = await Promise.all(
+                ['playback', 'favorites'].map(m => import('./dist/' + m + '.js')));
+            const folder = {id: 'album', children: Object.fromEntries(['A','B','C'].map(id => [id, {id}]))};
+            const roots = new Map([['drive', {type: 'onedrive', key: 'drive', name: 'Album', folder, info: {driveId: 'drive'}}]]);
+            const accounts = new Map([['drive', {driveId: 'drive', folder}]]);
+            const audio = document.querySelector('audio');
+            const player = createPlayback(audio, document.querySelector('#footer'), async () => new Response(null, {status: 404}));
+            const wav = await (await fetch('mode.wav')).arrayBuffer();
+            player.setDownloads({getOfflineBlob: async (_, id) => {
+                const bytes = new Uint8Array(wav.slice(0));
+                bytes[44] = id.charCodeAt(0);
+                return new Blob([bytes], {type: 'audio/wav'});
+            }});
+            const favorites = createFavorites({dbPut: async () => {}, authFetch: async () => new Response('{}')}, async () => {
+                player.setContext(favorites, roots);
+                await player.refreshLibraryQueue(true);
+            });
+            for (const remember of [false, true]) {
+                await favorites.add({kind: 'shortcut', id: String(remember), name: 'Album', hasPrivatePlayback: remember,
+                    target: {driveId: 'drive', sourceRootKey: 'drive', itemId: 'album', path: [], isFolder: true}});
+            }
+            Math.random = () => 0;
+            window.selectAlbum = (root, track) => {
+                const path = ['OnePlay Music', root];
+                return track ? player.playTrack([...path, track], accounts) : player.playFolder(path, accounts);
+            };
+            window.changeFavorite = (id, mode) => favorites.setMode(id, mode);
+            window.setRemember = (id, remember) => favorites.setHasPrivatePlayback(id, remember);
+        });
+        const choose = (root, track) => page.evaluate(([r, t]) => window.selectAlbum(r, t), [root, track]);
+        const mode = page.locator('.mode-label');
+        const title = page.locator('.footer-title');
+        for (const remember of [false, true]) {
+            const id = String(remember), favorite = 'fav:' + id;
+            await choose('drive');
+            await setPlaybackMode(page, 'one');
+            await choose(favorite, 'B');
+            assert.equal(await mode.textContent(), 'one');
+            await setPlaybackMode(page, 'shuffle');
+            await choose('drive');
+            assert.equal(await mode.textContent(), 'shuffle');
+            assert.equal(await title.textContent(), 'B'); // Fresh [B,C,A] pass.
+            await setPlaybackMode(page, 'all');
+            await choose(favorite, 'A');
+            assert.equal(await title.textContent(), 'A');
+            assert.equal(await mode.textContent(), 'shuffle');
+            await page.locator('.scrubber-edge-button.right').evaluate(el => el.click());
+            // Tapped A first, then shuffled [C,B]. Wait for the new source to play past zero.
+            await page.waitForFunction(() => document.querySelector('.footer-title').textContent === 'C'
+                && !document.querySelector('audio').paused && document.querySelector('audio').currentTime > 0.05);
+            assert.equal(await page.evaluate(async () => {
+                const bytes = await (await fetch(document.querySelector('audio').src)).arrayBuffer();
+                return String.fromCharCode(new Uint8Array(bytes)[44]);
+            }), 'C');
+
+            await page.evaluate(id => window.changeFavorite(id, 'one'), id);
+            await page.evaluate(id => window.setRemember(id, id !== 'true'), id);
+            assert.equal(await mode.textContent(), 'shuffle');
+            await choose(favorite, 'A');
+            assert.equal(await mode.textContent(), 'one');
+            await page.evaluate(id => window.setRemember(id, id === 'true'), id);
+            // The user's next selection sees the mode picked by this tap.
+            await page.evaluate(root => {
+                document.querySelector('.mode-label').click(); // One -> Timer.
+                return window.selectAlbum(root, 'C');
+            }, favorite);
+            assert.equal(await mode.textContent(), 'timer');
+            assert.equal(await title.textContent(), 'C');
+        }
+        // Sequential folder Play restores the private spot. A track tap starts that track at zero.
+        const audio = page.locator('audio');
+        await page.waitForFunction(() => document.querySelector('audio').readyState >= 2);
+        await audio.evaluate(el => { el.pause(); el.currentTime = 28; });
+        await page.waitForFunction(() => JSON.parse(localStorage['oneplay_music_fav:true']).time >= 28);
+        await choose('drive');
+        await choose('fav:true');
+        await page.waitForFunction(() => document.querySelector('audio').currentTime >= 28);
+        assert.equal(await title.textContent(), 'C');
+        await choose('fav:true', 'C');
+        await page.waitForFunction(() => document.querySelector('audio').readyState >= 2);
+        assert.ok(await audio.evaluate(el => el.currentTime < 2));
+    },
+
     /** Drive the native drawer through the snapshots from a cold Prev, including the gaps
      * between required reads. The fake clock makes a short wait and a visible wait distinct. */
     async 'wheel: native spinner stays through successive reads until playback'(page) {

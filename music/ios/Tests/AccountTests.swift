@@ -87,40 +87,89 @@ private final class TestAudioCDN: URLProtocol {
     func testBundledPinActionBarAndOfflineReopen() async throws {
         let tone = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "ScaleTone", withExtension: "mp3"))
         let size = try Data(contentsOf: tone).count
+        let cloud = try Data(contentsOf: XCTUnwrap(Bundle(for: Self.self).url(forResource: "SharedFolderPin", withExtension: "json")))
+        var cloudReads = 0
+        var graphOffline = false
+        var releaseShareMedia: CheckedContinuation<Void, Never>?
+        var holdShareMedia = true
+        defer { releaseShareMedia?.resume() }
         let account = try NativeAccount(recordFile: record, identity: TestIdentity()) { [self] req in
+            if graphOffline { throw URLError(.notConnectedToInternet) }
             if req.url?.path == "/v1.0/me/drive" { return try response(req, data: drive) }
-            if req.url?.path == "/v1.0/drives/library/items/a" {
-                let media: [String: Any] = ["id": "a", "size": size, "eTag": "v", "@microsoft.graph.downloadUrl": "https://pin.test/tone"]
+            if req.url?.path.hasPrefix("/v1.0/shares/") == true {
+                let result = req.url?.lastPathComponent == "driveItem"
+                    ? #"{"id":"root","name":"Shared music","folder":{},"parentReference":{"driveId":"remote"}}"#
+                    : #"{"id":"token"}"#
+                return try response(req,data:Data(result.utf8))
+            }
+            if req.url?.path.hasSuffix("/favorites.json:/content") == true && req.httpMethod == "GET" {
+                cloudReads += 1
+                return try response(req, data: cloud)
+            }
+            if req.url?.path == "/v1.0/$batch" {
+                let cached = #"{"responses":[{"id":"cache-root","status":200,"body":{"kind":"MusicData","schemaVersion":1,"size":20,"count":1,"folder":{"id":"root","children":{"Concert":{"id":"concert","children":{"Overture.mp3":{"id":"c"}}}}}}},{"id":"children-root","status":200,"body":{"value":[]}}]}"#
+                return try response(req, data: Data(cached.utf8))
+            }
+            if req.url?.path == "/v1.0/drives/remote/items/root" {
+                return try response(req, data: Data(#"{"id":"root","size":20,"folder":{}}"#.utf8))
+            }
+            if let id = req.url?.lastPathComponent, ["a", "b", "c"].contains(id) {
+                if id == "c" && holdShareMedia { await withCheckedContinuation { releaseShareMedia = $0 } }
+                let media: [String: Any] = ["id": id, "size": size, "eTag": "v", "@microsoft.graph.downloadUrl": "https://pin.test/tone"]
                 return try response(req, data: JSONSerialization.data(withJSONObject: media))
             }
             return try response(req, status: 404, data: Data())
         }
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [PinCDN.self]
-        let controller = LibraryController(account: account, store: .nonPersistent(), pinConfiguration: config)
+        let webStore = WKWebsiteDataStore.nonPersistent()
+        var controller = LibraryController(account: account, store: webStore, pinConfiguration: config)
         let host = try XCTUnwrap((UIApplication.shared.delegate as? AppDelegate)?.library)
-        host.addChild(controller)
-        host.view.addSubview(controller.view)
-        controller.didMove(toParent: host)
-        defer {
-            controller.player?.stop()
+        func attach() {
+            host.addChild(controller)
+            host.view.addSubview(controller.view)
+            controller.didMove(toParent: host)
+        }
+        func detach() {
             controller.detachPage()
             controller.willMove(toParent: nil)
             controller.view.removeFromSuperview()
             controller.removeFromParent()
         }
+        attach()
+        defer { detach() }
         var page = try await readyPage(in: controller)
         _ = try await page.callAsyncJavaScript("""
             const {dbPut} = await import('./dist/db.js');
             localStorage.setItem('oneplay_music_debug_enabled', '1');
             localStorage.setItem('account_info', JSON.stringify({driveId:'library',displayName:'Listener'}));
-            await dbPut('index:library',{kind:'MusicData',count:1,size:20,folder:{id:'album',children:{'First.mp3':{id:'a'}}}});
-            await dbPut('favorites',{updatedAt:1,favorites:[{kind:'playlist',id:'reader',name:'Offline album',members:[
-                {driveId:'library',sourceRootKey:'library',itemId:'a',isFolder:false,path:['First.mp3']}]}]});
+            await dbPut('index:library',{kind:'MusicData',schemaVersion:1,count:2,size:20,folder:{id:'root',children:{Books:{id:'books',
+                children:{Dune:{id:'dune',children:{'First.mp3':{id:'a'},'Second.mp3':{id:'b'}}}}}}}});
+            await dbPut('shares',{version:1,updatedAt:1,shares:[{id:'connection',shareId:'token',rootKey:'share:token',
+                driveId:'remote',rootItemId:'root',name:'Shared music',addedAt:1,updatedAt:1}]});
+            await dbPut('index-share:token',{kind:'MusicData',schemaVersion:1,count:1,size:20,folder:{id:'root',children:{
+                Concert:{id:'concert',children:{'Overture.mp3':{id:'c'}}}}}});
+            await dbPut('favorites',{version:1,updatedAt:1,favorites:[]});
             """, arguments: [:], in: nil, contentWorld: .page)
         _ = try await account.signIn(presenting: controller)
         page.reload()
         page = try await readyPage(in: controller, excluding: page)
+        // This exact document is a captured upload from the isolated PWA folder fixture.
+        // The first native Graph pull restores the intent while this device has no shared file.
+        let connection = try await page.callAsyncJavaScript("""
+            const favorites = window._testFavorites;
+            await favorites.pullFavoritesFromOneDrive();
+            const pin = favorites.getFolderPins().find(pin => pin.sourceRootKey === 'share:token');
+            await favorites.add({kind:'playlist',id:'reader',name:'Offline album',hasPrivatePlayback:false,members:[
+                {driveId:'library',sourceRootKey:'library',itemId:'a',isFolder:false,path:['Books','Dune','First.mp3']}]});
+            return pin?.connectionId;
+            """, arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertGreaterThan(cloudReads, 0)
+        XCTAssertEqual(connection as? String, "connection")
+        XCTAssertFalse(controller.pins.completeKeys.contains("remote:c"))
+        holdShareMedia = false
+        releaseShareMedia?.resume()
+        releaseShareMedia = nil
         func openDialog() async throws {
             _ = try await page.callAsyncJavaScript("""
                 if (!window._testTree) throw new Error('Missing library: '+JSON.stringify(window.__ONEPLAY_MUSIC_LOGS?.slice(-18)));
@@ -137,13 +186,97 @@ private final class TestAudioCDN: URLProtocol {
         _ = try await page.evaluateJavaScript("document.querySelector('.modal .modal-cancel').click()")
         // A successful account request is native signed-in evidence, even when other sync routes are unavailable.
         _ = try await account.media(driveID: "library", itemID: "a")
-        let deadline = ContinuousClock.now + .seconds(8)
-        while !controller.pins.completeKeys.contains("library:a"), .now < deadline { try await Task.sleep(for: .milliseconds(30)) }
-        let before = try await page.evaluateJavaScript("JSON.stringify([window._testFavorites.getAll().map(f=>[f.name,f.offlinePin]),window._testAuth.getEvidence(),document.querySelector('.modal')?.innerText])")
-        XCTAssertEqual(controller.pins.completeKeys, ["library:a"], "snapshot=\(controller.pins.snapshot(after:nil)), page=\(before ?? "")")
+        let storage = try XCTUnwrap(account.openPlaybackStore())
+        struct Owners: Decodable { var owners: [String: PinOwner] }
+        func waitForFiles(_ expected: Set<String>) async throws {
+            let deadline = ContinuousClock.now + .seconds(8)
+            while controller.pins.completeKeys != expected, .now < deadline { try await Task.sleep(for: .milliseconds(25)) }
+            XCTAssertEqual(controller.pins.completeKeys, expected, "Native pin inventory: \(controller.pins.snapshot(after:nil))")
+        }
+        try await waitForFiles(["library:a", "remote:c"])
+        // The album has one exclusive file. Its appearance proves the bundled folder
+        // action installed a native owner independently of the already-downloaded playlist.
+        func confirmFolderAction(parent: [String], child: String, action: String) async throws {
+            _ = try await page.callAsyncJavaScript("""
+                window._testTree.setSelectedPath(parent);
+                const row = [...document.querySelectorAll('#children .tree-row')].find(r => r.querySelector('.row-name').textContent === child);
+                const touch = {pointerType:'touch',pointerId:7,isPrimary:true,button:0,bubbles:true};
+                row.dispatchEvent(new PointerEvent('pointerdown', touch));
+                const holdDeadline = performance.now() + 3000;
+                while (!document.body.classList.contains('select-mode')) {
+                    if (performance.now() > holdDeadline) throw Error('Touch hold did not select ' + child);
+                    await new Promise(resolve => setTimeout(resolve, 10));
+                }
+                document.dispatchEvent(new PointerEvent('pointerup', touch));
+                if (!document.body.classList.contains('select-mode')) throw Error('Touch release cleared selection');
+                document.querySelector('#action-bar .right-btn').click();
+                const menu = [...document.querySelectorAll('.action-dropdown button')];
+                const status = action === 'Make available offline' ? 'Make available offline' : 'Available offline…';
+                if (menu.length !== 1 || menu[0].textContent !== status) throw Error('Unexpected folder status menu');
+                menu[0].click();
+                const modal = document.querySelector('.modal');
+                const choices = [...modal.querySelectorAll('button')];
+                choices.find(b => b.textContent.trim() === action).click();
+                const deadline = performance.now() + 4000;
+                while (modal.isConnected) {
+                    if (performance.now() > deadline) throw Error(modal.innerText);
+                    await new Promise(resolve => setTimeout(resolve, 10));
+                }
+                """, arguments: ["parent": parent, "child": child, "action": action], in: nil, contentWorld: .page)
+        }
+        let drive = ["OnePlay Music","library"]
+        try await confirmFolderAction(parent: drive + ["Books"], child: "Dune", action: "Make available offline")
+        try await waitForFiles(["library:a", "library:b", "remote:c"])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: storage.pinURL("library:b").path))
+        let partialCrumbs = try await page.callAsyncJavaScript("""
+            return [...document.querySelectorAll('#breadcrumbs .offline-badge.partial')].map(badge => {
+                const dots = [...badge.querySelector('path').getAttribute('d').matchAll(/M([\\d.]+) ([\\d.]+)h0/g)]
+                    .map(([,x,y]) => [Number(x),Number(y)]);
+                if (!dots.length || !dots.every(([x,y]) => dots.some(([a,b]) => a === 16-x && b === y)))
+                    throw Error('The dotted arrow is asymmetric');
+                return badge.closest('.tree-row').querySelector('.row-name').textContent;
+            });
+            """, arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertEqual(partialCrumbs as? [String], ["Books"])
+        let albumCrumbs = try await page.callAsyncJavaScript("""
+            window._testTree.setSelectedPath(['OnePlay Music','library','Books','Dune']);
+            return [...document.querySelectorAll('#breadcrumbs .offline-badge')].map(badge =>
+                [badge.closest('.tree-row').querySelector('.row-name').textContent,badge.classList.contains('partial')]);
+            """, arguments:[:], in:nil, contentWorld:.page)
+        let arrows = try XCTUnwrap(albumCrumbs as? [[Any]])
+        XCTAssertEqual(arrows.count,1)
+        XCTAssertEqual(arrows.first?.first as? String,"Dune")
+        XCTAssertEqual(arrows.first?.last as? Bool,false)
+        graphOffline = true
         account.updateNetworkPath(offline: true, interfaces: [])
-        page.reload()
-        page = try await readyPage(in: controller, excluding: page)
+        try await confirmFolderAction(parent: drive, child: "Books", action: "Make unavailable offline")
+        try await waitForFiles(["library:a", "remote:c"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storage.pinURL("library:b").path))
+
+        // This device still has the share and its pin, but has lost the cached listing.
+        _ = try await page.callAsyncJavaScript("""
+            const {dbDelete} = await import('./dist/db.js');
+            await dbDelete('index-share:token');
+            """, arguments: [:], in: nil, contentWorld: .page)
+        detach()
+        await controller.pins.unbindAndCancel()
+        try await controller.player?.stopAndDrain()
+        controller = LibraryController(account: account, store: webStore, pinConfiguration: config)
+        attach()
+        page = try await readyPage(in: controller)
+        // Wait for the unresolved owner to reach Swift before checking the retained audio.
+        let shareOwner = #"folder:["share:token","connection","concert"]"#
+        let deadline = ContinuousClock.now + .seconds(6)
+        var saved: PinOwner?
+        repeat {
+            saved = try storage.read(Owners.self, "pins")?.owners[shareOwner]
+            if saved?.sources.isEmpty == true { break }
+            try await Task.sleep(for: .milliseconds(25))
+        } while .now < deadline
+        XCTAssertEqual(saved?.sources, [:])
+        XCTAssertEqual(saved?.retained, ["remote:c"])
+        try await waitForFiles(["library:a", "remote:c"])
+        XCTAssertEqual(try Data(contentsOf: storage.pinURL("remote:c")), try Data(contentsOf: tone))
         try await openDialog()
         let ready = ContinuousClock.now + .seconds(3)
         var progress = ""
@@ -178,6 +311,274 @@ private final class TestAudioCDN: URLProtocol {
         ranges.name = "Expanded player with complete offline file"
         ranges.lifetime = .keepAlways
         add(ranges)
+        // The share cannot enumerate its album without a listing.
+        let blocked = try await page.callAsyncJavaScript("""
+            window._testTree.setSelectedPath(['OnePlay Music']);
+            const deadline = performance.now() + 5000;
+            while (performance.now() < deadline) {
+                const share = [...document.querySelectorAll('#children .tree-row')].find(r => r.textContent.includes('Shared music'));
+                if (share?.querySelector('.offline-badge.partial.paused')) return 'paused';
+                await new Promise(resolve => setTimeout(resolve, 20));
+            }
+            return [...document.querySelectorAll('#children .tree-row')].map(row => row.textContent+':'+row.querySelector('.offline-badge')?.className).join(', ') + ' ' + window._testAuth.getEvidence();
+            """, arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertEqual(blocked as? String, "paused")
+        XCTAssertEqual(controller.pins.completeKeys, ["library:a","remote:c"])
+
+        graphOffline = false
+        account.updateNetworkPath(offline: false, interfaces: [.wifi])
+        _ = try await account.media(driveID:"library", itemID:"a", lookup:.fresh)
+        // Disconnect and redeem the same link through Settings. The new UUID must
+        // start without the previous album's badge or native owner, even though
+        // the Graph response describes the identical physical album and recording.
+        let replacement = try await page.callAsyncJavaScript("""
+            async function confirm(selector) {
+                const modal = document.querySelector('.modal');
+                modal.querySelector(selector).click();
+                const until = performance.now()+8000;
+                while (modal.isConnected) {
+                    if (performance.now()>until) throw Error(modal.innerText);
+                    await new Promise(r=>setTimeout(r,20));
+                }
+            }
+            window._testTree.onSettingsClick();
+            document.querySelector('.settings-share-trash').click();
+            await confirm('.modal-danger');
+            document.querySelector('.settings-share-add').click();
+            document.querySelector('.modal input').value='https://example.test/same-link';
+            await confirm('.modal-confirm');
+            document.querySelector('.settings-close').click();
+            const share=window._testShares.getAll()[0], until=performance.now()+8000;
+            while (!window._testTree.getRoots().get(share.rootKey)?.folder?.children.Concert) {
+                if (performance.now()>until) throw Error('Reconnected album did not appear: '+JSON.stringify(window.__ONEPLAY_MUSIC_LOGS.slice(-20)));
+                await new Promise(r=>setTimeout(r,20));
+            }
+            window._testTree.setSelectedPath(['OnePlay Music',share.rootKey]);
+            const row=[...document.querySelectorAll('#children .tree-row')].find(r=>r.querySelector('.row-name').textContent==='Concert');
+            if (!row || row.querySelector('.offline-badge') || window._testFavorites.getFolderPins().length)
+                throw Error('The reconnected album inherited an offline setting');
+            return [share.shareId,share.id];
+            """, arguments:[:], in:nil, contentWorld:.page)
+        let replacementIDs = try XCTUnwrap(replacement as? [String])
+        XCTAssertEqual(replacementIDs.first,"token")
+        XCTAssertNotEqual(replacementIDs.last,"connection")
+        try await waitForFiles(["library:a"])
+        XCTAssertEqual(Set(try XCTUnwrap(storage.read(Owners.self,"pins")).owners.keys),["keep","reader"])
+        XCTAssertEqual(try Data(contentsOf:storage.pinURL("library:a")),try Data(contentsOf:tone))
+        XCTAssertFalse(FileManager.default.fileExists(atPath:storage.pinURL("remote:c").path))
+        // Remove the unrelated cross-device fixtures, leaving the playing playlist as
+        // the sole native owner. Exercise its final removal through the visible dialog.
+        graphOffline = true
+        account.updateNetworkPath(offline:true, interfaces:[])
+        _ = try await page.callAsyncJavaScript("""
+            const favorites = window._testFavorites;
+            await favorites.setOfflinePin('keep',undefined);
+            await window._testTree.onPlayClick(['OnePlay Music','fav:reader']);
+            """, arguments:[:], in:nil, contentWorld:.page)
+        try await waitForFiles(["library:a"])
+        XCTAssertEqual(Set(try XCTUnwrap(storage.read(Owners.self,"pins")).owners.keys), ["reader"])
+        let player = try XCTUnwrap(controller.player)
+        let playing = ContinuousClock.now + .seconds(6)
+        while player.snapshot["state"] as? String != "playing", .now < playing { try await Task.sleep(for:.milliseconds(20)) }
+        try await openDialog()
+        XCTAssertEqual(player.snapshot["state"] as? String,"playing")
+        XCTAssertTrue(player.holdsPin("library:a"))
+        let unmarked = try await page.callAsyncJavaScript("""
+            const modal = document.querySelector('.modal');
+            const remove = [...modal.querySelectorAll('button')].find(button => !button.hidden && button.textContent === 'Make unavailable offline');
+            remove.click();
+            const deadline = performance.now()+6000;
+            while (modal.isConnected) {
+                if (performance.now()>deadline) throw Error(modal.innerText);
+                await new Promise(r=>setTimeout(r,20));
+            }
+            const row = [...document.querySelectorAll('#children .tree-row')].find(r=>r.querySelector('.row-name').textContent==='Offline album');
+            return !!row && !row.querySelector('.offline-badge') && !window._testFavorites.getAll().find(f=>f.id==='reader').offlinePin;
+            """, arguments:[:], in:nil, contentWorld:.page)
+        XCTAssertEqual(unmarked as? Bool,true)
+        let committed = ContinuousClock.now + .seconds(4)
+        while try storage.read(Owners.self,"pins")?.owners.isEmpty != true, .now < committed { try await Task.sleep(for:.milliseconds(20)) }
+        let lastOwners = try XCTUnwrap(storage.read(Owners.self,"pins")).owners
+        XCTAssertTrue(lastOwners.isEmpty, "Final native owners: \(lastOwners)")
+        XCTAssertTrue(controller.pins.completeKeys.isEmpty, "Completed files after dialog removal: \(controller.pins.completeKeys)")
+        let lastFile = storage.pinURL("library:a")
+        XCTAssertTrue(player.holdsPin("library:a"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath:lastFile.path))
+        let end = ContinuousClock.now + .seconds(16)
+        while FileManager.default.fileExists(atPath:lastFile.path), .now < end { try await Task.sleep(for:.milliseconds(25)) }
+        // The now-unavailable playing occurrence can disappear from the visual
+        // queue on completion. The native decoder still records its natural finish.
+        XCTAssertTrue(player.status.contains("Finished"),player.status)
+        XCTAssertFalse(FileManager.default.fileExists(atPath:lastFile.path))
+        XCTAssertEqual(controller.pins.snapshot(after:nil)["total"] as? Int,0)
+        try await controller.player?.stopAndDrain()
+    }
+
+    /// Observe the packaged WebKit shell while real native downloads complete and the listener navigates.
+    func testBundled500TrackPinIn30kLibrary() async throws {
+        let tone = try XCTUnwrap(Bundle(for: Self.self).url(forResource:"ScaleTone", withExtension:"mp3"))
+        let size = try Data(contentsOf:tone).count
+        var hold = true
+        var pending = [CheckedContinuation<Void,Never>]()
+        defer { for request in pending { request.resume() } }
+        let account = try NativeAccount(recordFile:record, identity:TestIdentity()) { [self] req in
+            if req.url?.path == "/v1.0/me/drive" { return try response(req, data:drive) }
+            if let id = req.url?.lastPathComponent, id == "probe" || id.hasPrefix("song-") {
+                if hold && id != "probe" { await withCheckedContinuation { pending.append($0) } }
+                let media: [String:Any] = ["id":id, "size":size, "eTag":"v", "@microsoft.graph.downloadUrl":"https://pin.test/tone"]
+                return try response(req, data:JSONSerialization.data(withJSONObject:media))
+            }
+            return try response(req, status:404, data:Data())
+        }
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [PinCDN.self]
+        let controller = LibraryController(account:account, store:.nonPersistent(), pinConfiguration:config)
+        let host = try XCTUnwrap((UIApplication.shared.delegate as? AppDelegate)?.library)
+        host.addChild(controller)
+        host.view.addSubview(controller.view)
+        controller.didMove(toParent:host)
+        defer {
+            controller.detachPage()
+            controller.willMove(toParent:nil)
+            controller.view.removeFromSuperview()
+            controller.removeFromParent()
+        }
+        var page = try await readyPage(in:controller)
+        _ = try await page.callAsyncJavaScript("""
+            const {dbPut} = await import('./dist/db.js');
+            localStorage.setItem('account_info', JSON.stringify({driveId:'library',displayName:'Listener'}));
+            const folders = {Archive:{id:'archive',children:{}},Collection:{id:'collection',children:{}}};
+            for (let i=0; i<30000; i++) {
+                const artist = 'Artist '+Math.floor(i/50);
+                const parent = i>=500 ? folders.Archive : folders.Collection.children[artist] ??= {id:artist,children:{}};
+                const album = i>=500 ? 50+Math.floor((i-500)/500) : Math.floor(i/10);
+                const folder = parent.children['Album '+album] ??= {id:'album-'+album,children:{}};
+                folder.children['Song '+i+'.mp3'] = {id:'song-'+i};
+            }
+            await dbPut('index:library',{kind:'MusicData',schemaVersion:1,count:30000,size:30000*size,folder:{id:'root',children:folders}});
+            """, arguments:["size":size], in:nil, contentWorld:.page)
+        _ = try await account.signIn(presenting:controller)
+        page.reload()
+        page = try await readyPage(in:controller, excluding:page)
+        _ = try await account.media(driveID:"library",itemID:"probe")
+        let commit = try await page.callAsyncJavaScript("""
+            window._testTree.setSelectedPath(['OnePlay Music','library','Collection']);
+            const pin = album => window._testFavorites.setFolderPinned({driveId:'library',sourceRootKey:'library',
+                itemId:'album-'+album,path:['Collection','Artist '+Math.floor(album/5),'Album '+album],isFolder:true},true);
+            for (let n=0; n<49; n++) await pin(n);
+            const start = performance.now();
+            await pin(49);
+            const elapsed = performance.now()-start;
+            let notifications = 0, last = performance.now(), maxGap = 0;
+            window.addEventListener('oneplay-pins', () => notifications++);
+            const timer = setInterval(() => {
+                const now = performance.now();
+                maxGap = Math.max(maxGap,now-last);
+                last = now;
+            },5);
+            window.finishProgressSample = () => { clearInterval(timer); return {notifications,maxGap}; };
+            return elapsed;
+            """, arguments:[:], in:nil, contentWorld:.page)
+        XCTAssertTrue(controller.pins.completeKeys.isEmpty)
+        hold = false
+        for request in pending { request.resume() }
+        pending.removeAll()
+        // Navigate while some, but not all, files are present on disk.
+        let downloading = ContinuousClock.now + .seconds(30)
+        while controller.pins.completeKeys.count < 10, .now < downloading { try await Task.sleep(for:.milliseconds(20)) }
+        XCTAssertGreaterThanOrEqual(controller.pins.completeKeys.count,10)
+        XCTAssertLessThan(controller.pins.completeKeys.count,500)
+        let result = try await page.callAsyncJavaScript("""
+            const row = (root,name) => [...document.querySelectorAll(root+' .tree-row')].find(r=>r.querySelector('.row-name').textContent===name);
+            const tree = window._testTree;
+            const start = performance.now();
+            row('#children','Artist 0').querySelector('.row-name').click();
+            if(tree.getSelectedPath().at(-1)!=='Artist 0' || !row('#children','Album 0')) throw Error('Artist navigation failed');
+            row('#children','Album 0').querySelector('.row-name').click();
+            if(tree.getSelectedPath().at(-1)!=='Album 0' || !row('#children','Song 0.mp3')) throw Error('Album navigation failed');
+            const navMs = performance.now()-start;
+            tree.setSelectedPath(['OnePlay Music','library','Collection']);
+            const deadline = performance.now()+120000;
+            while (document.querySelectorAll('#children .offline-badge.partial.complete').length!==10) {
+                if (performance.now()>deadline) throw Error('Artist progress never settled: '+document.body.innerText.slice(0,600));
+                await new Promise(resolve=>setTimeout(resolve,20));
+            }
+            return {...window.finishProgressSample(), navMs};
+            """, arguments:[:], in:nil, contentWorld:.page)
+        let metrics = try XCTUnwrap(result as? [String:Double])
+        XCTAssertGreaterThan(metrics["notifications"] ?? 0, 1)
+        XCTAssertEqual(controller.pins.completeKeys, Set((0..<500).map { "library:song-\($0)" }))
+        print("50 albums, 500-of-30k native pin: last commit \(commit ?? "") ms; progress notifications and timer/navigation ms \(metrics); bytes \(500*size)")
+        // The playlist independently retains one file. Removing Collection uses the same
+        // committed action as its dialog; leave the tree visible to accept a navigation tap.
+        _ = try await page.callAsyncJavaScript("""
+            const favorites = window._testFavorites;
+            await favorites.add({kind:'playlist',id:'survivor',name:'Survivor',hasPrivatePlayback:false,members:[
+                {driveId:'library',sourceRootKey:'library',itemId:'song-0',isFolder:false,path:['Collection','Artist 0','Album 0','Song 0.mp3']}]});
+            await favorites.setOfflinePin('survivor',{paused:false});
+            window._testTree.setSelectedPath(['OnePlay Music','library']);
+            """, arguments:[:], in:nil, contentWorld:.page)
+        let mainActorGaps = Task { @MainActor in
+            var last = ContinuousClock.now, longest = Duration.zero
+            while !Task.isCancelled {
+                do { try await Task.sleep(for:.milliseconds(1)) } catch { break }
+                let now = ContinuousClock.now
+                longest = max(longest,last.duration(to:now))
+                last = now
+            }
+            return max(longest,last.duration(to:.now))
+        }
+        defer { mainActorGaps.cancel() }
+        let cleanup = try await page.callAsyncJavaScript("""
+            const tree = window._testTree, start = performance.now();
+            let last = start, maxGap = 0;
+            const tick = () => { const now = performance.now(); maxGap = Math.max(maxGap,now-last); last = now; };
+            const timer = setInterval(tick,1);
+            try {
+                const removing = window._testFavorites.setFolderPinned({driveId:'library',sourceRootKey:'library',
+                    itemId:'collection',path:['Collection'],isFolder:true},false,tree.getRoots()).then(()=>performance.now()-start);
+                await new Promise(resolve=>setTimeout(resolve,0));
+                const navAt = performance.now();
+                const row = [...document.querySelectorAll('#children .row-name')].find(r=>r.textContent==='Collection');
+                row.click();
+                if(tree.getSelectedPath().at(-1)!=='Collection') throw Error('Folder navigation failed');
+                document.querySelector('.row-icon-search').click();
+                document.querySelector('.search-input').dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+                if (tree.isSearchModeOpen() || tree.getSelectedPath().at(-1)!=='Collection') throw Error('Escape did not return to the current folder');
+                const navMs = performance.now()-navAt, localSaveMs = await removing;
+                const {createNativeLibrary} = await import('./dist/native-library.js');
+                const native = createNativeLibrary(window.webkit.messageHandlers.oneplay);
+                let after = null;
+                while (performance.now()-start<15000) {
+                    const inventory = await native.pins('snapshot',{after});
+                    if (inventory.total === trackBytes) break;
+                    after = inventory.revision;
+                    await new Promise(resolve=>setTimeout(resolve,20));
+                }
+                tick();
+                return {navMs, localSaveMs, cleanupMs:performance.now()-start, maxGap};
+            } finally { clearInterval(timer); }
+            """, arguments:["trackBytes":size], in:nil, contentWorld:.page)
+        mainActorGaps.cancel()
+        let mainGap = await mainActorGaps.value
+        let cleanupMetrics = try XCTUnwrap(cleanup as? [String:Double])
+        XCTAssertEqual(controller.pins.completeKeys, ["library:song-0"])
+        XCTAssertEqual(controller.pins.snapshot(after:nil)["total"] as? Int,size)
+        let store = try XCTUnwrap(account.openPlaybackStore())
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath:store.pinDirectory.path),[PlaybackStore.pinName("library:song-0")])
+        print("Bulk unpin 499/500: main-actor timer max \(mainGap); bundled JS ms \(cleanupMetrics)")
+        account.updateNetworkPath(offline:true,interfaces:[])
+        _ = try await page.callAsyncJavaScript("""
+            window._testTree.setSelectedPath(['OnePlay Music']);
+            await window._testTree.onPlayClick(['OnePlay Music','fav:survivor']);
+            """, arguments:[:], in:nil, contentWorld:.page)
+        let player = try XCTUnwrap(controller.player)
+        let playing = ContinuousClock.now + .seconds(8)
+        while (player.snapshot["position"] as? Double ?? 0)<0.05, .now<playing { try await Task.sleep(for:.milliseconds(15)) }
+        XCTAssertGreaterThanOrEqual(player.snapshot["position"] as? Double ?? 0,0.05,player.status)
+        XCTAssertTrue(player.holdsPin("library:song-0"))
+        try await player.stopAndDrain()
+        await controller.pins.unbindAndCancel()
     }
 
     func testOfflineColdStartAndBothInterruptedCleanupPoints() async throws {
@@ -1369,13 +1770,13 @@ extension AccountTests {
         let pool = MediaPool()
         let bytes = try Data(contentsOf: XCTUnwrap(Bundle(for: Self.self).url(forResource: "ScaleTone", withExtension: "mp3")))
         let media = MediaLocation(url: URL(string: "https://audio.test/bookmark")!, etag: "v", size: Int64(bytes.count))
-        for id in ["a", "b"] {
+        for id in ["a", "b", "c"] {
             let file = MediaPool.File(drive: "library", item: id, version: "v", size: media.size)
             for offset in stride(from: 0, to: bytes.count, by: MediaRanges.block) {
                 pool.store(bytes.subdata(in: offset..<min(offset + MediaRanges.block, bytes.count)), for: file, at: Int64(offset))
             }
         }
-        let player = NativePlayback(pool: pool) { _, _, _, _ in lookups.withLock { $0 += 1 }; return media }
+        let player = NativePlayback(pool: pool, shuffledStart: { Array($0.reversed()) }) { _, _, _, _ in lookups.withLock { $0 += 1 }; return media }
         let controller = LibraryController(account: account, store: webStore, player: player)
         let host = try XCTUnwrap((UIApplication.shared.delegate as? AppDelegate)?.library)
         host.addChild(controller)
@@ -1395,7 +1796,7 @@ extension AccountTests {
                 const root = ['OnePlay Music','library'];
                 localStorage.setItem('oneplay_music_playback',JSON.stringify({folder:root,track:[...root,'First.mp3'],mode:'one'}));
                 localStorage.setItem('oneplay_music_time','2.25');
-                await dbPut('index:library',{kind:'MusicData',count:2,size:20,folder:{id:'album',children:{'First.mp3':{id:'a'},'Second.mp3':{id:'b'}}}});
+                await dbPut('index:library',{kind:'MusicData',count:3,size:30,folder:{id:'album',children:{'First.mp3':{id:'a'},'Second.mp3':{id:'b'},'Third.mp3':{id:'c'}}}});
                 await dbPut('favorites',{updatedAt:1,favorites:[{kind:'playlist',id:'reader',name:'Remembered album',hasPrivatePlayback:true,
                     mode:'repeat',members:['First','Second'].map((name,i)=>({driveId:'library',sourceRootKey:'library',itemId:i?'b':'a',isFolder:false,path:[name+'.mp3']}))}]});
                 await dbPut('playback:reader',{trackPath:['OnePlay Music','fav:reader','m:1'],currentTime:4.25});
@@ -1438,6 +1839,82 @@ extension AccountTests {
             _ = try await page.evaluateJavaScript("document.querySelector('.footer-playpause').click()")
             try await waitFor { $0["state"] as? String == "playing" && ($0["position"] as? Double ?? 0) >= 3.5 }
             XCTAssertGreaterThan(lookups.withLock { $0 }, 0)
+        }
+        if fixture == nil {
+            // Exercise the bundled tree, real mode button, favorites document and Swift player together.
+            // The separate cross-process fixture retains its paused bookmark for the next invocation.
+            let sequence = try await page.callAsyncJavaScript("""
+                const tree = window._testTree, favorites = window._testFavorites;
+                const drive = ['OnePlay Music', 'library'], label = document.querySelector('.mode-label');
+                const observed = [];
+                for (const remember of [false, true]) {
+                    const id = 'mode-' + remember, fav = [drive[0], 'fav:' + id];
+                    await favorites.add({kind:'playlist', id, name:id, hasPrivatePlayback:remember,
+                        members:[...favorites.getAll().find(f => f.id === 'reader').members,
+                            {driveId:'library',sourceRootKey:'library',itemId:'c',isFolder:false,path:['Third.mp3']}]});
+                    const pick = async mode => {
+                        for (let i = 0; i < 5 && label.textContent !== mode; i++) {
+                            const prior = label.textContent;
+                            label.click();
+                            const end = performance.now() + 3000;
+                            while (label.textContent === prior) {
+                                if (performance.now() > end) throw Error('Mode button stayed at ' + prior);
+                                await new Promise(resolve => setTimeout(resolve, 10));
+                            }
+                        }
+                    };
+                    await tree.onPlayClick(drive);
+                    await pick('one');
+                    await tree.onTrackClick([...fav, 'm:0']);
+                    observed.push(label.textContent);
+                    await pick('shuffle');
+                    await tree.onPlayClick(drive);
+                    observed.push(label.textContent, favorites.getAll().find(f => f.id === id).mode);
+                    await pick('all');
+                    await tree.onTrackClick([...fav, 'm:0']);
+                    observed.push(label.textContent, document.querySelector('.footer-title').textContent);
+                    // The deterministic shuffle selected First,Third,Second. A later preference
+                    // and a queue revision must not replace that pass with canonical First,Second,Third.
+                    await favorites.setMode(id, 'all');
+                    await favorites.setHasPrivatePlayback(id, !remember);
+                    observed.push(label.textContent);
+                    document.querySelector('.scrubber-edge-button.right').click();
+                    const end = performance.now() + 3000;
+                    const post = window.webkit.messageHandlers.oneplay;
+                    while (true) {
+                        const {snapshot} = await post.postMessage({op:'playback',version:1,action:'snapshot'});
+                        if (snapshot.title === 'Third.mp3' && JSON.parse(snapshot.key).at(-1) === 'c'
+                            && snapshot.state === 'playing' && snapshot.position > 0.05) break;
+                        if (performance.now() > end) throw Error('Wrong shuffle successor');
+                        await new Promise(resolve => setTimeout(resolve, 10));
+                    }
+                }
+                return observed;
+                """, arguments: [:], in: nil, contentWorld: .page) as? [String]
+            let expected = ["one", "shuffle", "shuffle", "shuffle", "First.mp3", "shuffle"]
+            XCTAssertEqual(sequence, expected + expected)
+            // Fail the Swift queue write on disk. An accepted tap must still commit its
+            // preference through WebKit's independent IndexedDB store.
+            let queueFile = try XCTUnwrap(account.openPlaybackStore()).directory.appendingPathComponent("queue")
+            let originalQueue = folder.appendingPathComponent("original-queue")
+            try FileManager.default.moveItem(at: queueFile, to: originalQueue)
+            try FileManager.default.createDirectory(at: queueFile, withIntermediateDirectories: false)
+            defer {
+                try? FileManager.default.removeItem(at: queueFile)
+                try? FileManager.default.moveItem(at: originalQueue, to: queueFile)
+            }
+            let saved = try await page.callAsyncJavaScript("""
+                const {dbGet} = await import('./dist/db.js');
+                document.querySelector('.mode-label').click(); // Shuffle -> One.
+                const end = performance.now() + 3000;
+                while (performance.now() < end) {
+                    const data = await dbGet('favorites');
+                    if (data.favorites.find(f => f.id === 'mode-true').mode === 'one') return true;
+                    await new Promise(resolve => setTimeout(resolve, 20));
+                }
+                return false;
+                """, arguments: [:], in: nil, contentWorld: .page)
+            XCTAssertEqual(saved as? Bool, true)
         }
         try await player.stopAndDrain()
     }

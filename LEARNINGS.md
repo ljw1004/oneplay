@@ -22,7 +22,8 @@
 - **Look for existing code first**. If adding something, can you re-use existing code? or cleanly refactor existing code to serve the new purpose?
 - **Be happy to refactor**. As a good engineer you seek out opportunities to improve the health of the codebase, and are eager to do them.
 - **Keep a narrow fix local.** When two existing calls need the same request option, add it at both call sites. Extract a helper when the fix requires shared logic or the user asks for the refactor.
-- **Give plan reviews a KISS pass.** Ask what can be deleted using an existing contract. If a finding describes a rare case the project already accepts, keep that tradeoff unless the requested feature changes it. M18's general reviews proposed replacing whole-document sync even though M7 explicitly chose it.
+- **Reviewers can turn accepted behavior into a requirement.** A reviewer can reproduce an edge case accurately and still recommend the wrong fix. In M18, changing folder pins could cause another download. We accept repeat downloads as routine. We also leave the outcome of re-pinning during deletion unspecified. Adding persistent state to preserve the bytes, then testing for zero repeat downloads, made an invented promise look like a regression test.
+- **Give every review round its own dedicated KISS reviewer.** Use only the prescribed specialist roles. A general reviewer prompted to consider simplicity loses the independent judgment that KISS is there to supply. Give all specialists the same revision and the owner's accepted trade-offs. Before acting on a finding, identify the promised behavior it affects and weigh it alongside the KISS findings. When fixes change the code, the KISS reviewer must see that revision too. [Peer review instructions](AGENTS.md#agent-peer-review)
 - **Preserve the reasoning in existing comments.** Explanations of invariants, propagation, and recovery are part of the design record. If a sentence needs correction for the task, edit that sentence and preserve the surrounding rationale.
 - **Give surprising options a brief reason at each use.** One line beside each `cache: 'no-store'` explains what a future maintainer could otherwise miss: the folder ETag can stay the same while its recursive size changes.
 
@@ -81,6 +82,7 @@
 - **Deferred data must not trigger eager invalidation.** If dependencies are not loaded yet, defer validation instead of resetting state.
 - **Programmatic scroll/state restoration needs guardrails.** Empty-container scroll events and resource-default values can silently corrupt restored state.
 - **Tests must clear persistent state in setup.** Shared browser profiles make state leakage otherwise inevitable.
+
 
 ## Evidence-driven offline design
 
@@ -160,6 +162,7 @@
 - **Clamp and guard `setPositionState` inputs; platform implementations can throw on edge values.**
 
 - On a real tagged MP3, `kAudioFilePropertyAlbumArtwork` returned an unsupported-property error. Core Audio’s `kAudioFormatProperty_ID3TagToDictionary` exposed the front and back pictures from the same bytes. The native artwork test keeps this distinction covered with a 326-byte ID3 fixture.
+- A signed test host with a separate bundle ID gets its own Home Screen icon and private data. Give it a distinct display name, such as “OnePlay Music Tests”. After the device run, remove the disposable test host by its exact bundle ID and verify the production app still appears in the device inventory.
 - A simulated audio session can publish metadata to the media daemon while SpringBoard shows no Lock Screen controls. We also played a four-second voice prompt in a separate simulator process and the other player kept advancing. Exercise the native decision logic with fixtures and use a physical device for cross-app arbitration, disconnects, and audible route handoffs. [Apple's simulator limitations](https://developer.apple.com/library/archive/documentation/Audio/Conceptual/AudioSessionProgrammingGuide/OptimizingForDeviceHardware/OptimizingForDeviceHardware.html)
 
 ## TypeScript and testability

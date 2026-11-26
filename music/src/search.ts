@@ -42,7 +42,7 @@ export interface SearchOptions {
     readonly maxResults: number;
     readonly deniedRootKeys: ReadonlySet<string>;
     readonly evidenceState: EvidenceState;
-    readonly downloadedTrackKeys: ReadonlySet<string>;
+    readonly downloadedTrackKeys: Pick<ReadonlySet<string>, 'has'>;
 }
 
 export interface SearchRunResult {

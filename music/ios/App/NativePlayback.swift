@@ -100,7 +100,6 @@ private struct SavedSession: Codable {
     let mode: QueueMode
     let timer: String
     let favorite: String?
-    let configuredMode: QueueMode?
     let fenced: Bool
 }
 
@@ -130,6 +129,7 @@ final class NativePlayback: @unchecked Sendable {
     private var timerSetting = "30m"
     private var expiry: Task<Void, Never>?
     private var deadline: ContinuousClock.Instant?
+    private let shuffledStart: @Sendable ([Int]) -> [Int]
     private let timerInterval: @Sendable (Int) -> Duration
     private var timerGeneration = 0
     private var folder: [String] = []
@@ -181,7 +181,6 @@ final class NativePlayback: @unchecked Sendable {
     private var spots = [String: FavoriteSpot]()
     private var store: PlaybackStore?
     private var favorite: String?
-    private var configuredMode: QueueMode?
     private var savedCursor: PlayCursor?
     private var savedNextOrder: [Int]?
     private var savedPoint: SessionPoint?
@@ -236,7 +235,6 @@ final class NativePlayback: @unchecked Sendable {
             folder = record.folder
             folderKey = record.folderKey
             favorite = record.favorite
-            configuredMode = record.configuredMode
             timerSetting = record.timer
             session = UUID().uuidString
             fencedRevision = record.fenced ? revision : nil
@@ -318,7 +316,7 @@ final class NativePlayback: @unchecked Sendable {
         if structural {
             let record = SavedSession(tracks: catalog, canonical: canonical, cursor: cursor,
                 next: alternate == nil ? nil : anchor.next, point: point, folder: folder, folderKey: folderKey, mode: mode,
-                timer: timerSetting, favorite: favorite, configuredMode: configuredMode, fenced: fencedRevision != nil)
+                timer: timerSetting, favorite: favorite, fenced: fencedRevision != nil)
             enqueueWrite("queue") { try store.save(record, "queue") }
             hasHistory = true
         } else { enqueueWrite("position") { try store.save(point, "position") } }
@@ -344,8 +342,10 @@ final class NativePlayback: @unchecked Sendable {
 
     @MainActor var onChange: ((_ debugOnly: Bool) -> Void)?
 
-    init(captureURL: URL = NativePlayback.captureURL, diagnostics: NativeDiagnostics? = nil, pool: MediaPool = MediaPool(), timerInterval: @escaping @Sendable (Int) -> Duration = { .seconds($0 * 60) }, lookup: @escaping Lookup) {
+    init(captureURL: URL = NativePlayback.captureURL, diagnostics: NativeDiagnostics? = nil, pool: MediaPool = MediaPool(), timerInterval: @escaping @Sendable (Int) -> Duration = { .seconds($0 * 60) },
+         shuffledStart: @escaping @Sendable ([Int]) -> [Int] = { $0.shuffled() }, lookup: @escaping Lookup) {
         self.pool = pool
+        self.shuffledStart = shuffledStart
         self.timerInterval = timerInterval
         destination = captureURL
         self.diagnostics = diagnostics
@@ -395,19 +395,18 @@ final class NativePlayback: @unchecked Sendable {
             }
             if legacyPosition != nil && (hasHistory || active != nil) { return }
             saveCheckpoint()
+            if let timer { try setTimerSetting(timer) }
+            let startingMode = initialMode ?? mode
             let bookmark: FavoriteSpot?
-            if let favorite, !selected, initialMode != .shuffle, let store {
+            if let favorite, !selected, startingMode != .shuffle, let store {
                 bookmark = spots[favorite] ?? (try? store.read(FavoriteSpot.self, store.bookmarkFile(favorite)))
             } else { bookmark = nil }
             let bookmarked = bookmark.flatMap { spot in Self.validPosition(spot.seconds) ? eligible.first { tracks[$0].key == spot.key } : nil }
             let initial = bookmarked ?? (selected ? startIndex : first)
             interruptedItem = nil
             self.favorite = favorite
-            configuredMode = initialMode
             structureDirty = true
-            if let timer { try setTimerSetting(timer) }
-            if let initialMode { mode = initialMode }
-            else if self.folder.dropFirst().first?.hasPrefix("fav:") == true && self.folder.dropFirst().first != folder.dropFirst().first { mode = .all }
+            mode = startingMode
             deadline = nil
             catalog = tracks
             slots.removeAll()
@@ -421,8 +420,8 @@ final class NativePlayback: @unchecked Sendable {
             fencedRevision = nil
             let order: [Int]
             if mode != .shuffle { order = eligible }
-            else if selected { order = [initial] + eligible.filter { $0 != initial }.shuffled() }
-            else { order = eligible.shuffled() }
+            else if selected { order = [initial] + shuffledStart(eligible.filter { $0 != initial }) }
+            else { order = shuffledStart(eligible) }
             replaceRun(cursor: PlayCursor(order: order, slot: selected || bookmarked != nil ? order.firstIndex(of: initial)! : 0),
                        position: .seconds(legacyPosition ?? (bookmarked != nil ? bookmark!.seconds : 0)), paused: legacyPosition != nil,
                        delaySeconds: delaySeconds, nearEnd: nearEnd, forceRefresh: forceRefresh)
@@ -569,14 +568,12 @@ final class NativePlayback: @unchecked Sendable {
 
     /// Library revisions carry canonical order. Preparation budgets and occurrence references
     /// retain their slot even when a row moves or temporarily disappears.
-    func revise(session expected: String, revision next: Int, folder: [String], tracks: [IndexedTrack], favorite: String? = nil, configuredMode: QueueMode? = nil) {
+    func revise(session expected: String, revision next: Int, folder: [String], tracks: [IndexedTrack], favorite: String? = nil) {
         lock.withLock {
             guard session == expected, next > revision || next == fencedRevision, let run = active else { return }
             let continueAtEnd = fencedRevision != nil && continueAfterFence
-            structureDirty = structureDirty || fencedRevision != nil || self.folder != folder || self.favorite != favorite || self.configuredMode != configuredMode
+            structureDirty = structureDirty || fencedRevision != nil || self.folder != folder || self.favorite != favorite
             self.favorite = favorite
-            let nextMode = configuredMode != self.configuredMode ? configuredMode ?? mode : mode
-            self.configuredMode = configuredMode
             fencedRevision = nil
             revision = next
             self.folder = folder
@@ -592,9 +589,7 @@ final class NativePlayback: @unchecked Sendable {
             }
             structureDirty = structureDirty || canonical != newOrder
             canonical = newOrder
-            let modeChanged = mode != nextMode
-            configure(run, mode: nextMode, resumeAtBoundary: continueAtEnd && (deadline.map { $0 > .now } ?? true))
-            if modeChanged { armTimer(playing: active?.wantsPlay == true) }
+            configure(run, mode: mode, resumeAtBoundary: continueAtEnd && (deadline.map { $0 > .now } ?? true))
             saveCheckpoint()
         }
     }
@@ -737,7 +732,7 @@ final class NativePlayback: @unchecked Sendable {
 
     /// Logout drains all in-flight bytes before removing the diagnostic recording. Retrying cleanup is safe.
     func stopAndDrain() async throws {
-        lock.withLock { interruptedItem = nil; ticker?.cancel(); ticker = nil; store = nil; accessRevision = 0; accessDirty = false; spots.removeAll(); hasHistory = false; savedPoint = nil; savedCursor = nil; structureDirty = true; favorite = nil; folder = []; folderKey = ""; configuredMode = nil; active?.cancel(); active = nil; catalog = []; canonical = []; slots = [:]; connectedShares = nil; deniedRoots = []; mode = .all; armTimer(playing: false); pool = MediaPool(unmeteredWiFi: pool.unmeteredWiFi) }
+        lock.withLock { interruptedItem = nil; ticker?.cancel(); ticker = nil; store = nil; accessRevision = 0; accessDirty = false; spots.removeAll(); hasHistory = false; savedPoint = nil; savedCursor = nil; structureDirty = true; favorite = nil; folder = []; folderKey = ""; active?.cancel(); active = nil; catalog = []; canonical = []; slots = [:]; connectedShares = nil; deniedRoots = []; mode = .all; armTimer(playing: false); pool = MediaPool(unmeteredWiFi: pool.unmeteredWiFi) }
         await withCheckedContinuation { continuation in writer.async { self.pendingWrites.removeAll(); continuation.resume() } }
         await withCheckedContinuation { continuation in worker.async { continuation.resume() } }
         do { try FileManager.default.removeItem(at: destination) }

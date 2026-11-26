@@ -236,8 +236,8 @@ import WebKit
         switch action {
         case "snapshot":
             let reply = pins.snapshot(after: args["after"] as? Int)
-            guard let files = reply["files"] as? [String: Int], let missing = reply["missing"] as? [String],
-                  files.count + missing.count > 512, let revision = reply["revision"] as? Int else { return reply }
+            guard let files = reply["files"] as? [String: Int], let unavailable = reply["unavailable"] as? [String],
+                  files.count + unavailable.count > 512, let revision = reply["revision"] as? Int else { return reply }
             let data = try JSONSerialization.data(withJSONObject: reply)
             inventoryParts = (revision, data)
             return ["revision": revision, "parts": (data.count + GraphTransport.chunkSize - 1) / GraphTransport.chunkSize]
@@ -256,17 +256,10 @@ import WebKit
             guard pinParts?.revision == revision else { throw NativeAccountError.cancelled }
             pinParts!.data.append(contentsOf: text.utf8)
             if args["last"] as? Bool == true {
-                defer { pinParts = nil }
-                guard let owners = try JSONSerialization.jsonObject(with: pinParts!.data) as? [[String: Any]] else { throw NativeAccountError.invalidRequest }
-                try pins.apply(owners: owners)
-                pinRevision = revision
-            }
-        case "owners", "fence":
-            guard let revision = args["revision"] as? Int else { throw NativeAccountError.invalidRequest }
-            if revision > pinRevision {
-                if action == "fence" { try pins.control(action, quota: nil) }
-                else if let rows = args["owners"] as? [[String: Any]] { try pins.apply(owners: rows) }
-                else { throw NativeAccountError.invalidRequest }
+                let data = pinParts!.data
+                pinParts = nil
+                guard let rows = try JSONSerialization.jsonObject(with: data) as? [[String:Any]] else { throw NativeAccountError.invalidRequest }
+                try pins.apply(owners: rows)
                 pinRevision = revision
             }
         default: try pins.control(action, quota: args["quota"] as? Int)
@@ -399,7 +392,6 @@ import WebKit
                         staged = nil
                         guard Set(tracks.compactMap(\.key)).count == tracks.count else { throw NativeAccountError.invalidRequest }
                         let favorite = args["favorite"] as? String
-                        let mode = (args["mode"] as? String).flatMap(QueueMode.init(rawValue:))
                         guard favorite == nil || folder.dropFirst().first == "fav:" + favorite! else { throw NativeAccountError.invalidRequest }
                         if action == "start" {
                             let legacy = args["legacyPosition"] as? Double
@@ -410,22 +402,25 @@ import WebKit
                                 return
                             }
                             guard let index = args["index"] as? Int else { throw NativeAccountError.invalidRequest }
+                            let mode = (args["mode"] as? String).flatMap(QueueMode.init(rawValue:))
                             try player.start(tracks: tracks, startIndex: index, delaySeconds: 0, nearEnd: false, forceRefresh: false,
                                              folder: folder, folderKey: folderKey, selected: args["selected"] as? Bool == true, timer: args["timer"] as? String, initialMode: mode, favorite: favorite, legacyPosition: legacy)
                         } else {
                             guard let session = args["session"] as? String, let revision = args["revision"] as? Int else { throw NativeAccountError.invalidRequest }
-                            player.revise(session: session, revision: revision, folder: folder, tracks: tracks, favorite: favorite, configuredMode: mode)
+                            player.revise(session: session, revision: revision, folder: folder, tracks: tracks, favorite: favorite)
                         }
                     default:
                         guard let item = args["item"] as? String else { throw NativeAccountError.invalidRequest }
-                        try player.apply(action, item: item, seconds: args["seconds"] as? Double)
+                        applied = try player.apply(action, item: item, seconds: args["seconds"] as? Double)
                     }
                     // Queue and access updates share this bridge. Only the drawer sets its subscription.
                     if let showing = args["debugRanges"] as? Bool { showingAudioRanges = showing }
                     if ["start", "revise", "fence", "seek", "skip", "pause", "cycleMode", "next", "previous", "access", "timer", "play"].contains(action) {
                         player.handleOutputChange(.parkPaused)
                         systemPlayback?.publishNowPlaying()
-                        try await player.waitForCheckpointWrites()
+                        // The accepted mode is returned to its favorite immediately. Its ordinary
+                        // checkpoint writer persists the playing session independently.
+                        if action != "cycleMode" { try await player.waitForCheckpointWrites() }
                     }
                     var sample = playbackSample(player, account, includeDenied: action == "readAccess")
                     if let applied { sample["applied"] = applied }

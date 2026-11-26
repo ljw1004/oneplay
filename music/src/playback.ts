@@ -3,7 +3,7 @@
  * media identity and former neighbors until a new song takes over. */
 import { type FolderPath } from './tree.js';
 import { log, logError, logCatch } from './logger.js';
-import { type Favorites, type Favorite, type RootsMap } from './favorites.js';
+import { type Favorites, type RootsMap } from './favorites.js';
 import { dbGet, dbPut } from './db.js';
 import { type EvidenceState, type AuthFetch } from './auth.js';
 import { type TimerDuration } from './settings.js';
@@ -155,8 +155,7 @@ export function createPlayback(
 
     // -- Playback mode state -------------------------------------------------
     // INVARIANT: playbackMode is the active mode. Global default is 'all'.
-    // When playing within a hasPrivatePlayback favorite, mode is loaded from
-    // the favorite and restored on re-entry. On exit, it reverts to 'all'.
+    // A selection inherits this mode unless its outer favorite has a saved preference.
     // Timer mode requires deadline bookkeeping; non-timer modes ignore it.
     let playbackMode: PlaybackMode = 'all';
     let timerDurationSetting: TimerDuration = '30m';
@@ -166,10 +165,9 @@ export function createPlayback(
     // -- Per-favorite playback state ----------------------------------------
     // INVARIANT: activeFavId is set when playing within a favorite (path[1]
     // starts with "fav:"). activeFavHasPrivatePlayback tracks whether to
-    // save/restore mode and track/time position.
+    // save/restore track and time.
     let activeFavId: string | undefined;
     let activeFavHasPrivatePlayback = false;
-    let configuredMode: PlaybackMode | undefined;
     let lastSavedTimeBucket = -1;
     // -- Cold-start restore state (M10) -------------------------------------
     // INVARIANT: restoredCurrentTime is set by restoreVisualState and consumed
@@ -295,11 +293,6 @@ export function createPlayback(
         const time = restoredCurrentTime ?? audioEl.currentTime;
         const state = buildFavoritePlaybackStorageValue(current.path, time, {key: current.key, folderKey: queue.folderKey, folder: queue.folder});
         try { localStorage.setItem(`oneplay_music_fav:${activeFavId}`, state); } catch { /* quota */ }
-    };
-
-    const savePlaybackModeFireAndForget = (): void => {
-        if (!activeFavId || !activeFavHasPrivatePlayback || !favoritesRef) return;
-        favoritesRef.setMode(activeFavId, playbackMode).catch(logCatch('playback:save-mode'));
     };
 
     /** A large former pass lives in IDB. The global record points at the exact acknowledged snapshot. */
@@ -429,7 +422,7 @@ export function createPlayback(
                 },
             };
         },
-        onModeCycleClick: () => {
+        onModeCycleClick: async () => {
             const prevMode = playbackMode;
             const currentIdx = MODES.indexOf(playbackMode);
             playbackMode = MODES[(currentIdx + 1) % MODES.length];
@@ -447,10 +440,9 @@ export function createPlayback(
                 clearTimerDeadline('mode-leave');
             }
             urlEngine.clearPrefetchState();
-            if (activeFavHasPrivatePlayback) configuredMode = playbackMode;
-            savePlaybackModeFireAndForget();
             savePlaybackStateFireAndForget();
             saveMmPlayback();
+            if (activeFavId) await favoritesRef?.setMode(activeFavId, playbackMode).catch(logCatch('playback:save-mode'));
         },
         onExpandedChange: (expanded) => {
             if (expanded && phase !== 'loading' && !ui.isScrubbing()) showCurrentTime();
@@ -724,39 +716,6 @@ export function createPlayback(
     let accountsRef: AccountsMap = new Map();
 
     /**
-     * Detects and sets active favorite from a path.
-     * Saves outgoing favorite state before switching contexts.
-     */
-    const updateActiveFavorite = (path: FolderPath): Favorite | undefined => {
-        if (path.length < 2 || !path[1].startsWith('fav:') || !favoritesRef) {
-            if (activeFavId) {
-                savePlaybackStateFireAndForget();
-                activeFavId = undefined;
-                activeFavHasPrivatePlayback = false;
-                playbackMode = 'all';
-                clearTimerDeadline('favorite-context-clear');
-                ui.setModeLabelText(playbackMode);
-            }
-            return undefined;
-        }
-        const newFavId = path[1].slice(4);
-        const fav = favoritesRef.getAll().find(f => f.id === newFavId);
-        if (!fav) return undefined;
-
-        if (activeFavId && activeFavId !== newFavId) {
-            savePlaybackStateFireAndForget();
-        }
-        activeFavId = newFavId;
-        activeFavHasPrivatePlayback = fav.hasPrivatePlayback;
-        lastSavedTimeBucket = -1;
-        if (!fav.hasPrivatePlayback) {
-            playbackMode = 'all';
-            clearTimerDeadline('favorite-non-private');
-            ui.setModeLabelText(playbackMode);
-        }
-        return fav;
-    };
-    /**
      * Loads and plays a track. Stops current audio immediately to prevent races.
      *
      * INVARIANT: every call increments asyncCounter; stale async completions
@@ -924,15 +883,6 @@ export function createPlayback(
             if (!current) return;
             if (activeFavId) {
                 const favorite = favoritesRef?.getAll().find(f => f.id === activeFavId);
-                const newMode = favorite?.hasPrivatePlayback ? favorite.mode ?? 'all' : undefined;
-                if (favorite && newMode !== configuredMode) {
-                    playbackMode = newMode ?? 'all';
-                    clearTimerDeadline('favorite-mode-changed');
-                    armTimerFromNowIfPlaying('favorite-mode-changed');
-                    ui.setModeLabelText(playbackMode);
-                    urlEngine.clearPrefetchState();
-                }
-                configuredMode = newMode;
                 activeFavHasPrivatePlayback = !!favorite?.hasPrivatePlayback;
             }
             const revised = reduceRefreshedTrackList({freshTrackList: fresh.tracks, prevTrackList: trackList,
@@ -990,10 +940,12 @@ export function createPlayback(
         if (tapped && !tappedKey) { view.onPlayBlockedNoPlayableTracks(folder); return; }
         // Save the outgoing favorite before reading, including a fresh Play on that very favorite.
         savePlaybackStateFireAndForget();
-        const favorite = favoritesRef?.getAll().find(f => path[1] === 'fav:' + f.id);
+        if (folder[1]?.startsWith('fav:')) await favoritesRef?.whenLocalWritesComplete();
+        if (intent !== selection) return;
+        const favorite = favoritesRef?.getAll().find(f => folder[1] === 'fav:' + f.id);
         let saved = !tapped && favorite?.hasPrivatePlayback
             ? parseFavoritePlaybackStorageValue(localStorage.getItem('oneplay_music_fav:' + favorite.id)) : undefined;
-        if (!tapped && favorite?.hasPrivatePlayback && !saved?.key && favorite.mode !== 'shuffle') {
+        if (!tapped && favorite?.hasPrivatePlayback && !saved?.key && (favorite.mode ?? playbackMode) !== 'shuffle') {
             if (migrateLegacyFavorite) {
                 // The initial membership may still be waiting on another share. Only its
                 // matched key can carry old time across an intervening edit.
@@ -1008,7 +960,8 @@ export function createPlayback(
         // A saved edit can be waiting for an entirely different share to load. Once the
         // local write settles, a new complete selection can supersede that live queue.
         let reproject = !!edit;
-        while (intent === selection && (pendingSave || reproject || revision !== libraryRevision)) {
+        while (intent === selection) {
+            if (!pendingSave && !reproject && revision === libraryRevision) break;
             if (pendingSave) await pendingSave.done;
             revision = libraryRevision;
             reproject = false;
@@ -1025,18 +978,20 @@ export function createPlayback(
             else view.onPlayBlockedNoPlayableTracks(folder);
             return;
         }
-        const fav = updateActiveFavorite(chosen.folder);
-        configuredMode = fav?.hasPrivatePlayback ? fav.mode ?? 'all' : undefined;
-        if (fav?.hasPrivatePlayback) {
-            playbackMode = isValidMode(fav.mode) ? fav.mode : 'all';
-            if (playbackMode !== 'timer') clearTimerDeadline('favorite-mode-restore');
-            ui.setModeLabelText(playbackMode);
-        }
+        // Re-read after a yielding walk: a sync can change the bookmark policy or starting preference.
+        const fav = favoritesRef?.getAll().find(f => folder[1] === 'fav:' + f.id);
+        if (activeFavId !== fav?.id) savePlaybackStateFireAndForget();
+        activeFavId = fav?.id;
+        activeFavHasPrivatePlayback = !!fav?.hasPrivatePlayback;
+        const previousMode = playbackMode;
+        playbackMode = fav?.mode ?? playbackMode;
+        clearTimerDeadline('selection'); // The explicit play starts a fresh timer when audio begins.
+        ui.setModeLabelText(playbackMode);
         const resume = !tapped && fav?.hasPrivatePlayback && playbackMode !== 'shuffle' && saved
             ? chosen.tracks.find(t => (saved!.key ? t.key === saved!.key : pathEquals(t.path, saved!.track)) && isPlayable(t))
             : undefined;
         const target = resume ?? chosen.tracks[selectedIdx];
-        const keepPass = sameFolder && playbackMode === 'shuffle' && queue?.folderKey === folderKey;
+        const keepPass = sameFolder && previousMode === 'shuffle' && playbackMode === 'shuffle' && queue?.folderKey === folderKey;
         const revised = reduceRefreshedTrackList({freshTrackList: chosen.tracks, prevTrackList: keepPass ? trackList : [],
             playbackTrack: tapped ? target : undefined, playbackMode, keyOf: t => t.key, random: Math.random});
         ++refreshRequest;
@@ -1179,7 +1134,6 @@ export function createPlayback(
             activeFavId = favId;
             const favorite = favoritesRef?.getAll().find(f => f.id === favId);
             activeFavHasPrivatePlayback = !!favorite?.hasPrivatePlayback;
-            configuredMode = activeFavHasPrivatePlayback ? favorite?.mode ?? 'all' : undefined;
             restoredCurrentTime = time;
             generation = crypto.randomUUID();
             saveMmPlayback();

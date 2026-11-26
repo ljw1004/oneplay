@@ -10,7 +10,7 @@ import { resolvePathTailDisplayName } from '../../src/path-names.js';
 function makeRoots(): RootsMap {
     return new Map([
         ['fav:pl', { type: 'playlist', key: 'fav:pl', name: 'Heroic Anthems', members: [] }],
-        ['share:one', { type: 'share', key: 'share:one', name: 'Shared Mixes', driveId: 'drive-share', reindexing: false }],
+        ['share:one', { type: 'share', connectionId: 'connection', key: 'share:one', name: 'Shared Mixes', driveId: 'drive-share', reindexing: false }],
     ]);
 }
 

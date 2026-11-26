@@ -614,7 +614,7 @@ extension PlaybackTests {
         try await player.waitForCheckpointWrites()
         let positionURL = store.directory.appendingPathComponent("position")
         let stale = try Data(contentsOf: positionURL)
-        player.revise(session: player.sessionID, revision: 1, folder: folder, tracks: [tracks[2]], favorite: "list", configuredMode: .repeat)
+        player.revise(session: player.sessionID, revision: 1, folder: folder, tracks: [tracks[2]], favorite: "list")
         try player.apply("seek", item: first, seconds: 0.5)
         try await player.waitForCheckpointWrites()
         await XCTAssertColdHeld(store, expected: 0.5)
@@ -718,7 +718,7 @@ extension PlaybackTests {
             item.path = folder + ["m:\(i)"]
             return item
         }
-        func start(_ queue: [IndexedTrack], _ mode: QueueMode = .all, selected: Bool = false) throws {
+        func start(_ queue: [IndexedTrack], _ mode: QueueMode? = nil, selected: Bool = false) throws {
             try player.start(tracks: queue, delaySeconds: 0, nearEnd: false, forceRefresh: false, folder: folder,
                              folderKey: "list", selected: selected, initialMode: mode, favorite: "list")
         }
@@ -738,7 +738,13 @@ extension PlaybackTests {
         try start(tracks)
         XCTAssertEqual(player.snapshot["key"] as? String, "B")
         XCTAssertEqual(player.snapshot["position"] as? Double, 1.3)
-        try start([tracks[0], tracks[2]])
+        // A private folder with no preference inherits Shuffle and ignores the saved 1.3s.
+        try player.start(tracks: tracks, delaySeconds: 0, nearEnd: false, forceRefresh: false,
+                         folder: ["Music","d"], folderKey: "d", initialMode: .shuffle)
+        try start([tracks[1]])
+        XCTAssertEqual(player.snapshot["mode"] as? String, "shuffle")
+        XCTAssertEqual(player.snapshot["position"] as? Double, 0)
+        try start([tracks[0], tracks[2]], .all)
         XCTAssertEqual(player.snapshot["key"] as? String, "A")
         XCTAssertEqual(player.snapshot["position"] as? Double, 0)
         try start([tracks[2], tracks[0]], selected: true)

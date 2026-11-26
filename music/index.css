@@ -50,6 +50,8 @@ body{background:var(--bg-header);height:100%;display:flex;flex-direction:column;
 /* The separator width is fixed. Only its glyph shifts to share the gap
  * with a checkbox on its right or a refresh spinner on its left. */
 .crumb-end{white-space:nowrap;}
+/* A word joiner keeps an inline SVG badge on the last line of its folder name. */
+.crumb-end:has(> .offline-badge)::before{content:"\2060";}
 .crumb-separator{position:relative;padding:0 var(--crumb-side-gap);color:inherit;font-weight:normal;}
 .crumb-separator > span{position:relative;}
 .selecting .crumb-separator > span{left:-12px;}
@@ -260,6 +262,8 @@ body.select-mode #action-bar{display:flex;}
 .modal-actions .modal-button-spinner{width:16px;height:16px;margin-left:0;}
 .modal-actions .modal-button-spinner circle{stroke:currentColor;}
 .modal-actions button:disabled{opacity:0.45;cursor:default;}
+.offline-actions{justify-content:flex-start;flex-wrap:wrap;}
+.offline-actions button[hidden]{display:none;}
 .modal-playlist-list{list-style:none;margin:0 0 12px;padding:0;}
 .modal-playlist-list li{padding:14px 0;border-bottom:1px solid var(--border-divider);cursor:pointer;font-size:17px;color:var(--text-heading);display:flex;justify-content:space-between;align-items:center;}
 .modal-playlist-list li::after{content:'❯';color:var(--color-playlist-chevron);font-size:14px;margin-left:6px;}
@@ -296,7 +300,7 @@ body.select-mode #action-bar{display:flex;}
 .sync-spinner circle{fill:none;stroke:var(--accent-indicator);stroke-width:2.5;stroke-linecap:round;stroke-dasharray:18 22;transform-origin:center;transform-box:fill-box;animation:spin 1.2s linear infinite;}
 .offline-fav-row{padding-top:12px;padding-bottom:8px;margin-top:8px;font-weight:var(--font-weight-bold);border-top:1px solid var(--border-divider);}
 .offline-progress{font-size:14px;color:var(--text-modal-secondary);margin-bottom:8px;}
-.offline-pauseplay{cursor:pointer;opacity:0.7;}
+.offline-pauseplay{border:0;background:transparent;color:inherit;font:inherit;padding:0;margin-left:0.5em;cursor:pointer;opacity:0.7;}
 .offline-pauseplay:active{opacity:0.4;}
 .offline-warning{color:var(--color-warning-offline);font-size:13px;margin-bottom:8px;}
 .offline-global{border-top:1px solid var(--border-divider);padding-top:12px;margin-top:8px;font-size:13px;color:var(--text-tertiary);}

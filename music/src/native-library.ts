@@ -148,17 +148,15 @@ export function createNativeLibrary(handler: ReplyHandler) {
             const send = (name: string, fields: Record<string, unknown>) => post({op: 'pins', action: name, ...fields});
             if (action === 'owners') {
                 const contents = JSON.stringify(args.owners);
-                if (contents.length > 65536) {
-                    for (let offset = 0; offset < contents.length;) {
-                        let end = Math.min(offset + 65536, contents.length);
-                        // WebKit converts each piece to a Swift String. Keep surrogate pairs together.
-                        if (end < contents.length && /[\uD800-\uDBFF]/.test(contents[end-1])) end--;
-                        await send('ownerPart', {revision: args.revision, first: offset === 0, last: end === contents.length,
-                            text: contents.slice(offset, end)});
-                        offset = end;
-                    }
-                    return {};
+                for (let offset = 0; offset < contents.length;) {
+                    let end = Math.min(offset + 65536, contents.length);
+                    // WebKit converts each piece to a Swift String. Keep surrogate pairs together.
+                    if (end < contents.length && /[\uD800-\uDBFF]/.test(contents[end-1])) end--;
+                    await send('ownerPart', {revision: args.revision, first: offset === 0, last: end === contents.length,
+                        text: contents.slice(offset, end)});
+                    offset = end;
                 }
+                return {};
             }
             const result = await send(action, args) as {parts?: number; revision?: number};
             if (!result.parts) return result;

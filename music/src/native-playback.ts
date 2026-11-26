@@ -36,7 +36,7 @@ interface NativeSample {
     readonly message?: string;
 }
 
-interface PlaybackReply { readonly sequence: number; readonly snapshot: NativeSample }
+interface PlaybackReply { readonly applied?: boolean; readonly sequence: number; readonly snapshot: NativeSample }
 
 /** Swift owns the clock and queue. Each document paints only replies newer than its last sample. */
 export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
@@ -51,6 +51,7 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
     footer.classList.add('native-player');
     let sample: NativeSample = {};
     let sequence = 0;
+    let modePicks = Promise.resolve();
     let sampledAt = 0;
     let projectedSources: {session: string; roots: Set<string>} | undefined;
     const position = () => Math.min(sample.duration || Infinity, (sample.position ?? 0) +
@@ -62,7 +63,7 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
     let issuedRevision = 0;
     let buildGeneration = 0;
     let refreshGeneration = 0;
-    let pendingSelection: {queue: LibraryQueue; key?: string; timer: TimerDuration; mode?: PlaybackMode} | undefined;
+    let pendingSelection: {queue: LibraryQueue; key?: string; timer: TimerDuration} | undefined;
     let intent: {id: string; base: Promise<string>} | undefined;
     let pendingRevision = false;
     let awaitingSave = false;
@@ -169,13 +170,16 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
     const ui = createPlaybackUi({
         footerEl: footer,
         getMode: () => sample.mode ?? 'all',
-        onModeCycleClick: async () => {
-            const {session, mode} = sample;
-            await send('cycleMode', {item: sample.item});
-            if (session === sample.session && mode !== sample.mode && sample.mode && sample.folder) {
-                try { await saveFavoriteMode?.(sample.folder, sample.mode); }
-                catch { showError('Could not save this favorite’s play mode.'); }
-            }
+        onModeCycleClick: () => {
+            const item = sample.item;
+            // Save in tap order. The command reply identifies the accepted favorite even if a
+            // newer pushed snapshot has already painted a different folder or mode.
+            modePicks = modePicks.then(async () => {
+                const reply = await applyAndPaint('cycleMode', {item});
+                if (reply.applied && reply.snapshot.folder && reply.snapshot.mode) {
+                    await saveFavoriteMode?.(reply.snapshot.folder, reply.snapshot.mode);
+                }
+            }).catch(() => showError('Could not apply or save this play mode.'));
         },
         getDuration: () => sample.duration || undefined,
         onScrubStart: () => {
@@ -223,8 +227,12 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
             const connected = getConnected?.();
             if (connected) await native.syncPlaybackMembership(connected);
             await native.waitForPlaybackAccess?.(root => tracks.some(t => t.sourceRootKey === root));
+            // An immediate return to the playing favorite sees its accepted mode pick.
+            if (action === 'start') await modePicks;
             if (generation !== buildGeneration) return;
-            const reply = await applyAndPaint(action, {...folder, ...favoriteSettings?.(folder.folder), ...args, ...data});
+            const settings = favoriteSettings?.(folder.folder);
+            const reply = await applyAndPaint(action, {...folder, favorite: settings?.favorite,
+                ...(action === 'start' && {mode: settings?.mode}), ...args, ...data});
             const session = reply.snapshot.session;
             const accepted = action === 'start' ? session !== args.base
                 : session === args.session && reply.snapshot.revision === args.revision && !reply.snapshot.fenced;
@@ -282,17 +290,17 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
         if (cancelled) await send('cancelIntent', {intent: cancelled.id});
     }
 
-    async function start(queue: LibraryQueue, index: number, selected: boolean, timer: TimerDuration, mode?: PlaybackMode): Promise<void> {
+    async function start(queue: LibraryQueue, index: number, selected: boolean, timer: TimerDuration): Promise<void> {
         if (!intent) beginSelection();
         const target = intent!;
         const generation = buildGeneration;
         ++refreshGeneration;
-        pendingSelection = {queue, key: selected ? queue.tracks[index].key : undefined, timer, mode};
+        pendingSelection = {queue, key: selected ? queue.tracks[index].key : undefined, timer};
         const favorite = favoriteSettings?.(queue.folder).favorite;
         if (favorite) await migratePrivateSpots?.(favorite);
         const base = await target.base;
         if (target !== intent || generation !== buildGeneration) return;
-        await transfer(queue, 'start', {intent: target.id, base, index, selected, timer, ...(!favoriteSettings && mode && {mode})});
+        await transfer(queue, 'start', {intent: target.id, base, index, selected, timer});
         if (target === intent && !pendingSelection) intent = undefined;
     }
 
@@ -360,11 +368,11 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
             }
         }
         if (pendingSelection && rebuild) {
-            const {queue, key, timer, mode} = pendingSelection;
+            const {queue, key, timer} = pendingSelection;
             const latest = await rebuild(queue.folder, queue.folderKey);
             if (refresh !== refreshGeneration || !latest) return;
             const index = key ? latest.tracks.findIndex(t => t.key === key) : 0;
-            if (latest.tracks[index]) { await start(latest, index, !!key, timer, mode); return; }
+            if (latest.tracks[index]) { await start(latest, index, !!key, timer); return; }
             ++buildGeneration;
             await clearSelectionIntent();
             if (refresh !== refreshGeneration) return;

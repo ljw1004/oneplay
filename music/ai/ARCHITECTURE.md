@@ -45,7 +45,7 @@ A native session assigns a slot to each occurrence. Its render anchors carry the
 
 Swift saves the live queue and each private favorite in Application Support under the MSAL home-account and Graph drive pairing. The structural file holds the catalog, canonical order, current pass, held-song neighbors, chosen Shuffle boundary, mode, timer setting and a complete restart point. A serial writer atomically replaces it. Five-second position checkpoints identify the structural generation, occurrence and slot. An unreadable or mismatched checkpoint falls back to the structural point. Source access survives a restart. Sign-out drains the writer before removing the account files.
 
-A fresh app process restores paused. Its decoder waits for Play before activating audio or requesting media. A replacement web view reads the existing player. Folder Play matches a private bookmark by occurrence key in the newly selected queue, including after a row moves. A track tap starts that occurrence at zero, and folder Play in Shuffle draws a fresh pass. TypeScript supplies the favorite’s configured mode and migrates old bundled localStorage and IndexedDB positions through a complete cached library projection. New native positions are written only by Swift.
+A fresh app process restores paused. Its decoder waits for Play before activating audio or requesting media. A replacement web view reads the existing player. Folder Play matches a private bookmark by occurrence key in the newly selected queue, including after a row moves. A track tap starts that occurrence at zero, and folder Play in Shuffle draws a fresh pass. TypeScript supplies the outer favorite’s optional starting mode independently of its private bookmark, and migrates old bundled localStorage and IndexedDB positions through a complete cached library projection. New native positions are written only by Swift.
 
 Swift persists source access and its revision together under the account pairing. A WebKit document proposes a change against the revision it read. A verified share probe can allow or deny that source, and an explicit disconnect withdraws it locally. The account and document identity qualify pending requests. A retired account proof or an older probe cannot change access after a newer decision. The player checks access on queue commit and on cold restore.
 
@@ -53,7 +53,9 @@ Native playback owns one account-scoped URLSession and a 40 MB in-memory compres
 
 ### Offline recordings on iOS
 
-The favorite action bar edits the shared pin intent. The bundled page resolves each favorite to physical drive/item keys grouped by source root. A partial index, inaccessible share or reference awaiting healing preserves that owner's previous files. Swift stores owners under the native account pairing. A durable fence suspends obsolete work across a favorite edit and a process exit. The next authoritative library projection releases it.
+The selection bar edits favorite and physical folder pins in the same favorites document. The bundled page sends their source-grouped track keys to Swift. A partial index, inaccessible share or reference awaiting healing preserves that owner's previous files. Swift stores owners under the native account pairing. The native manifest treats folder and favorite IDs alike. Changing pins can cause recordings to download again.
+
+A pin edit is confirmed when its favorites document commits to IndexedDB. The page publishes the saved owners in the background. Swift uses their combined membership to schedule transfers and clean up unused files.
 
 Swift schedules two pin transfers in a background URLSession. Each task has an account binding and a durable task ID. The file must match the Graph length and open as audio before Swift records its expected length and version and moves it into the account’s backup-excluded Audio directory. A decoder can retain its open file through unpin, pause and seek. Sign-out closes admission before account cleanup. On foreground return the page pulls missed inventory revisions. Normal completions update counts through reverse membership, without walking the library again. [Native downloader](../ios/App/OfflinePins.swift) · [Shared UI projection](../src/native-pins.ts)
 
@@ -151,12 +153,6 @@ module's singleton. Instead, `src/index.ts` passes references and wires callback
 - **playback → downloads**
   - playback calls `downloads.getOfflineBlob()` to check the local cache before streaming from OneDrive
 
-The central dependency-breaking function is `computeAndPushOfflineState()` in
-`src/index.ts`. It computes which tracks are pinned (from favorites + index data),
-pushes `activeKeys`/`retainKeys` to downloads, and pushes icon state to tree.
-This avoids a circular dependency between favorites, downloads, and tree.
-
-
 ## Data flow: index
 
 The music index is a tree of `MusicFolder` and `MusicFile` nodes rooted at the
@@ -194,13 +190,15 @@ Two types of favorites:
   favorite).
 
 Favorites are stored in three places:
-1. **IndexedDB** (`favorites:{driveId}`) — local cache, instant load.
+1. **IndexedDB** (`favorites`) — local cache, instant load.
 2. **OneDrive App folder** (`favorites.json`) — durable cloud backup.
 3. **RAM** — the live `FavoritesData` object.
 
 Mutations always write locally first (IndexedDB + onChange callback for
 immediate UI update), then fire-and-forget an upload to OneDrive via a
 dirty-flag coalescing pump (rapid mutations collapse to one upload).
+
+Physical folder pins live beside favorites in the same document. Their source root, share connection UUID and path segments identify coverage. A parent pin replaces its descendants. Disconnecting a share clears that connection's intent locally before remote cache cleanup. An older remote document leaves local edits in place until a subsequent save uploads them.
 
 ### Synthetic path segments
 
@@ -232,7 +230,7 @@ Playback has several key concepts:
   list. Set by clicking ▷ on a folder or clicking a track (which sets its
   parent as the playback folder).
 - **Queue entries** carry a stable occurrence key, a logical path for the tree, the source root, physical drive/item IDs, title and album. The shared library walk distinguishes two playlist routes to the same recording.
-- **Playback modes** are One, All, Repeat, Shuffle and Timer. Each player owns its current pass, the audible occurrence and the natural-end policy.
+- **Playback modes** are One, All, Repeat, Shuffle and Timer. Each player owns its current pass, the audible occurrence and the natural-end policy. A folder or song starts in its outer favorite’s last explicitly selected mode, falling back to the live mode. A fresh session starts in All. Queue revisions and the private bookmark setting preserve the live mode.
 - **Remember my spot** saves the outgoing position for each private favorite. Folder Play resumes a surviving occurrence, an explicit track tap starts at zero, and Shuffle starts a fresh pass.
 
 ### Playlist edits
@@ -251,13 +249,9 @@ to prevent events from the previous track.
 
 ## Data flow: downloads
 
-The download engine is decoupled from favorites. It operates on abstract key
-sets (`driveId:itemId` strings):
+Both players use the same time-sliced projection of offline favorites and explicit folder pins. Unmarked folders and favorites are counted only while their offline dialog is open. A partially marked folder’s dialog shows the number of explicitly marked descendants and their unique downloaded recordings. Each owner has a deduplicated set of physical track keys. An inventory delta updates counts for the owners of that track. Rows and dialogs read these counts. A physical folder arrow shows coverage from physical pins alone. An ancestor’s dotted arrow completes when its pinned descendants finish. The breadcrumb trail shows only its rightmost offline arrow. A deeper solid or dotted arrow suppresses earlier dots.
 
-- `setPinnedKeys(activeKeys, retainKeys)`: the caller (`src/index.ts`) computes which
-  tracks should be downloaded (active = from unpaused offline favorites) and
-  retained (all offline favorites, including paused). The engine downloads
-  `active − downloaded` and garbage-collects `downloaded − retained`.
+- **Browser retention.** Both folder pins and unpaused offline favorites contribute active keys. Paused owners also contribute retained keys. The downloader shares its local file-size map with playback and the folder dialog. It fetches missing active keys and deletes unowned blobs in one IndexedDB transaction when the retained set is nonempty and all surviving owners resolve against the local library. Storage reconciliation follows the local pin save in the background. An empty retained set preserves the existing browser cache.
 - **Evidence state machine**: tracks connectivity as `no-evidence`,
   `evidence:signed-in`, `evidence:signed-out`, or `evidence:not-online`.
   Downloads only pump when signed in. Error classification consults
@@ -452,6 +446,7 @@ pulls are suppressed in signed-out/not-online states.
 
 - Each folder gets one children listing with `$top=10000`. The indexer consumes that page. This per-folder limit is deliberate. [Original indexing decisions](PLAN-M3.md#learnings-from-example-code)
 - Index requests bound their retry and backoff time. Whole-index rebuilds stop after three consecutive failures without batch progress or six attempts in all. A share disconnect waits for a dispatched cache write to settle before deleting the share cache.
+- A shared folder listing is cached by OneDrive link. Reconnecting that link can show its last cached listing while the index refreshes. Pins belong to a particular connection UUID, so a reconnected share starts with its old pins cleared.
 
 ### Settings, shares, and refresh UI contracts
 

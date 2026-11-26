@@ -4,8 +4,7 @@
  * Manages multi-select for favorites CRUD: long-press / right-click enters
  * select mode, a three-zone action bar (share · summary text · more) offers
  * actions via popup menus. Modals handle user input for each action.
- * A per-favorite dropdown is available from the action bar right button when
- * exactly one top-level favorite is selected.
+ * The right button manages one favorite or one physical subfolder, or deletes a selection.
  *
  * STATE MODEL:
  * - active: whether select mode is currently engaged.
@@ -26,11 +25,10 @@
  */
 
 import { setOfflineBadge, type FolderPath, type TreeView } from './tree.js';
-import { type Favorites, type RootsMap, type PlaylistMember, type ItemRef } from './favorites.js';
+import { type Favorites, type RootsMap, type PlaylistMember, type FolderPin } from './favorites.js';
 import { walkFolder } from './indexer.js';
 import { log, logError } from './logger.js';
 import { type DownloadControls, QUOTA_OPTIONS_GB, classifyOfflineBadgeState } from './downloads.js';
-import { collectPhysicalTracks } from './tracks.js';
 import { isWalkableRoot } from './roots.js';
 import { buildMembersFromSelection as buildMembersFromSelectionFromState } from './select-dialogs.js';
 import {
@@ -70,10 +68,13 @@ export interface Select {
     setDownloads(downloads: DownloadControls): void;
     /** Updates the offline modal DOM if it's currently open. Called on download state changes. */
     updateOfflineModal(): void;
+    /** Update an open selection when sync changes the covering folder pin. */
+    refreshFolderActions(): void;
 }
 
 /** Which actions are available based on selection state. */
 interface AvailableActions {
+    folder?: FolderPin;
     shortcut: boolean;
     playlist: boolean;       // existing playlists to add to
     delete: boolean;
@@ -125,11 +126,6 @@ export function createSelect(
     rightBtn.type = 'button';
     rightBtn.className = 'action-btn right-btn';
 
-    /** Tracks what the right button currently represents, so the click handler
-     *  knows whether to show a fav dropdown or go straight to delete. */
-    let rightBtnMode: 'fav' | 'delete' | 'hidden' = 'hidden';
-    let rightBtnFavId: string | undefined;
-
     const summary = document.createElement('div');
     summary.className = 'selection-summary';
     summary.append(actionText, cancelBtn);
@@ -157,19 +153,18 @@ export function createSelect(
         return { path, isFavRoot, favId, isPlaylistMember, memberIndex };
     };
 
-    /** Resolves direct-root path context for ItemRef creation / folder checks. */
-    const rootContextForPath = (path: FolderPath): {
-        folder: import('./indexer.js').MusicFolder;
-        driveId: string;
-        sourceRootKey: string | undefined;
-    } | undefined => {
-        if (path.length < 2) return undefined;
+    /** Resolve only physical subfolders. The connection UUID fences a dialog across share replacement. */
+    const physicalFolderAt = (path: FolderPath): FolderPin | undefined => {
         const root = roots.get(path[1]);
-        if (!isWalkableRoot(root)) return undefined;
+        if (path.length < 3 || !isWalkableRoot(root)) return undefined;
+        const tail = path.slice(2);
+        const folder = walkFolder(root.folder, tail);
+        if (!folder) return undefined;
         return {
-            folder: root.folder,
             driveId: root.type === 'onedrive' ? root.info.driveId : root.driveId,
-            sourceRootKey: root.type === 'share' ? root.key : undefined,
+            sourceRootKey: root.key,
+            connectionId: root.type === 'share' ? root.connectionId : undefined,
+            path: tail, itemId: folder.id, isFolder: true,
         };
     };
 
@@ -198,21 +193,12 @@ export function createSelect(
         // (not a track — track shortcuts would break the playback model where
         // tapping a track sets its containing folder as the playback folder),
         // and not already a shortcut target.
-        const shortcutOk = paths.length === 1 && (() => {
-            const p = paths[0];
-            if (p.path.length < 3) return false;
-            const ctx = rootContextForPath(p.path);
-            if (!ctx) return false;
-            // walkFolder returns undefined for files (no children property)
-            if (!walkFolder(ctx.folder, p.path.slice(2))) return false;
-            const allFavs = favorites.getAll();
-            return !allFavs.some(f =>
-                f.kind === 'shortcut'
-                && f.target.driveId === ctx.driveId
-                && f.target.sourceRootKey === ctx.sourceRootKey
-                && JSON.stringify(f.target.path) === JSON.stringify(p.path.slice(2)),
-            );
-        })();
+        const folder = paths.length === 1 ? physicalFolderAt(paths[0].path) : undefined;
+        const shortcutOk = !!folder && !favorites.getAll().some(f =>
+            f.kind === 'shortcut'
+            && f.target.driveId === folder.driveId
+            && (f.target.sourceRootKey ?? f.target.driveId) === folder.sourceRootKey
+            && JSON.stringify(f.target.path) === JSON.stringify(folder.path));
 
         // Playlist: at least one existing playlist exists (excluding the one we're browsing)
         const browsingFavId = paths.length > 0 && paths.every(p => p.favId === paths[0].favId)
@@ -231,6 +217,7 @@ export function createSelect(
         const moreMemory = paths.length === 1 && allFavRoots;
 
         return {
+            folder,
             shortcut: shortcutOk,
             playlist: playlistOk,
             delete: deleteOk,
@@ -258,10 +245,7 @@ export function createSelect(
                 if (cp.isFavRoot || cp.isPlaylistMember) {
                     folders++;
                 } else if (cp.path.length >= 3) {
-                    const ctx = rootContextForPath(cp.path);
-                    const isFolder = ctx !== undefined
-                        && walkFolder(ctx.folder, cp.path.slice(2)) !== undefined;
-                    if (isFolder) folders++; else tracks++;
+                    if (physicalFolderAt(cp.path)) folders++; else tracks++;
                 } else {
                     folders++; // account-level rows are folders
                 }
@@ -273,45 +257,35 @@ export function createSelect(
 
         const actions = computeAvailableActions();
 
-        // Right button: ☆/♫ for single favorite, trash for multi-delete, hidden otherwise
+        const folder = actions.folder;
+        const coverage = folder ? tree.getFolderOfflineState(folder).coverage : 'none';
+        rightBtn.onclick = null;
         if (actions.moreMemory) {
-            // INVARIANT: moreMemory implies exactly 1 top-level favorite selected
-            const paths = Array.from(selectedPaths).map(classifyPath);
-            const favId = paths[0].favId!;
+            const favId = classifyPath([...selectedPaths][0]).favId!;
             const fav = favorites.getAll().find(f => f.id === favId);
-            rightBtnMode = 'fav';
-            rightBtnFavId = favId;
             rightBtn.textContent = fav?.kind === 'playlist' ? '♫' : '☆';
-            rightBtn.classList.remove('hidden');
+            rightBtn.setAttribute('aria-label', 'Favorite actions');
+            rightBtn.onclick = () => showDropdown(rightBtn, buildFavItems(favId));
+        } else if (folder && coverage !== 'covered') {
+            rightBtn.innerHTML = '<svg aria-hidden="true" width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M2 5a1 1 0 011-1h5l2 2h7a1 1 0 011 1v8a1 1 0 01-1 1H3a1 1 0 01-1-1z"/></svg>';
+            rightBtn.setAttribute('aria-label', 'Folder actions');
+            rightBtn.onclick = () => showDropdown(rightBtn, [{
+                label: offlineTitle(coverage !== 'none'),
+                onClick: () => showOfflineModal(folder),
+            }]);
         } else if (actions.delete) {
-            rightBtnMode = 'delete';
-            rightBtnFavId = undefined;
             rightBtn.innerHTML = '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h14M7 5V4a1 1 0 011-1h4a1 1 0 011 1v1M5 5v12a1 1 0 001 1h8a1 1 0 001-1V5"/><path d="M8 9v5M12 9v5"/></svg>';
-            rightBtn.classList.remove('hidden');
-        } else {
-            rightBtnMode = 'hidden';
-            rightBtnFavId = undefined;
-            rightBtn.classList.add('hidden');
+            rightBtn.setAttribute('aria-label', 'Delete selected items');
+            rightBtn.onclick = showDeleteModal;
         }
+        rightBtn.classList.toggle('hidden', !rightBtn.onclick);
     };
 
     // -- Modals ---------------------------------------------------------------
 
     /** Shortcut creation modal: "Add new shortcut" with name and hasPrivatePlayback. */
-    const showShortcutModal = (): void => {
-        const paths = Array.from(selectedPaths).map(classifyPath);
-        if (paths.length !== 1) return;
-        const p = paths[0];
-        const ctx = rootContextForPath(p.path);
-        if (!ctx) return;
-
-        // Resolve the folder to get its itemId using walkFolder
-        const folderPath = p.path.slice(2);
-        const folderName = folderPath[folderPath.length - 1] || 'Folder';
-        const folder = folderPath.length === 0 ? ctx.folder : walkFolder(ctx.folder, folderPath);
-        if (!folder) return;
-        const folderId = folder.id;
-
+    const showShortcutModal = (folder: FolderPin): void => {
+        const folderName = folder.path.at(-1)!;
         let hasPrivatePlayback = false;
 
         showModal('Add new shortcut', (modal, close) => {
@@ -327,19 +301,15 @@ export function createSelect(
             modal.appendChild(label);
 
             addModalActions(modal, close, 'Create', async () => {
-                const target: ItemRef = {
-                    driveId: ctx.driveId,
-                    itemId: folderId,
-                    path: [...folderPath],
-                    isFolder: true,
-                    sourceRootKey: ctx.sourceRootKey,
-                };
                 const id = crypto.randomUUID();
                 await favorites.add({
                     kind: 'shortcut',
                     id,
                     name: folderName,
-                    target,
+                    target: {
+                        driveId: folder.driveId, path: folder.path, itemId: folder.itemId, isFolder: true,
+                        sourceRootKey: folder.connectionId ? folder.sourceRootKey : undefined,
+                    },
                     hasPrivatePlayback,
                 });
                 close();
@@ -486,8 +456,9 @@ export function createSelect(
         const actions = computeAvailableActions();
         const items: Array<{ label: string; danger?: boolean; chevron?: boolean; onClick: () => void }> = [];
 
-        if (actions.shortcut) {
-            items.push({ label: 'Add as Shortcut ☆', onClick: () => showShortcutModal() });
+        if (actions.shortcut && actions.folder) {
+            const folder = actions.folder;
+            items.push({ label: 'Add as Shortcut ☆', onClick: () => showShortcutModal(folder) });
         }
         if (actions.playlist) {
             items.push({ label: 'Add to existing playlist ♫', onClick: () => showPlaylistModal() });
@@ -519,11 +490,8 @@ export function createSelect(
         if (downloadsRef) {
             const isOffline = fav.offlinePin !== undefined;
             items.push({
-                label: isOffline ? 'Available offline…' : 'Make available offline…',
-                onClick: () => {
-                    if (active) select.exitSelectMode();
-                    showOfflineModal(favId);
-                },
+                label: offlineTitle(isOffline),
+                onClick: () => showOfflineModal(favId),
             });
         }
 
@@ -593,18 +561,9 @@ export function createSelect(
 
     // -- Offline modal --------------------------------------------------------
 
-    /** State for the live-updating offline modal. */
-    let modalFavId: string | undefined;
-    let modalEls: {
-        statsEl: HTMLElement;
-        warningEl: HTMLElement;
-        globalCountText: Text;
-        quotaSelect: HTMLSelectElement;
-        badgeEl: HTMLSpanElement;
-        title: HTMLElement;
-        actionBtn: HTMLButtonElement;
-        pauseBtn: HTMLSpanElement;
-    } | undefined;
+    /** Live updates replace text and button visibility in place so an open quota picker keeps its focus. */
+    let refreshOfflineModal: (() => void) | undefined;
+    const offlineTitle = (marked: boolean): string => marked ? 'Available offline…' : 'Make available offline';
 
     /** Formats bytes as "X.X Gb" or "X Mb". */
     const formatBytes = (bytes: number): string =>
@@ -612,46 +571,37 @@ export function createSelect(
         : bytes >= 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(0)} Mb`
         : `${(bytes / 1024).toFixed(0)} Kb`;
 
-    /**
-     * Shows the Available Offline modal for a favorite.
-     * Reads favorite data from the favorites module (already available) and
-     * download progress from the downloads snapshot API.
-     */
-    const showOfflineModal = (favId: string): void => {
-        if (!downloadsRef) return;
-        const fav = favorites.getAll().find(f => f.id === favId);
-        if (!fav) return;
-
-        modalFavId = favId;
-
+    /** Favorites and physical folders share the same offline dialog. Capture its target once,
+     * then read committed pin state and local progress on each update. */
+    const showOfflineModal = (target: string | FolderPin): void => {
+        const downloads = downloadsRef;
+        if (!downloads) return;
+        const folder = typeof target === 'string' ? undefined : target;
+        const favorite = () => typeof target === 'string' ? favorites.getAll().find(f => f.id === target) : undefined;
+        if (!folder && !favorite()) return;
+        select.exitSelectMode();
         const backdrop = document.createElement('div');
         backdrop.className = 'modal-backdrop';
-
         const modal = document.createElement('div');
         modal.className = 'modal';
-
-        // Close ✕ button at top-right
         const closeBtn = document.createElement('button');
         closeBtn.className = 'modal-close';
         closeBtn.type = 'button';
-        closeBtn.textContent = '\u00D7'; // ×
-        modal.appendChild(closeBtn);
-
-        // Title
-        const h3 = document.createElement('h3');
-        modal.appendChild(h3);
-
-        // Fav row: name + icon + badge, matching tree row display order
-        const favRow = document.createElement('div');
-        favRow.className = 'offline-fav-row';
-        const favName = document.createElement('span');
-        favName.textContent = fav.name;
-        const favIcon = document.createElement('span');
-        favIcon.className = 'fav-icon';
-        favIcon.textContent = '\u2002' + (fav.kind === 'playlist' ? '♫' : '☆');
-        const badgeEl = document.createElement('span');
-        favRow.append(favName, favIcon, badgeEl);
-        modal.appendChild(favRow);
+        closeBtn.setAttribute('aria-label', 'Close');
+        closeBtn.textContent = '×';
+        const title = document.createElement('h3');
+        const row = document.createElement('div');
+        row.className = 'offline-fav-row';
+        const name = document.createElement('span');
+        const icon = document.createElement('span');
+        const badge = document.createElement('span');
+        const fav = favorite();
+        if (fav) {
+            icon.className = 'fav-icon';
+            icon.textContent = '\u2002' + (fav.kind === 'playlist' ? '♫' : '☆');
+        }
+        row.append(name, icon, badge);
+        modal.append(closeBtn, title, row);
 
         // Stats line
         const statsEl = document.createElement('div');
@@ -678,156 +628,128 @@ export function createSelect(
             quotaSelect.appendChild(opt);
         }
         quotaSelect.addEventListener('change', () => {
-            downloadsRef!.setQuota(parseFloat(quotaSelect.value));
+            downloads.setQuota(parseFloat(quotaSelect.value));
         });
         globalDetail.append(globalCountText, quotaSelect);
         globalEl.append(globalLabel, globalDetail);
         modal.appendChild(globalEl);
 
         // Pause/Resume glyph (inline in statsEl, updated live)
-        const pauseBtn = document.createElement('span');
+        const pauseBtn = document.createElement('button');
+        pauseBtn.type = 'button';
         pauseBtn.className = 'offline-pauseplay';
 
-        // Action button (left-aligned: single button, reads naturally with content above)
         const actions = document.createElement('div');
-        actions.className = 'modal-actions';
-        actions.style.justifyContent = 'flex-start';
-
-        const actionBtn = document.createElement('button');
-        actionBtn.type = 'button';
-        actionBtn.className = 'modal-cancel';
-
-        actions.appendChild(actionBtn);
+        actions.className = 'modal-actions offline-actions';
         modal.appendChild(actions);
-
-        // Store references for live updates
-        modalEls = { title: h3, statsEl, warningEl, globalCountText, quotaSelect, badgeEl, actionBtn, pauseBtn };
-
+        let saving = false;
+        type OfflineAction = 'pin' | 'unpin' | 'pause' | 'resume' | 'retry';
+        let progressAction: 'pause' | 'resume' | 'retry' = 'pause';
+        let saveError = '';
         const close = (): void => {
+            if (saving) return;
             backdrop.remove();
-            modalFavId = undefined;
-            modalEls = undefined;
+            if (refreshOfflineModal !== renderOfflineModal) return;
+            refreshOfflineModal = undefined;
+            downloads.folderProgress(undefined);
         };
-
-        // Event handlers
         closeBtn.addEventListener('click', close);
-        backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
+        backdrop.addEventListener('click', event => { if (event.target === backdrop) close(); });
 
-        actionBtn.addEventListener('click', async () => {
-            const current = favorites.getAll().find(f => f.id === favId);
-            if (!current) return;
-            actionBtn.disabled = true;
-            try { await favorites.setOfflinePin(favId, current.offlinePin ? undefined : {paused: false}); }
-            catch (error) {
-                logError('Could not save offline pin: ' + String(error));
-                warningEl.textContent = 'Could not save the download setting. Try again.';
-                actionBtn.disabled = false;
-                return;
+        /** A local write failure leaves the same target and its current actions in the dialog. */
+        const save = async (action: OfflineAction): Promise<void> => {
+            if (saving) return;
+            const membership = action === 'pin' || action === 'unpin';
+            saving = true;
+            saveError = '';
+            renderOfflineModal();
+            try {
+                if (action === 'retry') await downloads.clearError();
+                else if (folder && membership) await favorites.setFolderPinned(folder, action === 'pin', roots);
+                else if (typeof target === 'string') {
+                    if (action === 'resume' && downloads.getSnapshot().lastError) await downloads.clearError();
+                    await favorites.setOfflinePin(target, action === 'unpin' ? undefined : {paused: action === 'pause'});
+                }
+            } catch (error) {
+                logError('Could not update offline downloads: ' + String(error));
+                saveError = 'Could not finish updating downloads. Try again.';
+            } finally {
+                saving = false;
+                if (membership && !saveError) close();
+                else if (refreshOfflineModal === renderOfflineModal) renderOfflineModal();
             }
-            close();
+        };
+        const buttons = (['pin', 'unpin'] as const).map(action => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'modal-cancel';
+            button.textContent = action === 'pin' ? 'Make available offline' : 'Make unavailable offline';
+            actions.appendChild(button);
+            button.addEventListener('click', () => save(action));
+            return button;
         });
+        pauseBtn.addEventListener('click', () => save(progressAction));
 
-        pauseBtn.addEventListener('click', async () => {
-            const currentFav = favorites.getAll().find(f => f.id === favId);
-            if (!currentFav?.offlinePin) return;
-            if (downloadsRef!.getSnapshot().lastError && !currentFav.offlinePin.paused) {
-                downloadsRef!.clearError();
-                return;
+        /** The partial row describes the marked child folders and their unique tracks. */
+        const renderOfflineModal = (): void => {
+            const fav = favorite();
+            const state = folder ? tree.getFolderOfflineState(folder) : undefined;
+            const marked = state ? state.coverage !== 'none' : !!fav?.offlinePin;
+            const partial = state?.coverage === 'partial';
+            const progress = folder ? downloads.folderProgress(folder) : undefined;
+            const cached = folder ? progress : fav && downloads.favoriteProgress(fav.id);
+            const current = folder ? physicalFolderAt(['OnePlay Music', folder.sourceRootKey, ...folder.path]) : undefined;
+            const changedFolder = !!folder && (current?.itemId !== folder.itemId || current.connectionId !== folder.connectionId);
+            const editable = folder ? !changedFolder && state?.coverage !== 'covered' : !!fav;
+            name.textContent = partial && progress?.childFolders !== undefined
+                ? `${progress.childFolders} child folder${progress.childFolders === 1 ? '' : 's'}`
+                : folder?.path.at(-1) ?? fav?.name ?? '';
+            title.textContent = offlineTitle(marked);
+            buttons[0].hidden = !editable || (marked && !partial);
+            buttons[1].hidden = !editable || !marked;
+            closeBtn.disabled = pauseBtn.disabled = saving;
+            for (const button of buttons) button.disabled = saving;
+            const snap = downloads.getSnapshot();
+            const iconState = state?.badge ?? classifyOfflineBadgeState(cached, snap, !!fav?.offlinePin?.paused);
+            setOfflineBadge(badge, marked ? iconState : undefined, partial);
+            const incomplete = marked && iconState !== 'complete';
+            const downloading = iconState === 'downloading';
+            statsEl.textContent = '';
+            if (!cached || (!cached.complete && !cached.total)) {
+                statsEl.textContent = 'Waiting for the library…';
+            } else {
+                const trackLabel = `${cached.total} track${cached.total === 1 ? '' : 's'}`;
+                statsEl.textContent = !marked ? trackLabel
+                    : !incomplete ? `${trackLabel}, ${formatBytes(cached.bytes)} ✓`
+                    : `${downloading ? 'Downloading' : 'Paused'} ${cached.downloaded}/${cached.total} tracks`;
             }
-            const wasPaused = currentFav.offlinePin.paused;
-            if (wasPaused) downloadsRef!.clearError(); // resume also clears latched error
-            await favorites.setOfflinePin(favId, { paused: !wasPaused });
-        });
+            const canRetry = snap.lastError || (!downloading && cached?.unavailable);
+            if (incomplete && (fav?.offlinePin?.paused || canRetry || (fav && downloading))) {
+                progressAction = fav?.offlinePin?.paused ? 'resume' : canRetry ? 'retry' : 'pause';
+                pauseBtn.textContent = progressAction === 'pause' ? '⏸︎' : '▶︎';
+                pauseBtn.setAttribute('aria-label', progressAction === 'pause' ? 'Pause downloads'
+                    : progressAction === 'resume' ? 'Resume downloads' : 'Retry downloads');
+                statsEl.appendChild(pauseBtn);
+            }
+            warningEl.textContent = changedFolder ? 'The folder has changed. Select it again.' : saveError || (
+                !incomplete || downloading || fav?.offlinePin?.paused ? ''
+                : snap.overQuota ? 'Reached storage limit'
+                : snap.evidence === 'evidence:signed-out' ? 'Not signed in'
+                : snap.evidence === 'evidence:not-online' ? 'Not online'
+                : snap.lastError ?? '');
 
+            const downloaded = snap.files.size;
+            const queued = snap.queuedCount;
+            const gb = snap.quotaBytes / (1024 ** 3);
+            globalCountText.textContent = queued && snap.evidence === 'evidence:signed-in'
+                ? `${downloaded}/${downloaded + queued} tracks, ${formatBytes(snap.totalBytes)} / `
+                : `${downloaded} tracks, ${formatBytes(snap.totalBytes)} / `;
+            quotaSelect.value = String(QUOTA_OPTIONS_GB.find(option => Math.abs(option - gb) < 0.1) ?? gb);
+        };
         backdrop.appendChild(modal);
         document.body.appendChild(backdrop);
-
-        // Initial update
-        updateOfflineModalLive();
-    };
-
-    /** Updates the offline modal DOM elements with current download state. */
-    const updateOfflineModalLive = (): void => {
-        if (!modalEls || !modalFavId || !downloadsRef) return;
-        const { statsEl, warningEl, globalCountText, quotaSelect, badgeEl, pauseBtn } = modalEls;
-        const fav = favorites.getAll().find(f => f.id === modalFavId);
-        if (!fav) { modalEls.actionBtn.disabled = true; pauseBtn.remove(); return; }
-        modalEls.title.textContent = fav.offlinePin ? 'Available Offline' : 'Make Available Offline';
-        modalEls.actionBtn.textContent = fav.offlinePin ? 'Make unavailable offline' : 'Make available offline';
-
-        const snap = downloadsRef.getSnapshot();
-        const cached = downloadsRef.favoriteProgress?.(modalFavId);
-        const keys = downloadsRef.favoriteProgress ? [] : collectPhysicalTracks(modalFavId, favorites, roots).map(t => t.driveId + ':' + t.itemId);
-        const totalTracks = cached?.total ?? keys.length;
-        const downloadedCount = cached?.downloaded ?? keys.filter(k => snap.downloadedKeys.has(k)).length;
-        const hasMissingTracks = downloadedCount < totalTracks || cached?.complete === false;
-        const incomplete = !!fav.offlinePin && hasMissingTracks;
-        const trackLabel = `${totalTracks} track${totalTracks !== 1 ? 's' : ''}`;
-        const iconState = classifyOfflineBadgeState(
-            hasMissingTracks,
-            snap.evidence,
-            fav.offlinePin?.paused ?? false,
-            snap.overQuota,
-            !!snap.lastError,
-        );
-        setOfflineBadge(badgeEl, fav.offlinePin ? iconState : undefined);
-        const isDownloading = iconState === 'downloading';
-
-        statsEl.textContent = '';
-        if (downloadsRef.favoriteProgress && (!cached || (!cached.complete && !cached.total))) {
-            statsEl.textContent = 'Waiting for the library…';
-        } else if (!fav.offlinePin) {
-            statsEl.textContent = trackLabel;
-        } else if (!hasMissingTracks) {
-            // Estimate this favorite's bytes proportionally from global totals
-            const favBytes = cached?.bytes ?? (snap.downloadedKeys.size > 0
-                ? snap.totalBytes * downloadedCount / snap.downloadedKeys.size : 0);
-            statsEl.textContent = `${trackLabel}, ${formatBytes(favBytes)} \u2713`;
-        } else if (isDownloading) {
-            pauseBtn.textContent = '\u2002\u23F8\uFE0E'; // ⏸︎
-            statsEl.append(
-                document.createTextNode(`Downloading ${downloadedCount}/${totalTracks} tracks`),
-                pauseBtn,
-            );
-        } else {
-            pauseBtn.textContent = '\u2002\u25B6\uFE0E'; // ▶︎
-            statsEl.append(
-                document.createTextNode(`Paused ${downloadedCount}/${totalTracks} tracks`),
-                pauseBtn,
-            );
-        }
-
-        // Show pause/resume glyph:
-        //   paused:true → show ▶︎ (resume clears paused)
-        //   lastError → show ▶︎ (resume clears error)
-        //   else → show ⏸︎ only if downloading (signed-in, not over quota)
-        pauseBtn.style.display = incomplete ? '' : 'none';
-        if (incomplete && !isDownloading) {
-            const showResume = fav.offlinePin!.paused || !!snap.lastError
-                || (!snap.overQuota && snap.evidence === 'evidence:signed-in');
-            pauseBtn.style.display = showResume ? '' : 'none';
-        }
-
-        // Warning line: reason for being paused (not shown for user-initiated pause)
-        warningEl.textContent = '';
-        if (incomplete && !isDownloading && !fav.offlinePin!.paused) {
-            if (snap.overQuota) warningEl.textContent = 'Reached storage limit';
-            else if (snap.evidence === 'evidence:signed-out') warningEl.textContent = 'Not signed in';
-            else if (snap.evidence === 'evidence:not-online') warningEl.textContent = 'Not online';
-            else if (snap.lastError) warningEl.textContent = snap.lastError;
-        }
-
-        // Global: update text and quota select value (DOM structure is stable)
-        const globalDownloaded = snap.downloadedKeys.size;
-        const globalQueued = snap.queuedKeys.size;
-        const globalTotal = globalDownloaded + globalQueued;
-        const hasActiveDownloads = globalQueued > 0 && snap.evidence === 'evidence:signed-in';
-        const currentQuotaGb = snap.quotaBytes / (1024 * 1024 * 1024);
-
-        globalCountText.textContent = hasActiveDownloads
-            ? `${globalDownloaded}/${globalTotal} tracks, ${formatBytes(snap.totalBytes)} / `
-            : `${globalDownloaded} tracks, ${formatBytes(snap.totalBytes)} / `;
-        quotaSelect.value = String(QUOTA_OPTIONS_GB.find(gb => Math.abs(gb - currentQuotaGb) < 0.1) ?? currentQuotaGb);
+        refreshOfflineModal = renderOfflineModal;
+        renderOfflineModal();
     };
 
     // -- Long-press detection -------------------------------------------------
@@ -838,6 +760,9 @@ export function createSelect(
     let longPressStartY = 0;
     /** Flag to suppress contextmenu right after a long-press fires. */
     let suppressContextMenu = false;
+    // Re-rendering checkboxes during a long-press leaves the finger over a selected row.
+    // Its release click belongs to the press that entered selection.
+    let suppressLongPressClick = false;
     /** Tracks latest long-press entry for diagnostic logging on immediate exits. */
     let lastLongPressEnterAt = 0;
     let lastLongPressEnteredPath: FolderPath | undefined;
@@ -873,8 +798,18 @@ export function createSelect(
         e.preventDefault();
     });
 
+    treeContainer.addEventListener('click', event => {
+        if (!suppressLongPressClick || event.detail === 0) return;
+        suppressLongPressClick = false;
+        event.preventDefault();
+        event.stopPropagation();
+    }, true);
+
     treeContainer.addEventListener('pointerdown', (e) => {
-        if (!e.isPrimary || e.button !== 0) return;
+        if (!e.isPrimary) return;
+        suppressLongPressClick = false;
+        suppressContextMenu = false;
+        if (e.button !== 0) return;
         if (active) return; // already in select mode
         const path = pathFromTreeEventTarget(e.target);
         if (!path || !isSelectablePath(path)) return;
@@ -888,6 +823,7 @@ export function createSelect(
             longPressTimer = undefined;
             longPressPointerId = undefined;
             suppressContextMenu = true;
+            suppressLongPressClick = true;
             lastLongPressEnterAt = performance.now();
             lastLongPressEnteredPath = path;
             select.enterSelectModeWithRow(path);
@@ -928,17 +864,6 @@ export function createSelect(
     // -- Action bar button handlers -------------------------------------------
 
     shareBtn.addEventListener('click', () => showSharePopup());
-    rightBtn.addEventListener('click', () => {
-        if (rightBtnMode === 'fav' && rightBtnFavId) {
-            // Single favorite: show the favorite-management dropdown.
-            const items = buildFavItems(rightBtnFavId);
-            if (items.length > 0) showDropdown(rightBtn, items, 'action-dropdown');
-        } else if (rightBtnMode === 'delete') {
-            // Multiple deletable items: go straight to delete confirmation
-            showDeleteModal();
-        }
-    });
-
     // -- Cancel button --------------------------------------------------------
 
     cancelBtn.addEventListener('click', () => select.exitSelectMode());
@@ -999,13 +924,15 @@ export function createSelect(
 
         setRoots(newRoots) {
             roots = newRoots;
+            if (active) syncActionBar();
         },
 
         onEnterSelect: () => {},
         onExitSelect: () => {},
         onNavigateToFav: () => {},
         setDownloads(dl) { downloadsRef = dl; },
-        updateOfflineModal() { updateOfflineModalLive(); },
+        updateOfflineModal() { refreshOfflineModal?.(); },
+        refreshFolderActions() { if (active) syncActionBar(); },
     };
 
     return select;

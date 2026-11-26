@@ -855,9 +855,9 @@ module.exports = {
         };
 
         await openOfflineModal();
-        const actionLabel = (await page.locator(".modal .modal-cancel").first().textContent() || "").trim();
-        if (/make available offline/i.test(actionLabel)) {
-            await page.locator(".modal .modal-cancel").first().click();
+        const mark = page.locator(".modal").getByRole("button", {name: "Make available offline", exact: true});
+        if (await mark.isVisible()) {
+            await mark.click();
             await page.waitForSelector(".modal-backdrop", { state: "hidden", timeout: 3000 });
             await openOfflineModal();
         }

@@ -226,7 +226,7 @@ Note that "re-pull index after an index has completed" is something that will ha
 
 Available Offline:
 - A favorite may have been marked as available offline. This mark is shown as ↓ badge to the right of the favorite icon. (Note: when a favorite is nested inside another favorite, the nested view of it shows the ♫/☆ icon just so the user knows that they've got a layer of indirection here, and the ↓ isn't shown in this nested spot; it's only shown at top level. To be clear, a nested favorite is nothing more than a pointer to an existing top-level favorite). It will be animated "↓⌄_" when downloads for this playlist are queued and downloading is actively happening (i.e. the app believes it is online and can download).
-- The way to mark a favorite as available offline is via the favorite popup in select mode (long-press the favorite, then tap the action bar's right button). There's an option "Make available offline >". When you chose this, it opens the "Available offline modal".
+- The way to mark a favorite as available offline is via the favorite popup in select mode (long-press the favorite, then tap the action bar's right button). The popup and dialog title both read "Make available offline" for an unmarked item and "Available offline…" for a marked item or a partially marked folder.
 - We will have our own limit of how much cache we're willing to use for offline files. Default 2gb. The size needed for an "marked for offline" folder may grow or shrink based on user actions (e.g. adding a new folder into a playlist), but also on non-user actions (e.g. an index has just completed and has revealed that a shortcut now is substantially larger than it was last time the index was built). If ever we're trying to download items that are larger than the limit, we'll pause downloads, and have some kind of warning indicator; maybe the icon would be "↓⏸" next to each other, or maybe the two would be superimposed. The user would know to long-press the favorite and use the action bar to learn more.
 - The "Available Offline" modal is a sort of control center for offline stuff. It is brought up in relation to an individual favorite, and has things specific to that favorite (how many tracks+bytes for that favorite, whether it's finished downloading or not, actions to turn on or off available-offline status for this favorite, ability to pause/unpause this favorite), and global information (the global queue of downloads, ability to change the global quota, how many tracks+bytes we store globally). This modal is used for different purposes (when the user taps "make available offline", when they tap "make unavailable offline", when they just want to view the offline status of a favorite maybe to pause/resume it or just see what it's doing). The reason to combine them is (1) simplicity of UI so the user only needs to learn a single modal, (2) because shortcuts and playlists might overlap, sharing storage, so it's not really meaningful to talk about storage/queue of one playlist in isolation, (3) the actions "make available offline" and "make unavailable" are both dangerous ones, so this modal is used to act as a confirmation dialog that let's the user make an informed choice. For instance if they entered it from "make available offline" in the action bar popup, the confirmation button will be "Make available offline"; when they entered it from "make unavailable offline" in the action bar popup, the confirmation button will be "Make unavailable offline" and there'll be the warning that cache will be lost.
 - "Paused" icon is shown for three things: (1) if the user has clicked Pause, (2) if we had a network error trying to download tracks, (3) if we've hit quota. The first "user click" is stored in a boolean which is persisted to IndexDB. The most recent error is stored only in RAM; the total size of files in IndexedDB can be computed from indexedDB at any time, including after restart, though we may decide to cache it depending on implementation ease. It's intentional that all three causes are shown with the same UI to the user, to keep concepts simple for them. The modal will show the most recent error, and will show a quota warning. If the user hits "resume" on any favorite, that resets the persisted "paused" boolean AND the error in RAM. Note that there's no "global" pause; if a user wants to pause five downloads, they can do so manually for each one.
@@ -265,8 +265,8 @@ Available Offline:
    
 ```
 +-------------------------------------+
-| Make Available Offline              |  <-- title reflects how the user opened this modal
-| OR: Available Offline               |
+| Make available offline              |  <-- title reflects how the user opened this modal
+| OR: Available offline…              |
 |                                     |
 | ☆ Beatles "" or "↓" or "↓⌄_" or "↓⏸"|  <-- this is the favorite you clicked on (readonly)
 |                                     |      the icon is the same as shown in tree view
@@ -292,7 +292,7 @@ Available Offline:
 |                                     |      alphabetically first of concurrent downloads.
 |                                     |      The % indicator is there for really big tracks.
 |                                     |
-| [Make unavailable offline]          |  <-- if opened via "Available offline >"; closes modal
+| [Make unavailable offline]          |  <-- if opened via "Available offline…"; closes modal
 | [Make available offline]            |  <-- if opened via "Make available offline"; closes modal
 | [Cancel/Close]                      |  <-- Initially "Cancel". But if you make a change
 |                                     |      to pause/resume/max, then it becomes "Close".

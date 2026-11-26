@@ -19,6 +19,13 @@ struct PlaybackStore {
     static func pinName(_ key: String) -> String { Data(SHA256.hash(data: Data(key.utf8))).base64EncodedString().replacingOccurrences(of: "/", with: "_") }
     func pinURL(_ key: String) -> URL { pinDirectory.appendingPathComponent(Self.pinName(key)) }
 
+    /// Pin paths name regular files. Unlink leaves an open decoder descriptor readable.
+    func unlinkPin(_ key: String) throws {
+        guard unlink(pinURL(key).path) == 0 || errno == ENOENT else {
+            throw POSIXError(POSIXErrorCode(rawValue:errno) ?? .EIO)
+        }
+    }
+
     func bookmarkFile(_ favorite: String) -> String { "favorite-" + Self.digest(Data(favorite.utf8)) }
 
     func read<T: Decodable>(_ type: T.Type, _ name: String) throws -> T? {

@@ -10,7 +10,17 @@
  */
 
 import { type MusicFolder } from './indexer.js';
-import { type ItemRef, type Root, type RootsMap } from './favorites.js';
+import { type FolderPin, type ItemRef, type Root, type RootsMap } from './favorites.js';
+
+/** Native retention follows a folder ID through renames within one connection. */
+export function folderPinOwnerId(pin: FolderPin): string {
+    return 'folder:' + JSON.stringify([pin.sourceRootKey, pin.connectionId ?? null, pin.itemId]);
+}
+
+/** Pin paths are scoped to the current share connection. JSON preserves segment boundaries. */
+export function folderPinPathKey(sourceRootKey: string, connectionId: string | undefined, path: readonly string[]): string {
+    return JSON.stringify([sourceRootKey, connectionId ?? null, ...path]);
+}
 
 /** Root variant that can be traversed as a folder tree. */
 export type WalkableRoot =

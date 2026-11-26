@@ -43,13 +43,15 @@ interface SharesData {
 export interface RemoveImpact {
     readonly uniqueTrackCount: number;
     readonly affectedFavoriteCount: number;
+    readonly folderPinCount: number;
 }
 
 export interface Shares {
     hasLoadedMembership?(): boolean;
     getAll(): readonly ShareRecordPersisted[];
     loadFromCache(): Promise<void>;
-    pullFromOneDrive(): Promise<void>;
+    /** True after reading a valid document or confirming there is none (404). */
+    pullFromOneDrive(): Promise<boolean>;
     addFromUrl(url: string, signal?: AbortSignal): Promise<ShareRecordPersisted>;
     rename(id: string, nextName: string): Promise<void>;
     remove(id: string): Promise<void>;
@@ -57,7 +59,7 @@ export interface Shares {
     getDeniedCount(): number;
     getDeniedRootKeys(): ReadonlySet<string>;
     getDeniedReason(rootKey: string): string | undefined;
-    computeRemoveImpact(rootKey: string, favorites: Favorites, roots: RootsMap): RemoveImpact;
+    computeRemoveImpact(share: ShareRecordPersisted, favorites: Favorites, roots: RootsMap): RemoveImpact;
 }
 
 const IDB_KEY = 'shares';
@@ -173,22 +175,28 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
         },
 
         async pullFromOneDrive() {
-            await deps.authFetch(`https://graph.microsoft.com/v1.0${ONEDRIVE_PATH}`, false)
-                .then(async (r) => {
-                    if (!r.ok) {
-                        if (r.status !== 404) logError(`shares: OneDrive load failed: ${r.status}`);
-                        return;
-                    }
-                    const server: SharesData = await readGraphJson(r, 'shares:onedrive-load');
-                    if (!server || !Array.isArray(server.shares)) return;
-                    loadedMembership = true;
-                    if ((server.updatedAt || 0) <= updatedAt) return;
-                    shares = sortByAddedAt(server.shares.map(normalizeShare));
-                    updatedAt = server.updatedAt;
-                    await saveLocal();
-                    onChange();
-                })
-                .catch(logCatch('shares:onedrive-load'));
+            try {
+                const r = await deps.authFetch(`https://graph.microsoft.com/v1.0${ONEDRIVE_PATH}`, false);
+                if (!r.ok) {
+                    if (r.status === 404) loadedMembership = true;
+                    else logError(`shares: OneDrive load failed: ${r.status}`);
+                    return r.status === 404;
+                }
+                const server: SharesData = await readGraphJson(r, 'shares:onedrive-load');
+                if (!server || !Array.isArray(server.shares)) return false;
+                const serverTime = server.updatedAt || 0;
+                if (loadedMembership && serverTime <= updatedAt) return true;
+                const previous = shares;
+                const next = sortByAddedAt(server.shares.map(normalizeShare));
+                await deps.dbPut(IDB_KEY, {version:1, updatedAt:serverTime, shares:next});
+                // A local edit admitted during this write wins. Reconcile its graph on the next pull.
+                if (shares !== previous) return false;
+                shares = next;
+                updatedAt = serverTime;
+                loadedMembership = true;
+                onChange();
+                return true;
+            } catch (error) { logCatch('shares:onedrive-load')(error); return false; }
         },
 
         async addFromUrl(url, signal) {
@@ -328,7 +336,8 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
         getDeniedRootKeys: () => new Set(deniedByRootKey.keys()),
         getDeniedReason: (rootKey) => deniedByRootKey.get(rootKey),
 
-        computeRemoveImpact(rootKey, favorites, roots) {
+        computeRemoveImpact(share, favorites, roots) {
+            const rootKey = share.rootKey;
             const allFavorites = favorites.getAll();
             const trackKeys = new Set<string>();
             let affectedFavoriteCount = 0;
@@ -373,6 +382,7 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
 
             return {
                 uniqueTrackCount: trackKeys.size,
+                folderPinCount: favorites.getFolderPins().filter(pin => pin.sourceRootKey === rootKey && pin.connectionId === share.id).length,
                 affectedFavoriteCount,
             };
         },

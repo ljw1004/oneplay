@@ -72,13 +72,8 @@ function makeStubDeps(): {
         },
         async audioPut(key, blob) { audioStore.set(key, blob); },
         async audioGet(key) { return audioStore.get(key); },
-        async audioDelete(key) { audioStore.delete(key); },
-        async audioKeys() { return Array.from(audioStore.keys()); },
-        async audioTotalBytes() {
-            let total = 0;
-            for (const blob of audioStore.values()) total += blob.size;
-            return total;
-        },
+        async audioDeleteBatch(keys) { for (const key of keys) audioStore.delete(key); },
+        async audioFileSizes() { return new Map([...audioStore].map(([key, blob]) => [key, blob.size])); },
         async audioClear() { audioStore.clear(); },
         loadQuotaBytes() { return quotaBytes; },
         saveQuotaBytes(bytes) { quotaBytes = bytes; },
@@ -156,8 +151,8 @@ function waitForState(dl: Downloads, predicate: () => boolean): Promise<void> {
     if (predicate()) return Promise.resolve();
     return new Promise<void>(resolve => {
         const prev = dl.onStateChange;
-        dl.onStateChange = () => {
-            prev();
+        dl.onStateChange = inventory => {
+            prev(inventory);
             if (predicate()) {
                 dl.onStateChange = prev;
                 resolve();
@@ -190,8 +185,8 @@ describe('evidence state machine', () => {
         const dl = createTestDownloads(stubs);
         dl.setPinnedKeys(keySet('f1', 'f2', 'f3'), keySet('f1', 'f2', 'f3'));
         stubs.setEvidence('evidence:signed-in');
-        // Wait for downloads to complete (3 tracks → all in downloadedKeys)
-        await waitForState(dl, () => dl.getSnapshot().downloadedKeys.size === 3);
+        // Wait for downloads to complete (3 tracks → all in files)
+        await waitForState(dl, () => dl.getSnapshot().files.size === 3);
         assert.ok(stubs.fetchLog.length > 0, 'expected fetch calls after signed-in transition');
     });
 
@@ -200,7 +195,7 @@ describe('evidence state machine', () => {
         const dl = createTestDownloads(stubs);
         dl.setPinnedKeys(keySet('f1', 'f2', 'f3'), keySet('f1', 'f2', 'f3'));
         stubs.setEvidence('evidence:signed-in');
-        await waitForState(dl, () => dl.getSnapshot().downloadedKeys.size === 3);
+        await waitForState(dl, () => dl.getSnapshot().files.size === 3);
         const countBefore = stubs.fetchLog.length;
         stubs.setEvidence('no-evidence');
         // After no-evidence, no new fetches should start. The transition is
@@ -256,14 +251,14 @@ describe('queue calculation', () => {
         assert.equal(stubs.fetchLog.length, 0);
     });
 
-    it('setPinnedKeys hydrates cached downloadedKeys while evidence is not-online', async () => {
+    it('setPinnedKeys hydrates cached files while evidence is not-online', async () => {
         const stubs = makeStubDeps();
         stubs.audioStore.set(`${DRIVE}:f1`, new Blob(['data']));
         const dl = createTestDownloads(stubs);
         stubs.setEvidence('evidence:not-online');
         dl.setPinnedKeys(keySet('f1'), keySet('f1'));
-        await waitForState(dl, () => dl.getSnapshot().downloadedKeys.size === 1);
-        assert.equal(dl.getSnapshot().downloadedKeys.size, 1);
+        await waitForState(dl, () => dl.getSnapshot().files.size === 1);
+        assert.equal(dl.getSnapshot().files.size, 1);
         assert.equal(stubs.fetchLog.length, 0, 'must not start network fetch while not-online');
     });
 });
@@ -273,6 +268,17 @@ describe('queue calculation', () => {
 // ---------------------------------------------------------------------------
 
 describe('garbage collection', () => {
+    it('only collects cached files once current owner membership is complete', async () => {
+        const stubs = makeStubDeps();
+        const all = keySet('song', 'other', 'orphan'), kept = keySet('song', 'other');
+        for (const key of all) stubs.audioStore.set(key, new Blob(['audio']));
+        const engine = createTestDownloads(stubs);
+        await engine.setPinnedKeys(kept, kept, false);
+        assert.deepEqual(new Set(stubs.audioStore.keys()), all);
+        await engine.setPinnedKeys(kept, kept, true);
+        assert.deepEqual(new Set(stubs.audioStore.keys()), kept);
+    });
+
     it('downloaded track not in retainKeys → audioDelete called', async () => {
         const stubs = makeStubDeps();
         // A track in the store that shouldn't be retained
@@ -321,7 +327,7 @@ describe('error classification', () => {
         stubs.setEvidence('evidence:signed-in');
         // 404s are removed from queue. Wait for all workers to finish
         // (queue drains, no items re-queued). onStateChange fires per track.
-        await waitForState(dl, () => dl.getSnapshot().queuedKeys.size === 0);
+        await waitForState(dl, () => dl.getSnapshot().queuedCount === 0);
         assert.equal(stubs.audioStore.size, 0);
     });
 
@@ -389,10 +395,10 @@ describe('error classification', () => {
         dl.setPinnedKeys(keySet('f1'), keySet('f1'));
         stubs.setEvidence('evidence:signed-in');
         await fetchStarted;
-        // Recalculate aborts in-flight workers by bumping generation + abort signal.
+        // Removing the last owner aborts the recording’s request.
         dl.setPinnedKeys(new Set(), new Set());
         await waitForState(dl, () =>
-            dl.getSnapshot().queuedKeys.size === 0 && dl.getSnapshot().downloadedKeys.size === 0);
+            dl.getSnapshot().queuedCount === 0 && dl.getSnapshot().files.size === 0);
         assert.equal(stubs.getEvidence(), 'evidence:signed-in');
         assert.equal(dl.getSnapshot().lastError, undefined);
     });
@@ -403,18 +409,18 @@ describe('error classification', () => {
 // ---------------------------------------------------------------------------
 
 describe('snapshot API', () => {
-    it('getSnapshot returns atomic state', async () => {
+    it('snapshot exposes completed sizes alongside queue and quota state', async () => {
         const stubs = makeStubDeps();
         stubs.audioStore.set(`${DRIVE}:f1`, new Blob(['data']));
         const dl = createTestDownloads(stubs);
         dl.setPinnedKeys(keySet('f1', 'f2'), keySet('f1', 'f2'));
         stubs.setEvidence('evidence:signed-in');
         // Wait for f2 to be downloaded (f1 was pre-populated)
-        await waitForState(dl, () => dl.getSnapshot().downloadedKeys.size === 2);
+        await waitForState(dl, () => dl.getSnapshot().files.size === 2);
 
         const snap = dl.getSnapshot();
-        assert.ok(snap.downloadedKeys.has(`${DRIVE}:f1`));
-        assert.ok(snap.downloadedKeys.has(`${DRIVE}:f2`));
+        assert.equal(snap.files.get(`${DRIVE}:f1`), stubs.audioStore.get(`${DRIVE}:f1`)!.size);
+        assert.equal(snap.files.get(`${DRIVE}:f2`), stubs.audioStore.get(`${DRIVE}:f2`)!.size);
         assert.equal(snap.evidence, 'evidence:signed-in');
         assert.equal(snap.overQuota, false);
         assert.equal(snap.lastError, undefined);
@@ -440,10 +446,10 @@ describe('snapshot API', () => {
         stubs.setEvidence('evidence:signed-in');
         // Wait for download to complete
         await waitForState(dl, () => stubs.audioStore.size === 1);
-        assert.ok(dl.getSnapshot().downloadedKeys.size > 0, 'precondition: has downloads');
+        assert.ok(dl.getSnapshot().files.size > 0, 'precondition: has downloads');
         await dl.clear();
         const snap = dl.getSnapshot();
-        assert.equal(snap.downloadedKeys.size, 0);
+        assert.equal(snap.files.size, 0);
         assert.equal(snap.totalBytes, 0);
         assert.equal(stubs.audioStore.size, 0);
     });
@@ -506,23 +512,31 @@ describe('evidence:not-online', () => {
 });
 
 describe('offline badge classifier', () => {
+    const progress = {downloaded: 0, total: 1, bytes: 0, complete: true};
+    const online = {evidence: 'evidence:signed-in' as const, overQuota: false, lastError: undefined};
     it('missing + not-online returns paused', () => {
         assert.equal(
-            classifyOfflineBadgeState(true, 'evidence:not-online', false, false, false),
+            classifyOfflineBadgeState(progress, {...online, evidence: 'evidence:not-online'}, false),
             'paused',
         );
     });
 
     it('missing + signed-in + no blockers returns downloading', () => {
         assert.equal(
-            classifyOfflineBadgeState(true, 'evidence:signed-in', false, false, false),
+            classifyOfflineBadgeState(progress, online, false),
             'downloading',
         );
     });
 
+    it('an unavailable index has nothing to download until it identifies a missing file', () => {
+        assert.equal(classifyOfflineBadgeState(undefined, online, false), 'paused');
+        assert.equal(classifyOfflineBadgeState({...progress, complete: false, downloaded: 1}, online, false), 'paused');
+        assert.equal(classifyOfflineBadgeState({...progress, complete: false}, online, false), 'downloading');
+    });
+
     it('no missing tracks returns complete', () => {
         assert.equal(
-            classifyOfflineBadgeState(false, 'evidence:not-online', false, true, true),
+            classifyOfflineBadgeState({...progress, downloaded: 1}, {...online, evidence: 'evidence:not-online', overQuota: true, lastError: 'Offline'}, false),
             'complete',
         );
     });

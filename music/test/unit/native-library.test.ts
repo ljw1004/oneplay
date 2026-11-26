@@ -2,6 +2,21 @@ import assert from 'node:assert/strict';
 import { it } from 'node:test';
 import { createNativeLibrary } from '../../src/native-library.js';
 
+it('splits large owner projections without breaking Unicode across chunk boundaries', async () => {
+    const recordings = Array.from({length:500}, (_, i) => 'drive:💿-fictional-recording-' + i);
+    const pieces: string[] = [];
+    const native = createNativeLibrary({async postMessage(message) {
+        assert.equal(message.action, 'ownerPart');
+        // Round-trip each message separately as the Swift bridge does.
+        pieces.push(Buffer.from(String(message.text)).toString());
+        return {};
+    }});
+    const owners = Array.from({length: 8}, (_, i) => ({id:'playlist-' + i, paused:false, complete:true, sources:{drive:recordings}}));
+    await native.pins('owners', {revision:1, owners});
+    assert.ok(pieces.length > 1);
+    assert.deepEqual(JSON.parse(pieces.join('')), owners);
+});
+
 it('preserves caller options, response metadata and empty bodies on the native bridge', async () => {
     let sent: Record<string, unknown> = {};
     const native = createNativeLibrary({ async postMessage(message) {

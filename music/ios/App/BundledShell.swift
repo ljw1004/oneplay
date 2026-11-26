@@ -10,8 +10,7 @@ import WebKit
     private weak var admittedPage: WKWebView?
     var onReplacePage: (() -> Void)?
 
-    override init() {
-        let root = Bundle.main.bundleURL.appendingPathComponent("Web", isDirectory: true)
+    init(root: URL = Bundle.main.bundleURL.appendingPathComponent("Web", isDirectory: true)) {
         let manifest = try? String(contentsOf: root.appendingPathComponent("manifest.txt"), encoding: .utf8)
         files = Dictionary(uniqueKeysWithValues: (manifest ?? "").split(separator: "\n").map {
             let path = String($0)

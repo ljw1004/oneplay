@@ -145,11 +145,14 @@ module.exports = {
             const name = "Lionel Nimrod's Inexplicable World";
             window._testAuth.transition("evidence:signed-in");
             tree.setDebugEnabled(true);
-            tree.setFavorites({
+            // A background render may rebind the loaded favorites model. Give that
+            // model the fixture so the selected route survives the rebind.
+            Object.assign(window._testFavorites, {
                 getAll: () => [{ id: "comedy", name: "Comedy Offline", kind: "playlist", members: [] }],
                 resolveChildren: (_id, path) => path.length ? [["Episode 1.mp3", false]] : [["m:0", true]],
                 resolvePathSegmentName: () => name,
             });
+            tree.setFavorites(window._testFavorites);
             tree.setOfflineIcons(new Map([["comedy", "paused"]]));
             tree.setSelectedPath(["OnePlay Music", "fav:comedy", "m:0"]);
             tree.setSyncing(false);
@@ -460,6 +463,7 @@ module.exports = {
                 if (root.type !== "share") continue;
                 existingShares.push({
                     key,
+                    connectionId: root.connectionId,
                     name: root.name,
                     driveId: root.driveId,
                     folder: root.folder,
@@ -470,6 +474,7 @@ module.exports = {
                 ...existingShares,
                 {
                     key: "share:test-no-data",
+                    connectionId: "test-no-data",
                     name: "Pending Share",
                     driveId: "drive-test",
                     reindexing: false,
@@ -491,6 +496,7 @@ module.exports = {
                 if (root.type !== "share" || key === "share:test-no-data") continue;
                 restoredShares.push({
                     key,
+                    connectionId: root.connectionId,
                     name: root.name,
                     driveId: root.driveId,
                     folder: root.folder,

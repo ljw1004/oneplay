@@ -5,8 +5,8 @@
  * folder; a playlist is an ordered list of members (folders, files, or
  * references to other favorites). Favorites are persisted to IndexedDB
  * (fast, best-effort) and the OneDrive App folder (best-effort, may fail
- * offline). An edit that fences a playback queue must commit to IndexedDB before
- * acknowledgment. Other settings and cloud writes remain best effort.
+ * offline). Playback queue edits, explicit mode choices and download requests
+ * must commit to IndexedDB before acknowledgment. Cloud writes are best effort.
  *
  * INVARIANTS:
  * - Shortcut targets always have isFolder=true. Enforced at add() and load().
@@ -17,14 +17,15 @@
  *   against cycles from corrupt/legacy data.
  * - FavoritesData.updatedAt is the epoch-ms timestamp of the most recent
  *   mutation. On load, local vs server conflict is resolved by newer updatedAt.
- * - Every mutation (add, remove, heal) and loadFromCache/pullFavoritesFromOneDrive call
- *   state, so the tree re-renders.
+ * - A folder pin covers a whole physical branch. Edits and healing retain only
+ *   its outermost explicit request within the same source and connection.
+ * - A committed edit publishes the new favorites and folder pins together.
  */
 
-import { type MusicFolder, type MusicFile, isMusicFolder, walkFolder, sortedFolderChildren } from './indexer.js';
+import { type MusicFolder, isMusicFolder, walkFolder, sortedFolderChildren } from './indexer.js';
 import { type PlaybackMode, isValidMode } from './playback.js';
 import { log, logError, logCatch } from './logger.js';
-import { resolveWalkableRootForItemRef } from './roots.js';
+import { folderPinOwnerId, folderPinPathKey, resolveWalkableRootForItemRef } from './roots.js';
 import { readGraphJson, type AuthFetch } from './auth.js';
 
 // ---------------------------------------------------------------------------
@@ -35,7 +36,6 @@ import { readGraphJson, type AuthFetch } from './auth.js';
  *  throwing stubs so accidental I/O paths fail fast. */
 export interface FavoritesDeps {
     authFetch: AuthFetch;
-    fencePinEdit?: () => Promise<() => void> | undefined;
     fenceQueueEdit?: () => Promise<void> | undefined;
     dbGet<T>(key: string): Promise<T | undefined>;
     dbPut(key: string, value: unknown): Promise<void>;
@@ -53,6 +53,66 @@ export interface ItemRef {
     readonly isFolder: boolean;
     /** Optional root identity used for share-backed refs (M14 multi-share disambiguation). */
     readonly sourceRootKey?: string;
+}
+
+/** A requested physical subfolder. Share connections get a fresh UUID each time
+ * the same link is added, even though their sourceRootKey remains the same. */
+export interface FolderPin extends ItemRef {
+    readonly isFolder: true;
+    readonly sourceRootKey: string;
+    readonly connectionId?: string;
+}
+
+// The index objects are immutable. Their reverse lookup dies with the index and
+// is shared by all healed references to it. A folder rename allocates
+// paths for folders only, even when the root also contains 30,000 recordings.
+const folderPathsByIndex = new WeakMap<MusicFolder, Promise<Map<string, string[]>>>();
+const filePathsByIndex = new WeakMap<MusicFolder, Promise<Map<string, string[]>>>();
+
+/** Enumerate each immutable index once per requested node type. Check time even
+ * inside a single wide folder, and never allocate paths for unrequested recordings. */
+async function indexPaths(folder: MusicFolder, folders: boolean): Promise<Map<string, string[]>> {
+    const paths = new Map<string, string[]>();
+    const pending: [MusicFolder, string[]][] = [[folder, []]];
+    let visited = 0, start = performance.now();
+    while (pending.length) {
+        const [dir, path] = pending.pop()!;
+        if (folders) paths.set(dir.id, path);
+        for (const name in dir.children) {
+            const child = dir.children[name];
+            if (isMusicFolder(child)) pending.push([child, [...path, name]]);
+            else if (!folders) paths.set(child.id, [...path, name]);
+            if (++visited % 64 === 0 && performance.now() - start >= 4) {
+                await new Promise(resolve => setTimeout(resolve, 0));
+                start = performance.now();
+            }
+        }
+    }
+    return paths;
+}
+
+/** Resolve by path first (including replacements), then by ID and node type.
+ * The caller must establish that this complete index belongs to the reference. */
+export async function resolveVerifiedItemRef<Ref extends ItemRef>(ref: Ref, folder: MusicFolder): Promise<Ref | undefined> {
+    const name = ref.path.at(-1);
+    const item = name === undefined ? folder : walkFolder(folder, ref.path.slice(0, -1))?.children[name];
+    if (item && isMusicFolder(item) === ref.isFolder) {
+        return item.id === ref.itemId ? ref : { ...ref, itemId: item.id };
+    }
+    const cache = ref.isFolder ? folderPathsByIndex : filePathsByIndex;
+    const paths = cache.get(folder) ?? indexPaths(folder, ref.isFolder);
+    cache.set(folder, paths);
+    const path = (await paths).get(ref.itemId);
+    return path ? { ...ref, path } : undefined;
+}
+
+/** One request per folder and per path within a connection. A parent covers its descendants. */
+function normalizeFolderPins(pins: readonly FolderPin[]): readonly FolderPin[] {
+    const byOwner = new Map(pins.filter(pin => pin.path.length).map(pin => [folderPinOwnerId(pin), pin]));
+    const byPath = new Map(pins.filter(pin => byOwner.get(folderPinOwnerId(pin)) === pin)
+        .map(pin => [folderPinPathKey(pin.sourceRootKey, pin.connectionId, pin.path), pin]));
+    return [...byPath.values()].filter(pin => !pin.path.some((_, i) =>
+        byPath.has(folderPinPathKey(pin.sourceRootKey, pin.connectionId, pin.path.slice(0, i)))));
 }
 
 /** Reference to another favorite (for playlist-in-playlist). */
@@ -74,7 +134,7 @@ export interface Shortcut {
     readonly target: ItemRef;
     readonly hasPrivatePlayback: boolean;
     /** Per-favorite playback mode. Persisted to OneDrive with favorites data.
-     *  Undefined means "use global default" ('all'). */
+     *  Undefined inherits the live playback mode. */
     readonly mode?: PlaybackMode;
     /** Offline download pin. undefined = not offline.
      *  paused = user-paused downloads for this favorite. */
@@ -88,7 +148,7 @@ export interface Playlist {
     readonly members: readonly PlaylistMember[];
     readonly hasPrivatePlayback: boolean;
     /** Per-favorite playback mode. Persisted to OneDrive with favorites data.
-     *  Undefined means "use global default" ('all'). */
+     *  Undefined inherits the live playback mode. */
     readonly mode?: PlaybackMode;
     /** Offline download pin. undefined = not offline.
      *  paused = user-paused downloads for this favorite. */
@@ -101,6 +161,7 @@ export interface FavoritesData {
     readonly version: number;
     readonly updatedAt: number;
     readonly favorites: readonly Favorite[];
+    readonly folderPins: readonly FolderPin[];
 }
 
 // ---------------------------------------------------------------------------
@@ -111,7 +172,7 @@ export interface FavoritesData {
 export type Root =
     | { readonly type: 'onedrive'; readonly key: string; readonly name: string;
         readonly folder: MusicFolder; readonly info: import('./indexer.js').AccountInfo; readonly reindexing: boolean }
-    | { readonly type: 'share'; readonly key: string; readonly name: string;
+    | { readonly type: 'share'; readonly key: string; readonly name: string; readonly connectionId: string;
         readonly driveId: string; readonly folder?: MusicFolder; readonly reindexing: boolean }
     | { readonly type: 'shortcut'; readonly key: string; readonly name: string;
         readonly target: ItemRef }
@@ -129,6 +190,15 @@ export interface Favorites {
     hasLoadedMembership?(): boolean;
     /** All favorites in display order. */
     getAll(): readonly Favorite[];
+
+    /** Wait for local edits already admitted when the listener selects a favorite. */
+    whenLocalWritesComplete(): Promise<void>;
+
+    /** Explicit physical subfolders requested offline, independently of favorite pins. */
+    getFolderPins(): readonly FolderPin[];
+
+    /** Pin a whole branch or clear its explicit pins, including descendants. */
+    setFolderPinned(folder: FolderPin, pinned: boolean, roots?: RootsMap): Promise<void>;
 
     /** Add a favorite. Returns false if it would create a cycle or shortcut
      *  target is not a folder. Persists to IndexedDB + OneDrive. */
@@ -166,7 +236,7 @@ export interface Favorites {
     heal(
         roots: RootsMap,
         currentFolders: ReadonlyMap<string, MusicFolder>,
-        removedRootKey?: string,
+        removedShare?: { rootKey: string; id: string },
     ): Promise<void>;
 
     /** Persist to IndexedDB and OneDrive. */
@@ -205,9 +275,8 @@ export interface Favorites {
      *  Cache-only — no network. Returns quickly so the UI renders immediately. */
     loadFromCache(): Promise<void>;
 
-    /** Fetch favorites from OneDrive. If the server version has a newer
-     *  updatedAt, adopt it, persist to IndexedDB, and call onChange(). */
-    pullFavoritesFromOneDrive(): Promise<void>;
+    /** Adopt a newer cloud document. True after reading a valid document or confirming a 404. */
+    pullFavoritesFromOneDrive(): Promise<boolean>;
 }
 
 // ---------------------------------------------------------------------------
@@ -218,9 +287,8 @@ export interface Favorites {
  * Creates the favorites module. The onChange callback is called after every
  * mutation so the tree can re-render.
  */
-export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync') => void | Promise<void>): Favorites {
-    let favorites: Favorite[] = [];
-    let updatedAt = 0;
+export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' | 'mode' | 'pins') => void | Promise<void>): Favorites {
+    let data: FavoritesData = { version: 1, updatedAt: 0, favorites: [], folderPins: [] };
     let loadedMembership = false;
     /** Stashed originals for _testOnlySuppressSave restore. */
     let originalDeps: Pick<FavoritesDeps, 'authFetch' | 'dbPut'> | undefined;
@@ -229,14 +297,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
 
     /** Finds a favorite by ID. */
     const findById = (id: string): Favorite | undefined =>
-        favorites.find(f => f.id === id);
-
-    /** Builds FavoritesData from current state. */
-    const toData = (): FavoritesData => ({
-        version: 1,
-        updatedAt,
-        favorites,
-    });
+        data.favorites.find(f => f.id === id);
 
     /** Validates a favorite on load/add. Returns true if valid. */
     const isValid = (fav: Favorite): boolean => {
@@ -255,6 +316,12 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
         hasPrivatePlayback: fav.hasPrivatePlayback ?? false,
         mode: isValidMode(fav.mode) ? fav.mode : undefined,
         offlinePin: fav.offlinePin ?? undefined,
+    });
+
+    /** Both storage paths accept old documents without a folderPins collection. */
+    const normalizedData = (stored: FavoritesData): FavoritesData => ({
+        version: 1, updatedAt: stored.updatedAt || 0,
+        favorites: stored.favorites.filter(isValid).map(normalize), folderPins: stored.folderPins ?? [],
     });
 
     // -- Cycle detection -----------------------------------------------------
@@ -385,83 +452,57 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
      * 2. If found with different itemId — heal by path (item was replaced).
      * 3. If not found at path — look up "driveId:itemId" in idToPath. If found,
      *    update path (item was moved/renamed). Heal by ID.
-     * 4. If neither — broken. Remove shortcuts entirely; remove playlist members.
+     * 4. If neither resolves to the right node type, remove the shortcut, member or pin.
      */
-    const healedFavorites = (
+    const healedMembership = async (
         roots: RootsMap,
         currentFolders: ReadonlyMap<string, MusicFolder>,
-        removedRootKey?: string,
-    ): Favorite[] | undefined => {
+        removedShare?: { rootKey: string; id: string },
+    ): Promise<Partial<Pick<FavoritesData, 'favorites' | 'folderPins'>> | undefined> => {
         let changed = false;
-        const pathsByFolder = new Map<MusicFolder, Map<string, string[]>>();
 
-        const healRef = (ref: ItemRef): ItemRef | undefined => {
-            if (removedRootKey && ref.sourceRootKey === removedRootKey) return undefined;
+        const healRef = async <Ref extends ItemRef>(ref: Ref, connectionId?: string): Promise<Ref | undefined> => {
             const root = resolveWalkableRootForItemRef(ref, roots);
+            // Ordinary favorites follow their source root. A folder pin belongs to the
+            // specific connection that created it. The two cloud documents can arrive
+            // in either order, so a different connection's index cannot heal that pin.
+            if (removedShare && ref.sourceRootKey === removedShare.rootKey) {
+                const current = roots.get(removedShare.rootKey);
+                if (connectionId ? connectionId === removedShare.id
+                    : current?.type !== 'share' || current.connectionId === removedShare.id) return undefined;
+            }
+            if (connectionId && (root?.type !== 'share' || root.connectionId !== connectionId)) return ref;
             // Only this pull's complete, verified folder can establish absence.
             // Offline, denied, failed and concurrently replaced roots keep their references.
             if (!root || currentFolders.get(root.key) !== root.folder) return ref;
-            let current: MusicFolder | MusicFile = root.folder;
-            let resolved = true;
-            for (const seg of ref.path) {
-                if (!isMusicFolder(current) || !current.children[seg]) {
-                    resolved = false;
-                    break;
-                }
-                current = current.children[seg];
-            }
-
-            if (resolved) {
-                // Found at path. Check itemId match.
-                if (current.id === ref.itemId) return ref; // healthy
-                // Different item at same path — heal by path (update itemId)
+            const healed = await resolveVerifiedItemRef(ref, root.folder);
+            if (currentFolders.get(root.key) !== root.folder || resolveWalkableRootForItemRef(ref, roots)?.folder !== root.folder) return ref;
+            if (healed && healed !== ref) {
                 changed = true;
-                log(`favorites: heal by path "${ref.path.join('/')}" old=${ref.itemId} new=${current.id}`);
-                return { ...ref, itemId: current.id };
+                log(`favorites: healed ${ref.itemId} at "${ref.path.join('/')}" to ${healed.itemId} at "${healed.path.join('/')}"`);
             }
-
-            // Most references still resolve at their stored path. Build the reverse
-            // map at most once per root and only after a path actually disappears.
-            let paths = pathsByFolder.get(root.folder);
-            if (!paths) {
-                const byId = new Map<string, string[]>();
-                const visit = (item: MusicFolder | MusicFile, path: string[]): void => {
-                    byId.set(item.id, path);
-                    if (isMusicFolder(item)) {
-                        for (const [name, child] of Object.entries(item.children)) visit(child, [...path, name]);
-                    }
-                };
-                visit(root.folder, []);
-                pathsByFolder.set(root.folder, byId);
-                paths = byId;
-            }
-            const path = paths.get(ref.itemId);
-            if (path) {
-                changed = true;
-                log(`favorites: heal by ID ${ref.itemId} → ${path.join('/')}`);
-                return { ...ref, path };
-            }
-
-            // Broken
-            log(`favorites: broken ref driveId=${ref.driveId} itemId=${ref.itemId} path=${ref.path.join('/')}`);
-            return undefined;
+            if (!healed) log(`favorites: broken ref driveId=${ref.driveId} itemId=${ref.itemId} path=${ref.path.join('/')}`);
+            return healed;
         };
 
         // Two-pass healing: first determine which favorites survive, then build
         // the healed list. This prevents forward-reference FavRefs from being
         // removed simply because the target appears later in the array.
-        const surviving = favorites.flatMap((fav): Favorite[] => {
-            if (fav.kind === 'playlist') return [fav];
-            const target = healRef(fav.target);
-            if (target) return [target === fav.target ? fav : { ...fav, target }];
-            changed = true;
-            log(`favorites: removing broken shortcut "${fav.name}"`);
-            return [];
-        });
+        const surviving: Favorite[] = [];
+        for (const fav of data.favorites) {
+            if (fav.kind === 'playlist') { surviving.push(fav); continue; }
+            const target = await healRef(fav.target);
+            if (target) surviving.push(target === fav.target ? fav : { ...fav, target });
+            else {
+                changed = true;
+                log(`favorites: removing broken shortcut "${fav.name}"`);
+            }
+        }
         const survivingIds = new Set(surviving.map(fav => fav.id));
 
-        const newFavorites = surviving.map((fav): Favorite => {
-            if (fav.kind === 'shortcut') return fav;
+        const newFavorites: Favorite[] = [];
+        for (const fav of surviving) {
+            if (fav.kind === 'shortcut') { newFavorites.push(fav); continue; }
             // Playlist: heal each ItemRef member, remove broken ones
             const newMembers: PlaylistMember[] = [];
             for (const m of fav.members) {
@@ -475,7 +516,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
                         log(`favorites: removing broken FavRef to ${m.favId}`);
                     }
                 } else {
-                    const healed = healRef(m);
+                    const healed = await healRef(m);
                     if (healed) {
                         newMembers.push(healed);
                     } else {
@@ -483,11 +524,20 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
                     }
                 }
             }
-            return newMembers.length === fav.members.length && newMembers.every((m, i) => m === fav.members[i])
-                ? fav : { ...fav, members: newMembers };
-        });
+            newFavorites.push(newMembers.length === fav.members.length && newMembers.every((m, i) => m === fav.members[i])
+                ? fav : { ...fav, members: newMembers });
+        }
 
-        return changed ? newFavorites : undefined;
+        const favoriteChanges = changed ? { favorites: newFavorites } : undefined;
+        const pins: FolderPin[] = [];
+        for (const pin of data.folderPins) {
+            const healed = await healRef(pin, pin.connectionId);
+            if (healed) pins.push(healed);
+        }
+        if (pins.length === data.folderPins.length && pins.every((pin, i) => pin === data.folderPins[i])) {
+            return favoriteChanges;
+        }
+        return { ...favoriteChanges, folderPins: normalizeFolderPins(pins) };
     };
 
     // -- Persistence ---------------------------------------------------------
@@ -506,24 +556,33 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
         return write;
     }
 
-    async function commitEdit(change: () => Favorite[] | undefined,
-        options: { pinEdit?: boolean; queueEdit?: boolean; origin?: 'sync'; serverTime?: number } = {}): Promise<boolean> {
-        const fencePins = (options.pinEdit || options.queueEdit) && deps.fencePinEdit;
-        const fenced = !!options.queueEdit && !!deps.fenceQueueEdit;
+    type Edit = (Partial<Pick<FavoritesData, 'favorites' | 'folderPins'>>
+        & { publish?: 'mode' | 'pins' }) | undefined;
+    async function commitEdit(change: () => Edit | Promise<Edit>,
+        options: { queueEdit?: boolean; origin?: 'sync' | 'mode' | 'pins'; serverTime?: number } = {}): Promise<boolean> {
+        let origin = options.origin;
+        let queueFenced = false;
         const write = serializeWrite(async () => {
-            const next = change();
-            if (!next) return false;
-            const data = { version: 1, updatedAt: options.serverTime ?? Date.now(), favorites: next };
-            const releasePins = fencePins ? await fencePins() : undefined;
+            const edit = await change();
+            if (!edit) return false;
+            const { publish, ...next } = edit;
+            // A cloud pull or a heal can change just physical folder pins. Keeping
+            // the admitted favorite objects leaves live queues and advancement alone.
+            origin = publish ?? (origin === 'sync' && !next.favorites ? 'pins' : origin);
+            const fenceQueue = options.queueEdit && origin !== 'mode' && origin !== 'pins'
+                ? deps.fenceQueueEdit : undefined;
+            queueFenced = !!fenceQueue;
+            // Even two local edits in the same millisecond must compare newer on the other device.
+            const updatedAt = options.serverTime ?? Math.max(Date.now(), data.updatedAt + 1);
+            const nextData = { ...data, ...next, updatedAt };
             try {
-                if (fenced) await deps.fenceQueueEdit!();
-                await deps.dbPut(IDB_KEY, data);
+                if (fenceQueue) await fenceQueue();
+                await deps.dbPut(IDB_KEY, nextData);
             } catch (error) {
-                if (fenced || fencePins) throw error;
+                if (options.queueEdit || origin === 'pins' || origin === 'mode') throw error;
                 logCatch('favorites:dbPut')(error);
-            } finally { releasePins?.(); }
-            favorites = next;
-            updatedAt = data.updatedAt;
+            }
+            data = nextData;
             loadedMembership = true;
             if (options.serverTime === undefined) scheduleOneDriveUploadFireAndForget();
             return true;
@@ -532,10 +591,10 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
         try {
             changed = await write;
         } catch (error) {
-            if (fenced || fencePins) await onChange(options.origin); // release the fence using the admitted graph
+            if (queueFenced) await onChange(origin); // release the fence using the admitted graph
             throw error;
         }
-        if (changed) await onChange(options.origin);
+        if (changed) await onChange(origin);
         return changed;
     }
 
@@ -552,7 +611,6 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
         (async () => {
             while (uploadDirty) {
                 uploadDirty = false;   // clear before upload so mutations during upload re-set it
-                const data = toData(); // snapshot current state
                 try {
                     const r = await deps.authFetch(
                         `https://graph.microsoft.com/v1.0${ONEDRIVE_PATH}`,
@@ -582,9 +640,8 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
             const cached = await deps.dbGet<FavoritesData>(IDB_KEY).catch(() => undefined);
             if (!cached || !Array.isArray(cached.favorites)) return false;
             loadedMembership = true;
-            favorites = cached.favorites.filter(isValid).map(normalize);
-            updatedAt = cached.updatedAt || 0;
-            log(`favorites: loaded ${favorites.length} from cache (updatedAt=${updatedAt})`);
+            data = normalizedData(cached);
+            log(`favorites: loaded ${data.favorites.length} from cache (updatedAt=${data.updatedAt})`);
             return true;
         });
         if (loaded) await onChange();
@@ -595,30 +652,47 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
      * updatedAt, adopts it into module state, persists to IndexedDB, and
      * calls onChange(). 404 means no server-side favorites yet — not an error.
      */
-    const pullFavoritesFromOneDrive = async (): Promise<void> => {
-        await deps.authFetch(
-            `https://graph.microsoft.com/v1.0${ONEDRIVE_PATH}`,
-            false,
-        ).then(async (r) => {
+    const pullFavoritesFromOneDrive = async (): Promise<boolean> => {
+        try {
+            const r = await deps.authFetch(`https://graph.microsoft.com/v1.0${ONEDRIVE_PATH}`, false);
             if (!r.ok) {
                 if (r.status === 404) loadedMembership = true;
                 else logError(`favorites: OneDrive load failed: ${r.status}`);
-                return;
+                return r.status === 404;
             }
             const server: FavoritesData = await readGraphJson(r, 'favorites:onedrive-load');
-            if (!server || !Array.isArray(server.favorites)) return;
-            loadedMembership = true;
-            const adopted = await commitEdit(() => (server.updatedAt || 0) > updatedAt
-                ? server.favorites.filter(isValid).map(normalize) : undefined,
-                { queueEdit: true, origin: 'sync', serverTime: server.updatedAt });
+            if (!server || !Array.isArray(server.favorites)) return false;
+            const adopted = await commitEdit(() => {
+                if (loadedMembership && (server.updatedAt || 0) <= data.updatedAt) return;
+                const next = normalizedData(server);
+                // Structural rows drive playback. Modes and offline settings can
+                // arrive independently and reuse the already admitted member objects.
+                const sameStructure = next.favorites.length === data.favorites.length && next.favorites.every((f, i) =>
+                    JSON.stringify({...f, mode: undefined, offlinePin: undefined})
+                    === JSON.stringify({...data.favorites[i], mode: undefined, offlinePin: undefined}));
+                if (!sameStructure) return next;
+                const foldersChanged = JSON.stringify(data.folderPins) !== JSON.stringify(next.folderPins);
+                let pinsChanged = foldersChanged;
+                const favorites = data.favorites.map((f, i) => {
+                    const incoming = next.favorites[i];
+                    if (f.offlinePin?.paused !== incoming.offlinePin?.paused) pinsChanged = true;
+                    else if (f.mode === incoming.mode) return f;
+                    return {...f, mode: incoming.mode, offlinePin: incoming.offlinePin};
+                });
+                return { favorites, folderPins: foldersChanged ? next.folderPins : data.folderPins,
+                    publish: pinsChanged ? 'pins' : 'mode' };
+            }, { queueEdit: true, origin: 'sync', serverTime: server.updatedAt || 0 });
             if (adopted) log(`favorites: adopted server version (updatedAt=${server.updatedAt})`);
-        }).catch(logCatch('favorites:onedrive-load'));
+            return true;
+        } catch (error) { logCatch('favorites:onedrive-load')(error); return false; }
     };
 
     // -- Public API ----------------------------------------------------------
 
     const api: Favorites = {
-        getAll: () => favorites,
+        getAll: () => data.favorites,
+        getFolderPins: () => data.folderPins,
+        whenLocalWritesComplete: () => pendingWrite,
         hasLoadedMembership: () => loadedMembership,
 
         add(fav) {
@@ -632,16 +706,16 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
                         }
                     }
                 }
-                return [...favorites, fav];
+                return { favorites: [...data.favorites, fav] };
             });
         },
 
         async remove(id) {
-            await commitEdit(() => favorites.filter(f => f.id !== id).map(f => {
+            await commitEdit(() => ({ favorites: data.favorites.filter(f => f.id !== id).map(f => {
                 if (f.kind !== 'playlist') return f;
                 const filtered = f.members.filter(m => !isFavRef(m) || m.favId !== id);
                 return filtered.length === f.members.length ? f : { ...f, members: filtered };
-            }), { queueEdit: true });
+            }) }), { queueEdit: true });
         },
 
         wouldCreateCycle,
@@ -678,14 +752,13 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
             return resolveDisplayName(ownerId, segment);
         },
 
-        async heal(roots, currentFolders, removedRootKey) {
-            await commitEdit(() => healedFavorites(roots, currentFolders, removedRootKey),
-                { queueEdit: true, origin: 'sync' });
+        async heal(roots, currentFolders, removedShare) {
+            await commitEdit(() => healedMembership(roots, currentFolders, removedShare), { queueEdit: true, origin: 'sync' });
         },
         async save() {
             await serializeWrite(async () => {
                 loadedMembership = true;
-                await deps.dbPut(IDB_KEY, toData()).catch(logCatch('favorites:dbPut'));
+                await deps.dbPut(IDB_KEY, data).catch(logCatch('favorites:dbPut'));
                 scheduleOneDriveUploadFireAndForget();
             });
         },
@@ -696,7 +769,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
             const trimmed = newName.trim();
             if (!trimmed) return;
             await commitEdit(() => findById(id)
-                ? favorites.map(f => f.id === id ? { ...f, name: trimmed } : f) : undefined);
+                ? { favorites: data.favorites.map(f => f.id === id ? { ...f, name: trimmed } : f) } : undefined);
         },
 
         async addMembers(playlistId, members) {
@@ -713,8 +786,8 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
                     seen.add(key); // also prevents intra-batch duplicates
                     return true;
                 });
-                if (toAdd.length) return favorites.map(f =>
-                    f === fav ? { ...fav, members: [...fav.members, ...toAdd] } : f);
+                if (toAdd.length) return { favorites: data.favorites.map(f =>
+                    f === fav ? { ...fav, members: [...fav.members, ...toAdd] } : f) };
             }, { queueEdit: true });
         },
 
@@ -736,26 +809,50 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
                     members = fav.members.filter(m => !targets.has(m));
                 }
                 if (members.length === fav.members.length) return;
-                return favorites.map(f => f === fav ? { ...fav, members } : f);
+                return { favorites: data.favorites.map(f => f === fav ? { ...fav, members } : f) };
             }, { queueEdit: true });
         },
 
         async setHasPrivatePlayback(id, value) {
             await commitEdit(() => findById(id)
-                ? favorites.map(f => f.id === id ? { ...f, hasPrivatePlayback: value } : f) : undefined);
+                ? { favorites: data.favorites.map(f => f.id === id ? { ...f, hasPrivatePlayback: value } : f) } : undefined);
         },
 
         async setMode(id, mode) {
             await commitEdit(() => {
                 const fav = findById(id);
                 if (!fav || fav.mode === mode) return;
-                return favorites.map(f => f === fav ? { ...f, mode } : f);
-            });
+                return { favorites: data.favorites.map(f => f === fav ? { ...f, mode } : f) };
+            }, {origin: 'mode'});
         },
 
         async setOfflinePin(id, pin) {
-            await commitEdit(() => findById(id)
-                ? favorites.map(f => f.id === id ? { ...f, offlinePin: pin } : f) : undefined, {pinEdit: true});
+            await commitEdit(() => {
+                const favorite = findById(id);
+                if (!favorite || favorite.offlinePin?.paused === pin?.paused) return;
+                return { favorites: data.favorites.map(f => f === favorite ? { ...f, offlinePin: pin } : f) };
+            }, {origin: 'pins'});
+        },
+
+        async setFolderPinned(folder, pinned, roots) {
+            await commitEdit(() => {
+                if (!folder.path.length) return;
+                // Recheck the live route at admission: another queued edit or refresh
+                // can replace this folder or reconnect its share after the dialog opens.
+                if (roots) {
+                    const root = resolveWalkableRootForItemRef(folder, roots);
+                    if (!root || (root.type === 'share' && root.connectionId !== folder.connectionId)
+                        || walkFolder(root.folder, folder.path)?.id !== folder.itemId) {
+                        throw new Error('The folder has changed. Select it again.');
+                    }
+                }
+                const pins = data.folderPins;
+                const inBranch = (pin: FolderPin): boolean => pin.sourceRootKey === folder.sourceRootKey
+                    && pin.connectionId === folder.connectionId && folder.path.every((name, i) => pin.path[i] === name);
+                if (pinned && pins.some(pin => inBranch(pin) && pin.path.length === folder.path.length && pin.itemId === folder.itemId)) return;
+                const folderPins = pinned ? normalizeFolderPins([...pins, folder]) : pins.filter(pin => !inBranch(pin));
+                if (folderPins.length !== pins.length || folderPins.some((pin, i) => pin !== pins[i])) return {folderPins};
+            }, {origin: 'pins'});
         },
 
         _testOnlySuppressSave(suppress) {

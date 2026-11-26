@@ -1,5 +1,6 @@
 import Foundation
 import AudioToolbox
+import OSLog
 
 /// One owner's last complete membership survives a cold launch with only part of the library loaded.
 struct PinOwner: Codable, Equatable {
@@ -10,8 +11,6 @@ struct PinOwner: Codable, Equatable {
 
 private struct PinManifest: Codable, Equatable {
     var binding = UUID()
-    var fenced = false
-    var revision = 0
     var quota = 1 << 30
     var owners = [String: PinOwner]()
 }
@@ -34,12 +33,13 @@ private struct PinManifest: Codable, Equatable {
     private var session: URLSession!
     private var resolving = [String: Task<Void, Never>]()
     private var running = [String: URLSessionDownloadTask]()
-    // At most two daemon task IDs are durable. A late body from a cancelled task cannot win a re-pin.
+    // M17 background-session recovery admits only daemon task IDs saved under this account binding.
     private var tickets = [String: Int]()
     private var missing = Set<String>()
     private var eligible = Set<String>()
     private(set) var sizes = [String: Int]()
     private var leased = [String: Int]()
+    private var cleanup: Task<Void,Never>?
     var playerHolds: (String) -> Bool = { _ in false }
     private var opening: Task<(PinManifest, [String: Int]), Error>?
     private var accountGeneration = 0
@@ -118,6 +118,8 @@ private struct PinManifest: Codable, Equatable {
     /// Close admission synchronously with the sign-out marker, before WebKit retirement yields.
     func closeAdmission() {
         accountGeneration += 1
+        cleanup?.cancel()
+        cleanup = nil
         storage = nil
         leased.removeAll()
         manifest = PinManifest()
@@ -158,7 +160,6 @@ private struct PinManifest: Codable, Equatable {
     func apply(owners rows: [[String: Any]]) throws {
         guard let storage else { throw NativeAccountError.unbound }
         var next = manifest
-        next.fenced = false
         next.owners.removeAll()
         for row in rows {
             guard let id = row["id"] as? String, next.owners[id] == nil, let paused = row["paused"] as? Bool,
@@ -170,7 +171,6 @@ private struct PinManifest: Codable, Equatable {
             next.owners[id] = PinOwner(sources: sources, retained: retained, paused: paused)
         }
         if next != manifest {
-            next.revision += 1
             try storage.save(next, "pins")
             manifest = next
             failures.removeAll()
@@ -184,7 +184,7 @@ private struct PinManifest: Codable, Equatable {
         var wanted = Set<String>(), retained = Set<String>()
         for owner in manifest.owners.values {
             retained.formUnion(owner.retained)
-            for (root, keys) in owner.sources where !manifest.fenced && !owner.paused && allowsSource(root) { wanted.formUnion(keys) }
+            for (root, keys) in owner.sources where !owner.paused && allowsSource(root) { wanted.formUnion(keys) }
         }
         for (key, timer) in delayed where !wanted.contains(key) { timer.cancel(); delayed[key] = nil }
         retryCount = retryCount.filter { wanted.contains($0.key) }
@@ -197,11 +197,8 @@ private struct PinManifest: Codable, Equatable {
         if current != tickets { tickets = current; try storage.save(current, "pin-transfers") }
         for (key, size) in leased where retained.contains(key) { sizes[key] = size; leased[key] = nil }
         for (key, size) in sizes where !retained.contains(key) {
-            if playerHolds(key) { leased[key] = size; sizes[key] = nil; continue }
-            do { try FileManager.default.removeItem(at: storage.pinURL(key)) }
-            catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile { }
+            leased[key] = size
             sizes[key] = nil
-            total -= size
         }
         missing = wanted.subtracting(sizes.keys)
         releaseUnusedLeases()
@@ -209,34 +206,38 @@ private struct PinManifest: Codable, Equatable {
         pump()
     }
 
-    /// Leased tracks leave the pin inventory immediately. Their bytes count toward quota until
-    /// the audible or prepared decoder releases them. Re-pinning can reclaim the same file.
-    func releaseUnusedLeases() {
-        guard let storage, !leased.isEmpty else { return }
+    /// Unowned tracks leave the inventory immediately. Each short main-actor slice
+    /// preserves files in use by the player. Their bytes count until unlink succeeds.
+    private func unlinkReleasedBatch() -> Bool {
+        guard let storage else { return false }
+        let deadline = ContinuousClock.now + .milliseconds(4)
+        let before = total
+        defer { if total != before { changed(); pump() } }
         for (key, size) in leased where !playerHolds(key) {
-            do {
-                try FileManager.default.removeItem(at: storage.pinURL(key))
-            } catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {
-            } catch { continue }
+            do { try storage.unlinkPin(key) }
+            catch {
+                // Keep the failed file accounted for. The next owner or player change retries it.
+                Logger(subsystem: "me.unto.oneplay.music", category: "Offline").error("Could not remove an unowned recording")
+                return false
+            }
             leased[key] = nil
             total -= size
-            changed()
+            if .now >= deadline { return true }
         }
-        pump()
+        return false
+    }
+
+    func releaseUnusedLeases() {
+        guard cleanup == nil, !leased.isEmpty, unlinkReleasedBatch() else { return }
+        let generation = accountGeneration
+        cleanup = Task {
+            defer { if generation == accountGeneration { cleanup = nil } }
+            repeat { await Task.yield() } while !Task.isCancelled && unlinkReleasedBatch()
+        }
     }
 
     func control(_ action: String, quota: Int?) throws {
         guard let storage else { throw NativeAccountError.unbound }
-        if action == "fence" {
-            guard !manifest.fenced else { return }
-            var next = manifest
-            next.fenced = true
-            next.revision += 1
-            try storage.save(next, "pins")
-            manifest = next
-            try reconcile()
-            return
-        }
         if action == "quota" {
             guard let quota, [1,2,5,10].contains(quota) else { throw NativeAccountError.invalidRequest }
             var next = manifest
@@ -251,13 +252,13 @@ private struct PinManifest: Codable, Equatable {
 
     /// A gap or policy change requires a full inventory. Ordinary completions cross WebKit as bounded deltas.
     func snapshot(after: Int?) -> [String: Any] {
-        var result: [String: Any] = ["revision": revision, "quota": manifest.quota, "total": total]
+        var result: [String: Any] = ["revision": revision, "quota": manifest.quota, "total": total, "queuedCount": missing.count]
         result["error"] = lastError
         if let after, after <= revision, after == revision || after >= (deltas.first?.revision ?? revision + 1) - 1 {
             result["added"] = Dictionary(uniqueKeysWithValues: deltas.filter { $0.revision > after }.compactMap { d in sizes[d.key].map { (d.key, $0) } })
         } else {
             result["files"] = sizes
-            result["missing"] = Array(missing)
+            result["unavailable"] = Array(failures.keys)
         }
         return result
     }

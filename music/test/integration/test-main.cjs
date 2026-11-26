@@ -34,6 +34,7 @@ const tests = {
     ...require('./test-cases-playback-select.cjs'),
     ...require('./test-cases-modes.cjs'),
     ...require('./test-wheel.cjs'),
+    ...require('./test-folders.cjs'),
     ...require('./test-cases-startup.cjs'),
 };
 
@@ -45,9 +46,14 @@ function isSignInGateFailure(error) {
     return (error && typeof error.message === 'string' && error.message === TREE_NOT_VISIBLE_ERROR);
 }
 
-/** Startup faults and the synthetic player fixture each need a clean origin. */
+/** Standalone fixtures seed an isolated origin before opening the app. */
+function usesStandaloneFixture(name) {
+    return name.startsWith('wheel:') || name.startsWith('folders:');
+}
+
+/** Startup faults and standalone fixtures each need a clean origin. */
 function usesIsolatedProfile(name) {
-    return name.startsWith('startup:') || name.startsWith('wheel:');
+    return name.startsWith('startup:') || usesStandaloneFixture(name);
 }
 
 /** Capture full localStorage snapshot for the current page origin. */
@@ -83,8 +89,8 @@ async function restoreLocalStorageSnapshot(page, snapshot) {
         process.exit(1);
     }
 
-    // Standalone wheel tests can run while the listener has the signed-in browser open.
-    const ctx = entries.some(([name]) => !name.startsWith('wheel:'))
+    // Standalone fixtures can run while the listener has the signed-in browser open.
+    const ctx = entries.some(([name]) => !usesStandaloneFixture(name))
         ? await chromium.launchPersistentContext(PROFILE, { headless: true }) : null;
     /** Full localStorage snapshot for the app origin, restored at suite end.
      *  Prevents destructive tests (startup/auth paths) from poisoning the
@@ -123,19 +129,19 @@ async function restoreLocalStorageSnapshot(page, snapshot) {
         let tempProfileDir = null;
         const isolated = usesIsolatedProfile(name);
         if (signInRequired && !isolated) continue;
-        const wheelFixture = name.startsWith('wheel:');
+        const standalone = usesStandaloneFixture(name);
         if (isolated) {
             tempProfileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oneplay-music-it-'));
             tempCtx = await chromium.launchPersistentContext(tempProfileDir, { headless: true,
-                serviceWorkers: wheelFixture ? 'block' : 'allow' });
+                serviceWorkers: standalone ? 'block' : 'allow' });
         }
         const activeCtx = tempCtx || ctx;
         const page = await activeCtx.newPage();
         const t0 = Date.now();
         let perTestStorageSnapshot = {};
         try {
-            // The wheel fixture installs its own document before its first navigation.
-            if (!wheelFixture) {
+            // Standalone fixtures install their seed route before their first navigation.
+            if (!standalone) {
                 await page.goto(URL, { waitUntil: 'domcontentloaded' });
                 if (isolated) {
                     await restoreLocalStorageSnapshot(page, originStorageSnapshot).catch(() => {});

@@ -25,6 +25,30 @@ function makeDeps(handler: (url: string) => MockResponse): SharesDeps {
     };
 }
 
+it('confirms valid absent, older and zero-version shares while leaving failed reads available for retry', async () => {
+    const record = {id:'id', shareId:'share', rootKey:'share:share', name:'Album', driveId:'drive',
+        rootItemId:'album', addedAt:1, updatedAt:1};
+    let reply: MockResponse = {status:503}, diskFull = false;
+    const shares = createShares({...makeDeps(() => reply), async dbPut() { if (diskFull) throw Error('disk full'); }}, () => {});
+    assert.equal(await shares.pullFromOneDrive(), false);
+    reply = {status:200, body:{}};
+    assert.equal(await shares.pullFromOneDrive(), false);
+    reply = {status:200, body:{updatedAt:0, shares:[record]}};
+    assert.equal(await shares.pullFromOneDrive(), true);
+    assert.deepEqual(shares.getAll(), [record]);
+    reply = {status:200, body:{updatedAt:5, shares:[]}};
+    diskFull = true;
+    assert.equal(await shares.pullFromOneDrive(), false);
+    assert.deepEqual(shares.getAll(), [record]);
+    diskFull = false;
+    assert.equal(await shares.pullFromOneDrive(), true);
+    reply = {status:200, body:{updatedAt:0, shares:[record]}};
+    assert.equal(await shares.pullFromOneDrive(), true);
+    assert.deepEqual(shares.getAll(), []);
+    reply = {status:404};
+    assert.equal(await shares.pullFromOneDrive(), true);
+});
+
 describe('shares:addFromUrl', () => {
     it('surfaces Graph error message for share-open failures', async () => {
         const shares = createShares(makeDeps((url) => {

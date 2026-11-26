@@ -31,6 +31,7 @@ describe('isWalkableRoot', () => {
         };
         const share: Root = {
             type: 'share',
+            connectionId: 'connection',
             key: 'share:s1',
             name: 'Share',
             driveId: 'd2',
@@ -44,6 +45,7 @@ describe('isWalkableRoot', () => {
     it('rejects unloaded share and favorite roots', () => {
         const share: Root = {
             type: 'share',
+            connectionId: 'connection',
             key: 'share:s1',
             name: 'Share',
             driveId: 'd2',
@@ -74,6 +76,7 @@ describe('resolveWalkableRootForItemRef', () => {
             },
             {
                 type: 'share',
+                connectionId: 'connection',
                 key: 'share:s1',
                 name: 'Share',
                 driveId: 'd1',
@@ -112,6 +115,7 @@ describe('resolveWalkableRootForItemRef', () => {
             },
             {
                 type: 'share',
+                connectionId: 'connection',
                 key: 'share:s1',
                 name: 'Share',
                 driveId: 'd1',

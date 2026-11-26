@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "updatedAt": 1795718488848,
+  "favorites": [
+    {
+      "id": "keep",
+      "kind": "playlist",
+      "name": "Keep",
+      "hasPrivatePlayback": false,
+      "offlinePin": {
+        "paused": false
+      },
+      "members": [
+        {
+          "driveId": "drive",
+          "sourceRootKey": "drive",
+          "itemId": "first",
+          "path": [
+            "Books",
+            "Dune",
+            "Disc",
+            "Opening.wav"
+          ],
+          "isFolder": false
+        }
+      ]
+    }
+  ],
+  "folderPins": [
+    {
+      "driveId": "remote",
+      "sourceRootKey": "share:token",
+      "connectionId": "connection",
+      "path": [
+        "Concert"
+      ],
+      "itemId": "concert",
+      "isFolder": true
+    }
+  ]
+}

@@ -33,24 +33,30 @@
 
 import { type MusicFolder, type AccountInfo, isMusicFolder, sortedFolderChildren } from './indexer.js';
 import { type PlaybackInfo } from './playback.js';
-import { type RootsMap, type Favorite, type Favorites, isFavRef } from './favorites.js';
+import { type RootsMap, type Favorite, type Favorites, type FolderPin, isFavRef } from './favorites.js';
 import { type EvidenceState } from './auth.js';
 import { type SearchResult } from './search.js';
-import { isPathDeniedByShare } from './roots.js';
+import { folderPinPathKey, isPathDeniedByShare } from './roots.js';
 import { resolvePathTailDisplayName } from './path-names.js';
 
 /** Paint the same compact arrow in the trail, child list and offline details.
  * The pause bar and arrow share a viewBox, independently of text line height. */
-export function setOfflineBadge(badge: HTMLElement, state: 'complete' | 'downloading' | 'paused' | undefined): void {
+export function setOfflineBadge(badge: HTMLElement, state: OfflineBadgeState | undefined, partial = false): void {
     badge.replaceChildren();
-    badge.className = state ? 'offline-badge ' + state : '';
+    badge.className = state ? 'offline-badge ' + state + (partial ? ' partial' : '') : '';
     if (!state) return;
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.setAttribute('viewBox', '0 0 16 16');
     svg.setAttribute('role', 'img');
-    svg.setAttribute('aria-label', state === 'paused' ? 'Downloads paused' : state === 'downloading' ? 'Downloading' : 'Marked for offline');
+    const status = state === 'paused' ? 'Downloads paused' : state === 'downloading' ? 'Downloading' : 'Marked for offline';
+    svg.setAttribute('aria-label', partial ? 'Some subfolders marked for offline. ' + status : status);
     // The rounded stroke extends 0.8 units past the arrow vertex to the baseline at y=12.
-    svg.innerHTML = '<path d="M8 1.5v9.7M4 7.2l4 4 4-4"/>' + (state === 'paused' ? '<path d="M3.5 14h9"/>' : '');
+    // Place individual dots on the centerline and in mirrored pairs. Dashing a V
+    // continuously offsets the dots on its second arm by the length of the first.
+    const arrow = partial
+        ? '<path d="M8 1.6h0 M8 4.8h0 M8 8h0 M8 11.2h0 M4 7.2h0 M12 7.2h0 M6 9.2h0 M10 9.2h0"/>'
+        : '<path d="M8 1.5v9.7M4 7.2l4 4 4-4"/>';
+    svg.innerHTML = arrow + (state === 'paused' ? '<path d="M3.5 14h9"/>' : '');
     badge.appendChild(svg);
 }
 
@@ -70,6 +76,9 @@ const DEBUG_EVIDENCE_BADGES = {
 
 /** Path from root to a folder. ["OnePlay Music"] is the app root. */
 export type FolderPath = readonly string[];
+type OfflineBadgeState = 'complete' | 'downloading' | 'paused';
+type OfflineIcons = ReadonlyMap<string, OfflineBadgeState>;
+type FolderIcons = ReadonlyMap<string, {partial: boolean; state: OfflineBadgeState}>;
 
 /** Public API returned by createTree. */
 export interface TreeView {
@@ -80,6 +89,7 @@ export interface TreeView {
     /** Replaces all share roots in insertion order. */
     setShareRoots(shares: ReadonlyArray<{
         key: string;
+        connectionId: string;
         name: string;
         driveId: string;
         folder?: MusicFolder;
@@ -115,8 +125,10 @@ export interface TreeView {
     /** Called on every selectedPath change (folder click, breadcrumb, setSelectedPath).
      *  Wired by index.ts to persist oneplay_music_view to localStorage. */
     onPathChange: (path: FolderPath) => void;
-    /** Set offline icon states for favorite roots. Absent = no icon. */
-    setOfflineIcons(icons: Map<string, 'complete' | 'downloading' | 'paused'>): void;
+    /** Physical icons use the same scoped path for a marked folder and its ancestors. */
+    setOfflineIcons(favorites: OfflineIcons, folders?: FolderIcons): void;
+    /** The selection menu shares the tree's definition of coverage. */
+    getFolderOfflineState(folder: FolderPin): {coverage: 'none' | 'explicit' | 'partial' | 'covered'; badge?: OfflineBadgeState};
     /** Set syncing state (⟳ spinner on OnePlay Music row). */
     setSyncing(value: boolean): void;
     /** Toggle the build number on the OnePlay Music row. */
@@ -228,8 +240,8 @@ export function createTree(
     let selectModeActive = false;
     let selectModePaths: ReadonlySet<string> = new Set();
 
-    // Offline icon states for favorite roots (set via setOfflineIcons).
-    let offlineIcons: Map<string, 'complete' | 'downloading' | 'paused'> = new Map();
+    let offlineIcons: OfflineIcons = new Map();
+    let folderIcons: FolderIcons = new Map();
 
     // Syncing state: when true, ⟳ spinner shows on OnePlay Music row.
     let isSyncing = false;
@@ -414,14 +426,7 @@ export function createTree(
                 if (root.type === 'share') roots.delete(key);
             }
             for (const share of shares) {
-                roots.set(share.key, {
-                    type: 'share',
-                    key: share.key,
-                    name: share.name,
-                    driveId: share.driveId,
-                    folder: share.folder,
-                    reindexing: share.reindexing,
-                });
+                roots.set(share.key, { type: 'share', ...share });
             }
             render();
         },
@@ -472,7 +477,20 @@ export function createTree(
         onSelectExit: () => {},
         onFavoriteRootTap: (_path) => {},
         onPathChange: (_path) => {},
-        setOfflineIcons(icons) { offlineIcons = icons; },
+        setOfflineIcons(favorites, folders = new Map()) {
+            offlineIcons = favorites;
+            folderIcons = folders;
+        },
+        getFolderOfflineState({sourceRootKey, connectionId, path}) {
+            const key = folderPinPathKey(sourceRootKey, connectionId, path);
+            const icon = folderIcons.get(key);
+            if (icon) return {coverage: icon.partial ? 'partial' : 'explicit', badge:icon.state};
+            for (let end = path.length - 1; end > 0; end--) {
+                const ancestor = folderIcons.get(folderPinPathKey(sourceRootKey, connectionId, path.slice(0, end)));
+                if (ancestor && !ancestor.partial) return {coverage:'covered'};
+            }
+            return {coverage:'none'};
+        },
         setSyncing(value) { isSyncing = value; render(); },
         setDebugEnabled(value) { debugEnabled = value; render(); },
         setEvidence(state, isTrackCached) {
@@ -752,13 +770,24 @@ export function createTree(
             favIcon.textContent = (opts.isBreadcrumb ? '\u00a0' : '\u2002') + (rootType === 'shortcut' ? '☆' : '♫');
             suffix.appendChild(favIcon);
 
-            // ↓ offline badge: driven by offlineIcons map (pushed by index.ts)
-            const iconState = offlineIcons.get(opts.path[1].slice(FAV_PREFIX.length));
-            if (iconState) {
-                const badge = document.createElement('span');
-                setOfflineBadge(badge, iconState);
-                suffix.appendChild(badge);
-            }
+        }
+
+        // Only a physical route can show a folder pin. A playlist containing the same tracks
+        // has its own owner badge, and never marks the corresponding OneDrive album.
+        const keyFor = (subpath: FolderPath) => folderPinPathKey(opts.path[1],
+            rootEntry?.type === 'share' ? rootEntry.connectionId : undefined, subpath);
+        const folderKey = opts.isFolder && (rootType === 'onedrive' || rootType === 'share')
+            ? keyFor(opts.path.slice(2)) : undefined;
+        const folderIcon = folderKey === undefined ? undefined : folderIcons.get(folderKey);
+        const partial = folderIcon?.partial;
+        const iconState = isFavoriteRoot ? offlineIcons.get(opts.path[1].slice(FAV_PREFIX.length)) : folderIcon?.state;
+        // Breadcrumb arrows coalesce to the right. Every ancestor of a pin is
+        // partial, so checking the next crumb suffices even in a deep trail.
+        const nextKey = partial && opts.isBreadcrumb && !isSelected ? keyFor(selectedPath.slice(2, depth + 1)) : undefined;
+        if (iconState && !(nextKey && folderIcons.has(nextKey))) {
+            const badge = document.createElement('span');
+            setOfflineBadge(badge, iconState, partial);
+            suffix.appendChild(badge);
         }
 
         // For depth-3 rows inside playlists, show FavRef member's icon (☆/♫)

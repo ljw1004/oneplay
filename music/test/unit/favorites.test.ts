@@ -19,7 +19,7 @@ import assert from 'node:assert/strict';
 import {
     createFavorites, type FavoritesDeps, type Favorites,
     type RootsMap, type Root, type Shortcut, type Playlist,
-    type ItemRef, type FavRef, type PlaylistMember, type FavoritesData,
+    type ItemRef, type FolderPin, type FavRef, type PlaylistMember, type FavoritesData,
 } from '../../src/favorites.js';
 import { type MusicFolder, type AccountInfo } from '../../src/indexer.js';
 
@@ -255,6 +255,7 @@ describe('healing', () => {
         const baseRoot = roots.get(DRIVE_ID) as Root;
         roots.set('share:s1', {
             type: 'share',
+            connectionId: 'connection',
             key: 'share:s1',
             name: 'Share',
             driveId: DRIVE_ID,
@@ -290,7 +291,7 @@ describe('healing', () => {
         const { favs, changeCount } = makeFavs();
         const roots = buildTestRoots();
         const [folder] = currentPrimary(roots).values();
-        roots.set('share:s1', { type: 'share', key: 'share:s1', name: 'Share', driveId: DRIVE_ID, folder, reindexing: false });
+        roots.set('share:s1', { type: 'share', connectionId: 'connection', key: 'share:s1', name: 'Share', driveId: DRIVE_ID, folder, reindexing: false });
         const member = { ...itemRef(['Rock'], 'current-cloud-id', true), sourceRootKey: 'share:s1' };
         await favs.add(playlist('mix', 'Mix', [member]));
         const before = changeCount();
@@ -309,7 +310,7 @@ describe('healing', () => {
             isFolder: true,
             sourceRootKey: 'share:s1',
         }));
-        await favs.heal(roots, new Map(), 'share:s1');
+        await favs.heal(roots, new Map(), { rootKey: 'share:s1', id: 'connection' });
         assert.equal(favs.getAll().length, 0);
     });
 });
@@ -719,5 +720,209 @@ describe('playlist edit acknowledgment', () => {
         full = false;
         await favs.removeMembers('p', [0]);
         assert.deepEqual((favs.getAll()[0] as Playlist).members, []);
+    });
+});
+
+describe('physical folder pins', () => {
+    const pin = (path: string[], id: string, connectionId?: string): FolderPin => ({
+        path, driveId: DRIVE_ID, itemId: id, isFolder: true,
+        ...(connectionId ? {sourceRootKey: 'share:s', connectionId} : {sourceRootKey: DRIVE_ID}),
+    });
+
+    it('serializes branch edits and keeps similarly named folders, other connections and favorite pins', async () => {
+        const { favs } = makeFavs();
+        const book = pin(['Books'], 'books'), dune = pin(['Books', 'Dune'], 'dune');
+        const shelf = pin(['Bookshelf'], 'shelf'), shared = pin(dune.path.slice(), 'dune', 'uuid');
+        const mix = { ...playlist('p', 'Offline', []), offlinePin: { paused: false } };
+        await favs.add(mix);
+        await Promise.all([dune, shelf, shared, book].map(folder => favs.setFolderPinned(folder, true)));
+        assert.deepEqual(favs.getFolderPins(), [shelf, shared, book]);
+        const before = favs.getFolderPins();
+        await favs.setFolderPinned(dune, true);
+        await favs.setFolderPinned(book, true);
+        assert.equal(favs.getFolderPins(), before, 'a covered request must preserve the committed collection');
+        await favs.setFolderPinned(book, false);
+        await favs.setFolderPinned(dune, true);
+        await favs.setFolderPinned(book, false);
+        assert.deepEqual(favs.getFolderPins(), [shelf, shared]);
+        assert.deepEqual(favs.getAll(), [mix]);
+    });
+
+    it('heals only verified folders and drops pins moved below another explicit request', async () => {
+        const { favs } = makeFavs(), roots = buildTestRoots();
+        const account = roots.get(DRIVE_ID) as Extract<Root, { type: 'onedrive' }>;
+        // A file has replaced the old path. The stored folder ID still matches album1.
+        await favs.setFolderPinned(pin(['Jazz', 'standards.mp3'], 'album1'), true);
+        await favs.setFolderPinned(pin(['Old name'], 'rock'), true);
+        await favs.setFolderPinned(pin(['Jazz'], 'replaced'), true);
+        await favs.setFolderPinned(pin(['Missing'], 'file1'), true);
+        const original = favs.getFolderPins();
+        await favs.heal(roots, new Map());
+        assert.equal(favs.getFolderPins(), original);
+        await favs.heal(roots, new Map([[DRIVE_ID, account.folder]]));
+        assert.deepEqual(favs.getFolderPins(), [pin(['Rock'], 'rock'), pin(['Jazz'], 'jazz')]);
+    });
+
+    it('never heals or removes the replacement connection’s pins when the same link reconnects', async () => {
+        const { favs } = makeFavs(), roots = buildTestRoots();
+        const { folder } = roots.get(DRIVE_ID) as Extract<Root, { type: 'onedrive' }>;
+        const rootKey = 'share:s';
+        roots.set(rootKey, { type: 'share', connectionId: 'new', key: rootKey, name: 'Books', driveId: DRIVE_ID, folder, reindexing: false });
+        const old = pin(['Gone'], 'nonexistent', 'old'), fresh = pin(['Rock'], 'rock', 'new');
+        await favs.setFolderPinned(old, true);
+        await favs.setFolderPinned(fresh, true);
+        await favs.heal(roots, new Map([[rootKey, folder]]));
+        assert.deepEqual(favs.getFolderPins(), [old, fresh], 'a different connection cannot prove this old reference gone');
+        await favs.heal(roots, new Map(), { rootKey, id: 'old' });
+        assert.deepEqual(favs.getFolderPins(), [fresh]);
+    });
+
+    it('reopens an offline edit, skips PUT on older/absent pulls, then syncs it in the next full document', async () => {
+        const older = { version: 1, updatedAt: 1, favorites: [] };
+        let disk: unknown = older, cloud: unknown = older, online = false, puts = 0;
+        const deps: FavoritesDeps = {
+            async dbGet<T>() { return structuredClone(disk) as T; },
+            async dbPut(_, value) { disk = structuredClone(value); },
+            async authFetch(_, __, options) {
+                if (options?.method === 'PUT') puts++;
+                if (!online) throw new Error('offline');
+                if (options?.method === 'PUT') cloud = JSON.parse(String(options.body));
+                return cloud ? Response.json(cloud) : new Response(null, { status: 404 });
+            },
+        };
+        const first = createFavorites(deps, () => {});
+        await first.loadFromCache();
+        assert.deepEqual(first.getFolderPins(), []);
+        const album = pin(['Album'], 'album');
+        await first.setFolderPinned(album, true);
+        assert.equal(puts, 1);
+        const reopened = createFavorites(deps, () => {});
+        await reopened.loadFromCache();
+        assert.equal(await reopened.pullFavoritesFromOneDrive(), false, 'A network failure keeps the graph unconfirmed');
+        online = true;
+        assert.equal(await reopened.pullFavoritesFromOneDrive(), true, 'An older document still confirms the graph');
+        cloud = undefined;
+        assert.equal(await reopened.pullFavoritesFromOneDrive(), true, 'A 404 confirms that no server document exists');
+        assert.deepEqual(reopened.getFolderPins(), [album]);
+        assert.equal(puts, 1);
+        await reopened.add(playlist('p', 'Road trip', []));
+        const second = createFavorites({ ...deps, dbGet: async () => undefined }, () => {});
+        await second.pullFavoritesFromOneDrive();
+        assert.deepEqual(second.getFolderPins(), [album]);
+        assert.equal(second.getAll()[0].id, 'p');
+        assert.equal(puts, 2);
+    });
+
+    it('compares a cloud pin edit with the last committed playlist and leaves its queue running', async () => {
+        const current = playlist('p', 'Current mix', []);
+        const remote = { version: 1, updatedAt: Date.now() + 1000, favorites: [current], folderPins: [pin(['Disc'], 'disc')] };
+        const events: string[] = [];
+        let admit!: () => void, started!: () => void, hold = true, diskFull = false;
+        const entered = new Promise<void>(resolve => { started = resolve; });
+        const wait = new Promise<void>(resolve => { admit = resolve; });
+        const favs = createFavorites({ ...sinkDeps,
+            authFetch: async (_, __, options) => options?.method === 'PUT' ? new Response() : Response.json(remote),
+            dbPut: async () => {
+                if (hold) { hold = false; started(); await wait; }
+                if (diskFull) throw new Error('disk full');
+            },
+            fenceQueueEdit: async () => { events.push('fence queue'); },
+        }, origin => { events.push(origin ?? 'local edit'); });
+        const adding = favs.add(current);
+        await entered;
+        const heldWrite = favs.whenLocalWritesComplete();
+        const pulling = favs.pullFavoritesFromOneDrive();
+        // Parsing this in-memory response yields microtasks. Check that its edit
+        // actually joined the write queue before allowing the local add to commit.
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.notEqual(favs.whenLocalWritesComplete(), heldWrite);
+        admit();
+        await Promise.all([adding, pulling]);
+        assert.equal(favs.getAll()[0], current);
+        assert.deepEqual(favs.getFolderPins(), remote.folderPins);
+        assert.deepEqual(events, ['local edit', 'pins']);
+
+        events.length = 0;
+        diskFull = true;
+        remote.updatedAt++;
+        remote.folderPins = [];
+        assert.equal(await favs.pullFavoritesFromOneDrive(), false);
+        assert.equal(favs.getFolderPins().length, 1);
+        assert.deepEqual(events, [], 'a failed intent write leaves the existing owner projection alone');
+
+        events.length = 0;
+        diskFull = false;
+        remote.favorites = [];
+        await favs.pullFavoritesFromOneDrive();
+        assert.deepEqual(events, ['fence queue', 'sync']);
+        assert.deepEqual(favs.getAll(), []);
+    });
+
+    it('adopts a cloud mode change without fencing either player or discarding the admitted members', async () => {
+        const row = playlist('p', 'Album', [itemRef(['song'], 'song', false)]);
+        const events: string[] = [];
+        const favs = createFavorites({...sinkDeps,
+            authFetch: async (_, __, options) => options?.method === 'PUT' ? new Response() : Response.json({
+                updatedAt: Date.now() + 10_000, favorites: [{...row, mode: 'repeat'}], folderPins: [],
+            }),
+            fenceQueueEdit: async () => { events.push('queue'); },
+        }, origin => { events.push(origin ?? 'add'); });
+        await favs.add(row);
+        const originalPins = favs.getFolderPins();
+        await favs.pullFavoritesFromOneDrive();
+        assert.deepEqual(events, ['add', 'mode']);
+        assert.equal(favs.getAll()[0].mode, 'repeat');
+        assert.equal((favs.getAll()[0] as Playlist).members, row.members);
+        assert.equal(favs.getFolderPins(), originalPins);
+    });
+
+    it('checks the captured connection and folder at confirmation', async () => {
+        const favs = createFavorites(sinkDeps, () => {});
+        const selected = pin(['Album'],'album','old');
+        const current = {type:'share' as const, key:'share:s',name:'Library',driveId:DRIVE_ID,connectionId:'new',
+            reindexing:false,folder:{id:'root',children:{Album:{id:'album',children:{}}}}};
+        const roots: RootsMap = new Map([['share:s',current]]);
+        await assert.rejects(favs.setFolderPinned(selected,true,roots), /folder has changed/);
+        roots.set('share:s',{...current,connectionId:'old',folder:{id:'root',children:{Album:{id:'replacement',children:{}}}}});
+        await assert.rejects(favs.setFolderPinned(selected,true,roots), /folder has changed/);
+        assert.deepEqual(favs.getFolderPins(), []);
+    });
+
+    it('rejects explicit mode and favorite pin edits when local storage fails', async () => {
+        let full = false;
+        const uploads: FavoritesData[] = [];
+        const persisted = playlist('mix', 'Mix', []);
+        const favs = createFavorites({ ...sinkDeps,
+            dbPut: async () => { if (full) throw new Error('disk full'); },
+            authFetch: async (_, __, options) => {
+                uploads.push(JSON.parse(String(options?.body)));
+                return new Response();
+            },
+        }, () => {});
+        await favs.add(persisted);
+        full = true;
+        await assert.rejects(favs.setOfflinePin('mix', { paused: false }), /disk full/);
+        await assert.rejects(favs.setMode('mix', 'shuffle'), /disk full/);
+        assert.equal(favs.getAll()[0], persisted);
+        full = false;
+        await favs.rename('mix', 'New name');
+        assert.deepEqual(uploads.at(-1)?.favorites, [{ ...persisted, name: 'New name' }]);
+        assert.equal(uploads.length, 2);
+    });
+
+    it('a failed local pin cannot leak into the next favorites upload', async () => {
+        const uploads: FavoritesData[] = [];
+        let diskFull = true;
+        const favs = createFavorites({ ...sinkDeps,
+            dbPut: async () => { if (diskFull) throw new Error('full'); },
+            authFetch: async (_, __, options) => {
+                uploads.push(JSON.parse(String(options?.body)));
+                return new Response();
+            },
+        }, () => {});
+        await assert.rejects(favs.setFolderPinned(pin(['Books'], 'books'), true), /full/);
+        diskFull = false;
+        await favs.add(playlist('p', 'Road trip', []));
+        assert.deepEqual(uploads.map(doc => doc.folderPins), [[]]);
     });
 });

@@ -326,11 +326,19 @@ module.exports = {
         await page.reload({ waitUntil: "domcontentloaded" });
         await page.waitForSelector("#tree-container:not([hidden])", { timeout: 15000 });
 
+        await page.waitForFunction(() => document.querySelector('.mode-label')?.textContent === 'timer'
+            && !!window._testPlayback?.getInfo() && document.getElementById('player').paused);
+
         const baseNow = await page.evaluate(() => Date.now());
         await setFakeNow(page, baseNow + 60 * 1000);
-        const prevSeq = await getTestSeq(page, "_testPlaybackSeq");
         await page.locator("#footer .footer-playpause").click();
-        await waitForPlaybackReady(page, prevSeq);
+        // The restore and loadeddata notifications can both precede the play event
+        // that arms the timer. Advance the test clock only after audio actually plays.
+        await page.waitForFunction(() => {
+            const audio = document.getElementById('player');
+            return !audio.paused && audio.currentTime > 0
+                && document.querySelector('.footer-playpause').textContent.includes('⏸');
+        });
 
         await setFakeNow(page, baseNow + 17 * 60 * 1000);
         await dispatchAudioTimeupdate(page);

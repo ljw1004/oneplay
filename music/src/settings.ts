@@ -52,6 +52,7 @@ interface OpenOptions {
     readonly theme: ThemePreference;
     readonly onThemeChange: (next: ThemePreference) => void;
     readonly onTestLocalPlayback?: () => void;
+    readonly onDebugExpire: () => Promise<void>;
     readonly onDebugToggle: (next: boolean) => void;
 }
 
@@ -71,7 +72,7 @@ export interface SettingsView {
     updateIndexSection(status: IndexStatus): void;
 }
 
-const DEBUG_ENABLED_NOTE = 'Log, evidence indicator and version-refresh are turned on.';
+const DEBUG_ENABLED_NOTE = 'Expire makes OneDrive require a reconnect.';
 
 const TIMER_OPTIONS: ReadonlyArray<{ value: TimerDuration; label: string }> = [
     { value: '15m', label: '15m' },
@@ -147,18 +148,9 @@ export function createSettings(container: HTMLElement): SettingsView {
         latestFailure: undefined,
     };
 
-    let debugButton: HTMLButtonElement | undefined;
-    let debugLineEl: HTMLElement | undefined;
     let indexLinesEl: HTMLElement | undefined;
     let indexHeadingEl: HTMLElement | undefined;
     let refreshButton: HTMLButtonElement | undefined;
-
-    const renderDebugControls = (enabled: boolean): void => {
-        if (debugButton) debugButton.textContent = enabled ? 'Turn off' : 'Turn on';
-        if (!debugLineEl) return;
-        debugLineEl.hidden = !enabled;
-        debugLineEl.textContent = enabled ? DEBUG_ENABLED_NOTE : '';
-    };
 
     const renderIndexSection = (): void => {
         if (!indexLinesEl || !refreshButton) return;
@@ -207,8 +199,6 @@ export function createSettings(container: HTMLElement): SettingsView {
         open(initial) {
             container.replaceChildren();
             openState = true;
-            debugButton = undefined;
-            debugLineEl = undefined;
             indexLinesEl = undefined;
             indexHeadingEl = undefined;
             refreshButton = undefined;
@@ -443,18 +433,48 @@ export function createSettings(container: HTMLElement): SettingsView {
 
             const debug = section('Debug');
             let debugEnabled = initial.debugEnabled;
-            debugButton = document.createElement('button');
+            const debugButton = document.createElement('button');
             debugButton.type = 'button';
             debugButton.className = 'settings-pill';
-            debugLineEl = document.createElement('div');
+            const debugLineEl = document.createElement('div');
             debugLineEl.className = 'settings-debug-line';
+            debugLineEl.textContent = DEBUG_ENABLED_NOTE;
+            const panel = document.getElementById('log-panel')!;
+            const logsButton = document.createElement('button');
+            logsButton.type = 'button';
+            logsButton.className = 'settings-pill';
+            logsButton.textContent = 'Logs';
+            logsButton.setAttribute('aria-controls', panel.id);
+            logsButton.setAttribute('aria-expanded', String(panel.classList.contains('visible')));
+            logsButton.addEventListener('click', () => {
+                const visible = panel.classList.toggle('visible');
+                logsButton.setAttribute('aria-expanded', String(visible));
+                if (visible) {
+                    panel.scrollTop = 0;
+                    logsButton.scrollIntoView({ block: 'nearest' });
+                }
+            });
+            const expireButton = document.createElement('button');
+            expireButton.type = 'button';
+            expireButton.className = 'settings-pill';
+            expireButton.textContent = 'Expire';
+            expireButton.addEventListener('click', () => runMaybeAsyncUiAction(initial.onDebugExpire, 'settings expire'));
+            /** Turning off Debug closes its panel before hiding the control that dismisses it. */
+            const renderDebugControls = (): void => {
+                debugButton.textContent = debugEnabled ? 'Turn off' : 'Turn on';
+                debugLineEl.hidden = logsButton.hidden = expireButton.hidden = !debugEnabled;
+                if (!debugEnabled) {
+                    panel.classList.remove('visible');
+                    logsButton.setAttribute('aria-expanded', 'false');
+                }
+            };
             debugButton.addEventListener('click', () => {
                 debugEnabled = !debugEnabled;
-                renderDebugControls(debugEnabled);
+                renderDebugControls();
                 initial.onDebugToggle(debugEnabled);
             });
-            renderDebugControls(debugEnabled);
-            debug.append(debugLineEl, debugButton);
+            renderDebugControls();
+            debug.append(debugLineEl, debugButton, ' ', logsButton, ' ', expireButton);
             body.appendChild(debug);
 
             if (initial.onTestLocalPlayback) {
@@ -462,7 +482,7 @@ export function createSettings(container: HTMLElement): SettingsView {
                 localFiles.className = 'settings-pill';
                 localFiles.textContent = 'Test local MP3 files…';
                 localFiles.addEventListener('click', initial.onTestLocalPlayback);
-                debug.appendChild(localFiles);
+                debug.append(' ', localFiles);
             }
 
             root.append(header, body);
@@ -474,8 +494,6 @@ export function createSettings(container: HTMLElement): SettingsView {
             openState = false;
             authButton = undefined;
             container.replaceChildren();
-            debugButton = undefined;
-            debugLineEl = undefined;
             indexLinesEl = undefined;
             indexHeadingEl = undefined;
             refreshButton = undefined;

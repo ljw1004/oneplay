@@ -25,7 +25,12 @@ import WebKit
     #if DEBUG
     private var pickedFiles: CheckedContinuation<[URL], Error>?
     #endif
-    private(set) var webView: WKWebView?
+    /// Both library themes draw a blue header beneath the system status icons.
+    override var preferredStatusBarStyle: UIStatusBarStyle { webView == nil ? .default : .lightContent }
+
+    private(set) var webView: WKWebView? {
+        didSet { setNeedsStatusBarAppearanceUpdate() }
+    }
 
     init(account: NativeAccount? = nil, store: WKWebsiteDataStore? = nil, player: NativePlayback? = nil, pinConfiguration: URLSessionConfiguration? = nil) {
         self.pins = OfflinePins(configuration: pinConfiguration ?? (account == nil ? .background(withIdentifier: OfflinePins.identifier) : .ephemeral))
@@ -325,6 +330,9 @@ import WebKit
                     state["debugPlayback"] = true
                     #endif
                     reply = state
+                case "debugRequireInteractiveReconnect":
+                    try account.requireInteractiveReconnectForDebug()
+                    reply = true
                 case "pins":
                     reply = try handlePins(args, account: account)
                 case "diagnostics":

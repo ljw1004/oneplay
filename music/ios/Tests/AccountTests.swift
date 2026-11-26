@@ -435,6 +435,78 @@ private final class TestAudioCDN: URLProtocol {
         catch { XCTAssertEqual(NativeAccountError.classify(error), .cancelled) }
     }
 
+    /// The bundled debug tap fences Graph and keeps the pairing until Settings verifies interactive recovery.
+    func testSettingsExpireRequiresInteractiveReconnect() async throws {
+        let identity = TestIdentity()
+        var interactiveVerifications = 0
+        let account = try NativeAccount(recordFile: record, identity: identity) { [self] req in
+            if req.url?.path == "/v1.0/me/drive" {
+                if req.value(forHTTPHeaderField: "Authorization") == "Bearer interactive" { interactiveVerifications += 1 }
+                return try response(req, data: drive)
+            }
+            return try response(req, status: 404, data: Data())
+        }
+        let controller = LibraryController(account: account, store: .nonPersistent())
+        controller.loadViewIfNeeded()
+        defer { controller.detachPage() }
+        var page = try await readyPage(in: controller)
+        _ = try await page.callAsyncJavaScript("""
+            const {dbPut} = await import('./dist/db.js');
+            localStorage.setItem('oneplay_music_debug_enabled', '1');
+            localStorage.setItem('account_info', JSON.stringify({driveId:'library',displayName:'Listener'}));
+            await dbPut('index:library',{kind:'MusicData',count:1,size:20,folder:{id:'root',children:{'First.mp3':{id:'a'}}}});
+            """, arguments: [:], in: nil, contentWorld: .page)
+        _ = try await account.signIn(presenting: controller)
+        page.reload()
+        page = try await readyPage(in: controller, excluding: page)
+        func waitForEvidence(_ value: String, badge: String = "") async throws {
+            let deadline = ContinuousClock.now + .seconds(5)
+            while ContinuousClock.now < deadline {
+                let visibleState = try await page.evaluateJavaScript("""
+                    [window._testAuth?.getEvidence(), document.querySelector('.app-root .crumb-end > [role=img]')?.textContent].join('|')
+                    """)
+                if visibleState as? String == "\(value)|\(badge)" { return }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            XCTFail("Expected \(value) with breadcrumb badge '\(badge)'")
+        }
+
+        try await waitForEvidence("evidence:signed-in")
+        _ = try await page.evaluateJavaScript("document.querySelector('.app-root .row-icon-settings').click()")
+        _ = try await page.evaluateJavaScript("""
+            [...document.querySelectorAll('#settings-container button')].find(button => button.textContent === 'Expire').click()
+            """)
+        try await waitForEvidence("evidence:signed-out", badge: "🔒")
+        XCTAssertNil(account.currentShareProof)
+        let blocked = try await account.request(message: ["url": batch, "method": "POST", "id": UUID().uuidString])
+        XCTAssertEqual(blocked["status"] as? Int, 401)
+        XCTAssertEqual((blocked["headers"] as? [String: String])?["X-OnePlay-Account-Error"], "interactionRequired")
+        account.updateNetworkPath(offline: true, interfaces: [])
+        try await waitForEvidence("evidence:not-online", badge: "🚫")
+        account.updateNetworkPath(offline: false, interfaces: [.wifi])
+        try await waitForEvidence("evidence:signed-out", badge: "🔒")
+
+        identity.home = "different-account"
+        do {
+            _ = try await account.signIn(presenting: controller)
+            XCTFail("A different account must not clear the challenge")
+        } catch NativeAccountError.wrongAccount {}
+        XCTAssertEqual(account.snapshot["evidence"] as? String, "evidence:signed-out")
+        identity.home = "listener"
+        let canReconnect = try await page.evaluateJavaScript("!!document.querySelector('#settings-container:not([hidden]) .settings-pill-reconnect')")
+        XCTAssertEqual(canReconnect as? Bool, true)
+        let shot = XCTAttachment(image: try await page.takeSnapshot(configuration: nil))
+        shot.name = "Debug expiry - native Reconnect"; shot.lifetime = .keepAlways
+        add(shot)
+        let verifiedBefore = interactiveVerifications
+        _ = try await page.evaluateJavaScript("document.querySelector('.settings-pill-reconnect').click()")
+        try await waitForEvidence("evidence:signed-in")
+        XCTAssertGreaterThan(interactiveVerifications, verifiedBefore)
+        XCTAssertEqual(account.snapshot["driveID"] as? String, "library")
+        XCTAssertEqual(identity.removed, 0)
+        XCTAssertNotNil(account.currentShareProof)
+    }
+
     func testChangedAccountDetailsLatchAndBlockSubsequentWrite() async throws {
         try pair()
         var reads = 0

@@ -57,6 +57,13 @@ export function setOfflineBadge(badge: HTMLElement, state: 'complete' | 'downloa
 /** Key prefix for favorite roots in the RootsMap. */
 const FAV_PREFIX = 'fav:';
 
+/** Debug shows an evidence badge only while sign-in is unconfirmed. */
+const DEBUG_EVIDENCE_BADGES = {
+    'no-evidence': { icon: '‽', label: 'OneDrive sign-in status unknown' },
+    'evidence:signed-out': { icon: '🔒', label: 'OneDrive signed out' },
+    'evidence:not-online': { icon: '🚫', label: 'Offline' },
+};
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -97,8 +104,6 @@ export interface TreeView {
     onPlayClick: (path: FolderPath) => void;
     /** Called when user clicks the menu/warning icon on the OnePlay Music row. */
     onSettingsClick: () => void;
-    /** Called when user taps the debug evidence glyph on the OnePlay Music row. */
-    onDebugEvidenceGlyphClick: () => void;
     /** Called when user taps a share root row with no loaded folder data. */
     onShareWithoutDataTap: (path: FolderPath) => void;
     /** Called when user clicks a row in select mode. Wired by index.ts. */
@@ -114,7 +119,7 @@ export interface TreeView {
     setOfflineIcons(icons: Map<string, 'complete' | 'downloading' | 'paused'>): void;
     /** Set syncing state (⟳ spinner on OnePlay Music row). */
     setSyncing(value: boolean): void;
-    /** Toggle debug glyph visibility on the OnePlay Music row. */
+    /** Toggle the build number on the OnePlay Music row. */
     setDebugEnabled(value: boolean): void;
     /** Set evidence state and cache-check callback for track greying.
      *  When signed-out or not-online, non-cached tracks are greyed and unclickable. */
@@ -168,15 +173,12 @@ interface RowOptions {
  *   Used to restore scroll position after render.
  * @param deployCounter - Deploy counter string shown as "OnePlay Music{N}" in the header
  *   only when debug mode is enabled. Empty string = plain "OnePlay Music".
- * @param debugGlyphs - If provided, enables an optional debug glyph on the
- *   OnePlay Music row showing the evidence state when setDebugEnabled(true) is active.
  */
 export function createTree(
     container: HTMLElement,
     initialPath?: FolderPath,
     initialScrollMap?: Record<string, {top: number}>,
     deployCounter = '',
-    debugGlyphs?: Readonly<Record<EvidenceState, string>>,
 ): TreeView {
     const breadcrumbsEl = container.querySelector<HTMLElement>('#breadcrumbs')!;
     const childrenEl = container.querySelector<HTMLElement>('#children')!;
@@ -231,7 +233,7 @@ export function createTree(
 
     // Syncing state: when true, ⟳ spinner shows on OnePlay Music row.
     let isSyncing = false;
-    // Runtime debug visibility for the OnePlay Music evidence glyph.
+    // Debug mode shows the build number after OnePlay.
     let debugEnabled = false;
 
     // Evidence state for track greying (set via setEvidence from orchestrator).
@@ -465,7 +467,6 @@ export function createTree(
         onTrackClick: (_path) => {},
         onPlayClick: (_path) => {},
         onSettingsClick: () => {},
-        onDebugEvidenceGlyphClick: () => {},
         onShareWithoutDataTap: (_path) => {},
         onSelectToggle: (_path) => {},
         onSelectExit: () => {},
@@ -776,16 +777,6 @@ export function createTree(
             }
         }
 
-        /** Appends an icon/button span with stopPropagation click handler. Returns the span. */
-        const addIcon = (cls: string, text: string, onClick: () => void): HTMLElement => {
-            const icon = document.createElement('span');
-            icon.className = cls;
-            icon.textContent = text;
-            icon.addEventListener('click', (e) => { e.stopPropagation(); onClick(); });
-            el.appendChild(icon);
-            return icon;
-        };
-
         /** Appends the shared spinner glyph (⟳) used by sync and reindex states. */
         const addSpinner = (parent: HTMLElement): void => {
             const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -810,15 +801,14 @@ export function createTree(
                 view.onSettingsClick();
             };
             el.insertBefore(menuIcon, nameSpan);
-            if (debugEnabled) {
-                addIcon('row-icon', '📋', () => {
-                    const panel = document.getElementById('log-panel');
-                    panel?.classList.toggle('visible');
-                    if (panel?.classList.contains('visible')) panel.scrollTop = 0;
-                });
-            }
-            if (debugGlyphs && debugEnabled) {
-                addIcon('row-icon', debugGlyphs[evidence], () => view.onDebugEvidenceGlyphClick());
+            if (debugEnabled && evidence !== 'evidence:signed-in') {
+                const { icon, label } = DEBUG_EVIDENCE_BADGES[evidence];
+                const badge = document.createElement('span');
+                badge.setAttribute('role', 'img');
+                badge.setAttribute('aria-label', label);
+                badge.title = label;
+                badge.textContent = icon;
+                suffix.append('\u2009', badge);
             }
         }
 

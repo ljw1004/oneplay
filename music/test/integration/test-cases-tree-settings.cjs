@@ -127,7 +127,7 @@ module.exports = {
      * sync and selection repurpose the gap after OnePlay. */
     async "tree: Comedy Offline aligns across sync and Select"(page) {
         // Leave room for the second chevron, but not the first word of the next folder.
-        await page.setViewportSize({ width: 465, height: 700 });
+        await page.setViewportSize({ width: 432, height: 700 });
         const geometry = () => page.evaluate(() => {
             const rects = selector => Array.from(document.querySelectorAll(selector), el => {
                 const range = document.createRange();
@@ -143,6 +143,7 @@ module.exports = {
         await page.evaluate(() => {
             const tree = window._testTree;
             const name = "Lionel Nimrod's Inexplicable World";
+            window._testAuth.transition("evidence:signed-in");
             tree.setDebugEnabled(true);
             tree.setFavorites({
                 getAll: () => [{ id: "comedy", name: "Comedy Offline", kind: "playlist", members: [] }],
@@ -157,13 +158,11 @@ module.exports = {
         const [root, comedy, lionel] = idle.names.map(lines => lines[0]);
         assert(root[1] === comedy[1], "OnePlay and Comedy Offline must share a baseline");
         const song = await page.locator("#children .row-name").first().boundingBox();
-        assert(root[0] === song.x && lionel[0] === song.x && Math.abs(lionel[1] - root[1] - 36) <= 1,
+        assert(root[0] === song.x && lionel[0] === song.x && Math.abs(lionel[1] - root[1] - 40) <= 1,
             "OnePlay and wrapped Lionel Nimrod should align with song text");
         assert(idle.separators[0][0][1] === idle.separators[1][0][1], "Chevron baselines should match");
-        const icons = await page.locator(".app-root .row-icon:not(.row-icon-menu-left)").evaluateAll(nodes =>
-            nodes.map(el => el.getBoundingClientRect().toJSON()));
-        assert(icons.length === 2 && Math.abs(icons[0].left - root[0] - root[2]) < 1
-            && Math.abs(icons[1].left - icons[0].right) < 1, "Debug controls should touch the version and each other");
+        assert(await page.locator(".app-root [role=img]").count() === 0,
+            "Confirmed sign-in should leave the debug version alone");
         assert(await page.locator(".app-root").evaluate(el => getComputedStyle(el).fontWeight) === "400",
             "An ancestor root uses regular weight");
         await page.evaluate(() => window._testTree.setSyncing(true));
@@ -208,8 +207,8 @@ module.exports = {
         await page.evaluate(() => window._testTree.setAccount("fixture", { id: "root", children: {
             Classical: { id: "genre", children: { Bach: { id: "composer", children: {} } } },
         } }, { displayName: "OneDrive" }));
-        for (const [depth, side, dy] of [[1, "right", 0], [2, "left", 0], [2, "center", -15],
-            [2, "center", 15], [3, "left", 0]]) {
+        for (const [depth, side, dy] of [[1, "right", 0], [2, "left", 0], [2, "center", -19],
+            [2, "center", 19], [3, "left", 0]]) {
             await page.evaluate(() => window._testTree.setSelectedPath(["OnePlay Music", "fixture", "Classical", "Bach"]));
             const name = await page.locator(".crumb .row-name").nth(depth - 1).boundingBox();
             const x = side === "left" ? name.x - 8 : side === "right" ? name.x + name.width + 8 : name.x + name.width / 2;
@@ -222,11 +221,14 @@ module.exports = {
 
     /** Opening search swaps in the search header; closing restores tree rows. */
     async "search: open and close toggles search header"(page) {
+        const trail = await page.locator(".folder-trail").boundingBox();
         await openSearchMode(page);
         await page.waitForFunction(() => {
             const input = document.querySelector("#breadcrumbs .search-input");
             return input !== null && document.activeElement === input;
         }, undefined, { timeout: 3000 });
+        const header = await page.locator(".search-header").boundingBox();
+        assert(header.height === trail.height, "Search must match the single-line breadcrumb bar");
         await closeSearchMode(page);
         const breadcrumbRows = await page.locator("#breadcrumbs .tree-row").count();
         assert(breadcrumbRows >= 1, `Expected normal breadcrumbs after close, got ${breadcrumbRows}`);
@@ -344,33 +346,34 @@ module.exports = {
 
     // -- Log toggle -----------------------------------------------------------
 
-    /** Clipboard log icon is debug-only; when debug is enabled, tapping it toggles the log panel. */
-    async "log: clipboard icon is debug-only and toggles panel"(page) {
+    /** Logs remains reachable with a full panel and closes when Debug is turned off. */
+    async "log: Settings Debug toggles the log panel"(page) {
+        await page.setViewportSize({ width: 320, height: 620 });
         await openSettingsPage(page);
-        const maybeTurnOff = page.locator("#settings-container button", { hasText: "Turn off" }).first();
-        if (await maybeTurnOff.count() > 0) await maybeTurnOff.click();
+        const logs = page.getByRole("button", { name: "Logs", exact: true });
+        const panel = page.locator("#log-panel");
+        assert(await logs.isHidden(), "Logs should be hidden when Debug is off");
+        await page.getByRole("button", { name: "Turn on", exact: true }).click();
+        const off = page.getByRole("button", { name: "Turn off", exact: true });
+        const expire = page.getByRole("button", { name: "Expire", exact: true });
+        const [toggleBox, logsBox, expireBox] = await Promise.all([off.boundingBox(), logs.boundingBox(), expire.boundingBox()]);
+        assert(expireBox.y === logsBox.y && expireBox.x >= logsBox.x + logsBox.width &&
+            expireBox.x + expireBox.width <= 320 && expireBox.height >= 44,
+            "Expire should fit to the right of Logs on a narrow phone");
+        assert(logsBox.y === toggleBox.y && logsBox.x >= toggleBox.x + toggleBox.width && logsBox.height >= 44,
+            "Logs should be a full-height button to the right of Turn off");
+        await logs.click();
+        assert(await panel.isVisible() && await logs.getAttribute("aria-expanded") === "true",
+            "Logs should open the panel");
+        await logs.click();
+        assert(await panel.isHidden(), "A second tap should dismiss the panel");
+        await logs.click();
         await closeSettingsPage(page);
-
-        const hiddenByDefault = await page.locator(".row-icon", { hasText: "📋" }).count();
-        assert(hiddenByDefault === 0, `Expected no clipboard icon by default, got ${hiddenByDefault}`);
-
+        assert(await panel.isVisible(), "Logs should remain visible over the library");
         await openSettingsPage(page);
-        await page.locator("#settings-container button", { hasText: "Turn on" }).click();
-        await closeSettingsPage(page);
-
-        const logBefore = await page.evaluate(() =>
-            document.getElementById("log-panel").classList.contains("visible"));
-        assert(!logBefore, "Log panel should start hidden");
-
-        await page.locator(".row-icon", { hasText: "📋" }).click();
-        const logAfter = await page.evaluate(() =>
-            document.getElementById("log-panel").classList.contains("visible"));
-        assert(logAfter, "Log panel should be visible after click");
-
-        await page.locator(".row-icon", { hasText: "📋" }).click();
-        const logFinal = await page.evaluate(() =>
-            document.getElementById("log-panel").classList.contains("visible"));
-        assert(!logFinal, "Log panel should be hidden after second click");
+        assert(await logs.getAttribute("aria-expanded") === "true", "Reopened Settings should reflect the open panel");
+        await off.click();
+        assert(await logs.isHidden() && await panel.isHidden(), "Turning off Debug should hide Logs and its panel");
     },
 
     // -- Settings -------------------------------------------------------------
@@ -408,10 +411,9 @@ module.exports = {
                 color: getComputedStyle(icon).color,
             };
         });
-        const warningRgb = (warningStyle.color.match(/\d+/g) || []).map(Number);
         assert(warningStyle.hasWarningClass, "Expected signed-out warning icon to have row-icon-warning class");
-        assert(warningRgb.length >= 3 && warningRgb[0] > 150 && warningRgb[1] < 120 && warningRgb[2] < 120,
-            `Expected warning icon to be red-ish, got "${warningStyle.color}"`);
+        assert(warningStyle.color === "rgb(255, 227, 155)",
+            `Expected a pale amber warning on the blue title bar, got "${warningStyle.color}"`);
         await page.evaluate(() => window._testAuth.transition("evidence:signed-in"));
         await page.waitForFunction(() => {
             const row = document.querySelector("#breadcrumbs .tree-row");
@@ -551,9 +553,12 @@ module.exports = {
             glyph.selectNodeContents(button);
             return [button.getBoundingClientRect().toJSON(), glyph.getBoundingClientRect().toJSON()];
         });
+        const trail = await page.locator(".folder-trail").boundingBox();
         const rootTitle = await page.locator(".app-root .row-name").boundingBox();
         const browsing = await menuGeometry(page.locator(".app-root .row-icon-settings"));
         await openSettingsPage(page);
+        const header = await page.locator(".settings-header").boundingBox();
+        assert(header.height === trail.height, "Settings must match the single-line breadcrumb bar");
         const settings = await menuGeometry(page.locator(".settings-menu"));
         assert(JSON.stringify(browsing) === JSON.stringify(settings), "Opening Settings moved the menu button or glyph");
         const menu = await page.locator(".settings-menu").boundingBox();
@@ -962,52 +967,49 @@ module.exports = {
         await closeSettingsPage(page);
     },
 
-    /** Debug toggle persists across reload and controls OnePlay Music debug glyph visibility. */
-    async "settings: debug toggle persists and controls glyph"(page) {
-        const getDebugState = async () => await page.evaluate(() => {
-            const row = document.querySelector("#breadcrumbs .tree-row");
-            if (!row) return { hasGlyph: false, icons: [] };
-            const icons = Array.from(row.querySelectorAll(".row-icon")).map(el => el.textContent || "");
-            const hasGlyph = icons.some(text =>
-                text.includes("‽") || text.includes("🔑") || text.includes("🔒") || text.includes("🚫"));
-            const rowName = (row.querySelector(".row-name")?.textContent || "").trim();
-            return {
-                hasGlyph,
-                icons,
-                rowName,
-            };
+    /** Evidence badges describe the account without offering another auth action. */
+    async "settings: debug breadcrumb reports OneDrive evidence"(page) {
+        const badge = page.locator(".app-root .crumb-end > [role=img]");
+        await page.evaluate(() => {
+            window._testTree.setDebugEnabled(false);
+            window._testAuth.transition("evidence:signed-out");
         });
+        assert(await badge.count() === 0, "Debug off should hide the signed-out badge");
+        await page.evaluate(() => window._testTree.setDebugEnabled(true));
+        for (const [state, icon] of [
+            ["evidence:signed-out", "🔒"], ["evidence:not-online", "🚫"], ["no-evidence", "‽"],
+        ]) {
+            await page.evaluate(value => window._testAuth.transition(value), state);
+            assert(await badge.textContent() === icon, `Expected ${icon} for ${state}`);
+            await badge.click();
+            assert(await page.evaluate(() => window._testAuth.getEvidence()) === state, "Tapping a badge must preserve evidence");
+        }
+        await page.evaluate(() => window._testAuth.transition("evidence:signed-in"));
+        assert(await badge.count() === 0, "Confirmed sign-in should remove the badge");
+    },
+
+    /** Debug persists across reload and shows the version in the root breadcrumb. */
+    async "settings: debug toggle persists and shows Expire"(page) {
+        const rootName = page.locator("#breadcrumbs .app-root .row-name");
+        const expire = page.getByRole("button", { name: "Expire", exact: true });
         await openSettingsPage(page);
-        const maybeTurnOff = page.locator("#settings-container button", { hasText: "Turn off" }).first();
-        if (await maybeTurnOff.count() > 0) await maybeTurnOff.click();
-        const debugLineHiddenWhenOff = await page.locator("#settings-container .settings-debug-line").first().isHidden();
-        assert(debugLineHiddenWhenOff, "Debug status line should be hidden when debug is off");
+        const off = page.getByRole("button", { name: "Turn off", exact: true });
+        if (await off.isVisible()) await off.click();
+        assert(await expire.isHidden(), "Expire should be hidden with debug off");
         await closeSettingsPage(page);
-        const offState = await getDebugState();
-        assert(!offState.hasGlyph, `Debug glyph should be hidden after explicit disable (icons=${JSON.stringify(offState.icons)})`);
-        assert(offState.rowName === "OnePlay",
-            `Expected plain OnePlay Music title when debug is off, got "${offState.rowName}"`);
+        assert(await rootName.textContent() === "OnePlay", "The root should show the plain app name");
 
         await openSettingsPage(page);
-        await page.locator("#settings-container button", { hasText: "Turn on" }).click();
-        const debugLineWhenOn = page.locator("#settings-container .settings-debug-line").first();
-        const debugLineVisibleWhenOn = await debugLineWhenOn.isVisible();
-        const debugLineTextWhenOn = await debugLineWhenOn.textContent();
-        assert(debugLineVisibleWhenOn, "Debug status line should be visible when debug is on");
-        assert((debugLineTextWhenOn || "").includes("Log, evidence indicator and version-refresh are turned on."),
-            `Unexpected debug status line text: \"${debugLineTextWhenOn}\"`);
+        await page.getByRole("button", { name: "Turn on", exact: true }).click();
+        assert(await expire.isVisible(), "Expire should appear with debug on");
         await closeSettingsPage(page);
-        const onState = await getDebugState();
-        assert(onState.hasGlyph, `Debug glyph should appear after enabling debug (icons=${JSON.stringify(onState.icons)})`);
-        assert(onState.rowName.startsWith("OnePlay") && onState.rowName.length > "OnePlay".length,
-            `Expected deploy suffix in title when debug is on, got "${onState.rowName}"`);
-
+        const version = await rootName.textContent();
+        assert(version.startsWith("OnePlay") && version.length > "OnePlay".length, "Debug should show the build number");
         await page.goto(URL, { waitUntil: "domcontentloaded" });
         await page.waitForSelector("#tree-container:not([hidden])", { timeout: 15000 });
-        const persistedState = await getDebugState();
-        assert(persistedState.hasGlyph, `Debug glyph should persist across reload (icons=${JSON.stringify(persistedState.icons)})`);
-        assert(persistedState.rowName.startsWith("OnePlay") && persistedState.rowName.length > "OnePlay".length,
-            `Expected deploy suffix to persist in title when debug is on, got "${persistedState.rowName}"`);
+        assert(await rootName.textContent() === version, "The build number should persist across reload");
+        await openSettingsPage(page);
+        assert(await expire.isVisible(), "Expire should remain available after reload");
     },
 
     /** Refresh button disables (not hidden) while pull is in-flight and checking text wins over progress. */

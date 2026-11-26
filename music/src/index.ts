@@ -49,14 +49,6 @@ const DEPLOY_COUNTER = '__DEPLOY_COUNTER__';
 
 let debugEnabled = false;
 
-/** Maps evidence state to a glyph for the debug indicator on the OnePlay Music row. */
-const EVIDENCE_GLYPHS: Record<EvidenceState, string> = {
-    'no-evidence': '\u203D',          // ‽
-    'evidence:signed-in': '\uD83D\uDD11',   // 🔑
-    'evidence:signed-out': '\uD83D\uDD12',  // 🔒
-    'evidence:not-online': '\uD83D\uDEAB',  // 🚫
-};
-
 // DOM helpers
 
 const statusEl = (): HTMLElement => document.getElementById('status')!;
@@ -100,7 +92,7 @@ function applyTheme(): void {
         delete document.documentElement.dataset.theme;
     }
     const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute('content', isDark ? '#1a1a1c' : '#f2efe5');
+    if (meta) meta.setAttribute('content', getComputedStyle(document.documentElement).getPropertyValue('--bg-header').trim());
     const cs = document.querySelector('meta[name="color-scheme"]');
     if (cs) cs.setAttribute('content', isDark ? 'dark' : 'light');
 }
@@ -327,18 +319,22 @@ function setRuntimeDebugEnabled(next: boolean): void {
     nativePlayer?.setDebugEnabled(debugEnabled);
 }
 
-/**
- * Debug-only action: corrupt both auth tokens and force signed-out evidence.
- * This is intentionally destructive and exists to exercise signed-out recovery paths.
- */
-function corruptAuthTokensAndTransitionSignedOutForDebug(): void {
-    if (!browserAuth) return;
+/** Exercise reconnect using the auth provider that owns the current account. */
+async function simulateSignedOutForDebug(): Promise<void> {
+    if (!debugEnabled) return;
+    if (native) {
+        try { await native.requireInteractiveReconnectForDebug(); }
+        catch (error) {
+            logCatch('debug: could not simulate reconnect')(error);
+            showToastMessage('Could not simulate reconnect.');
+        }
+        return;
+    }
     const stamp = new Date().toISOString();
-    localStorage.setItem('access_token', `null: debug evidence glyph corrupt access_token ${stamp}`);
-    localStorage.setItem('refresh_token', `null: debug evidence glyph corrupt refresh_token ${stamp}`);
-    logError(`debug: corrupted access_token and refresh_token via evidence glyph (${stamp})`);
-    // "evidence:not-signed-in" from older naming is represented as evidence:signed-out.
-    browserAuth?.transition('evidence:signed-out');
+    localStorage.setItem('access_token', `null: debug expired access_token ${stamp}`);
+    localStorage.setItem('refresh_token', `null: debug expired refresh_token ${stamp}`);
+    logError(`debug: expired browser credentials from Settings (${stamp})`);
+    browserAuth!.transition('evidence:signed-out');
 }
 
 /** The local-file join check is available before the first sign-in and in airplane mode. */
@@ -520,6 +516,7 @@ function openSettingsPage(): void {
         },
         onTestLocalPlayback: native?.state.debugPlayback ? () => showPlaybackTest() : undefined,
         theme: themePreference,
+        onDebugExpire: simulateSignedOutForDebug,
         onDebugToggle: (next) => setRuntimeDebugEnabled(next),
     });
     sync.updateSettingsIndexSection();
@@ -553,8 +550,7 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
 
     if (!tree) {
         tree = createTree(treeEl, restoredView?.path, restoredScroll,
-            SW_DEBUG ? DEPLOY_COUNTER : '',
-            SW_DEBUG ? EVIDENCE_GLYPHS : undefined);
+            SW_DEBUG ? DEPLOY_COUNTER : '');
         settings = createSettings(settingsEl);
         if (browserAuth) {
             playback = createPlayback(
@@ -683,7 +679,6 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
         };
         tree.onSettingsClick = () => openSettingsPage();
         tree.onShareWithoutDataTap = () => openSettingsPage();
-        tree.onDebugEvidenceGlyphClick = () => corruptAuthTokensAndTransitionSignedOutForDebug();
         tree.onSearchOpen = () => {
             if (select?.isActive()) select.exitSelectMode();
             playback?.collapse();

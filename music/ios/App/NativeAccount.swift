@@ -83,6 +83,8 @@ enum MediaLookup: Sendable {
     private let downloadFile: DownloadFile
     private let path: NWPathMonitor?
     private var routeInterfaces: Set<NWInterface.InterfaceType>?
+    // A debug tap simulates failed silent acquisition for this process and account only.
+    private var debugRequiresInteraction = false
     private var offline = false
     private var evidence = "no-evidence"
     var onNetworkPathChange: (() -> Void)?
@@ -164,7 +166,23 @@ enum MediaLookup: Sendable {
         guard expected == proofGeneration else { throw NativeAccountError.transient }
     }
 
-    private func setEvidence(_ value: String) {
+    /// Use the real auth-failure path so older Graph replies lose their proof before the UI sees the lock.
+    func requireInteractiveReconnectForDebug() throws {
+        guard record != nil, !cleanupPending else { throw NativeAccountError.unbound }
+        guard signInTask == nil, !debugRequiresInteraction else { return }
+        debugRequiresInteraction = true
+        diagnostics.record("Debug: simulating interactionRequired until interactive reconnect")
+        invalidateProofAndPublishSignedOut()
+    }
+
+    private func invalidateProofAndPublishSignedOut() {
+        if driveProof != .mismatch { invalidateDriveProof(.unchecked) }
+        setEvidence("evidence:signed-out")
+    }
+
+    private func setEvidence(_ observed: String) {
+        // Route changes can establish offline status while the simulated challenge is pending.
+        let value = debugRequiresInteraction ? (offline ? "evidence:not-online" : "evidence:signed-out") : observed
         guard evidence != value else { return }
         evidence = value
         onEvidenceChange?(value)
@@ -181,6 +199,7 @@ enum MediaLookup: Sendable {
     private func acquireSilent(home: String, force: Bool) async throws -> IdentityGrant {
         let epoch = generation
         try checkAdmission(epoch)
+        guard !debugRequiresInteraction else { throw NativeAccountError.interactionRequired }
         let id = UUID()
         let (grant, wasForced): (IdentityGrant, Bool) = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { waiter in
@@ -325,6 +344,7 @@ enum MediaLookup: Sendable {
             previousExpiry = result.expiresOn
             diagnostics.record("Sign-in paired successfully")
             record = binding
+            debugRequiresInteraction = false
             driveProof = .verified(token: result.accessToken)
             setEvidence("evidence:signed-in")
             return snapshot
@@ -343,6 +363,7 @@ enum MediaLookup: Sendable {
     func beginSignOut(theme: String? = nil) throws {
         guard var binding = record else { throw NativeAccountError.unbound }
         generation += 1
+        debugRequiresInteraction = false
         mediaLocations.removeAll()
         driveProof = .unchecked
         binding.cleanupPending = true
@@ -405,9 +426,10 @@ enum MediaLookup: Sendable {
 
     /// Actual responses are evidence. A denied shared item leaves the account signed in.
     private func observe(status: Int, authenticated: Bool, authFailure: Bool = false) {
+        // Repeated simulated 401s must not invalidate an interactive drive verification in flight.
+        guard !debugRequiresInteraction else { return }
         if authFailure {
-            if driveProof != .mismatch { invalidateDriveProof(.unchecked) }
-            setEvidence("evidence:signed-out")
+            invalidateProofAndPublishSignedOut()
         } else if evidence == "evidence:signed-out" && (!authenticated || status >= 500) {
             // An outstanding content grant or a network fault cannot prove that MSAL recovered.
             return

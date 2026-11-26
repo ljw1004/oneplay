@@ -139,6 +139,7 @@ export function createNativeLibrary(handler: ReplyHandler) {
             state = next;
             if (next.evidence !== prev) library.onEvidenceChange(next.evidence, prev);
         },
+        requireInteractiveReconnectForDebug: () => post({ op: 'debugRequireInteractiveReconnect' }),
         signOut: (theme: string) => post({ op: 'signOut', theme }),
         fetch: request,
         followContent: (url: string, signal?: AbortSignal) => request(url, false, { signal, timeoutMs: 30000 }, true),

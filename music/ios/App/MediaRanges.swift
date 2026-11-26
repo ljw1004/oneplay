@@ -131,7 +131,6 @@ final class MediaPool: @unchecked Sendable {
         }
     }
 
-    #if DEBUG
     private var requests = [UUID: (File, Range<Int64>)]()
 
     func setDebugRequest(_ id: UUID, _ request: (File, Range<Int64>)?) {
@@ -155,7 +154,6 @@ final class MediaPool: @unchecked Sendable {
                     "fetching": active.filter { $0.0 == file }.map { [$0.1.lowerBound, $0.1.upperBound] }]
         }
     }
-    #endif
 
     /// A denied lookup invalidates this item. A successful lookup keeps its matching version.
     func discard(drive: String, item: String, keeping admitted: File? = nil) {
@@ -369,9 +367,7 @@ final class MediaRanges: @unchecked Sendable {
     private let trace: (String) -> Void
     private let diagnostic: (String) -> Void
     private let renew: ((MediaLocation) throws -> MediaLocation)?
-    #if DEBUG
     private let signalDebug: () -> Void
-    #endif
     private let awaitDemand: (() throws -> Void)?
     var onFirstBlockData: (() -> Void)?
     var onDecoderWait: ((Bool) -> Void)?
@@ -386,9 +382,7 @@ final class MediaRanges: @unchecked Sendable {
         self.grant = location
         self.resource = location.url
         self.successorWindow = successorWindow
-        #if DEBUG
         self.signalDebug = signalDebug
-        #endif
         self.speculative = speculative
         self.trace = trace
         self.diagnostic = diagnostic
@@ -500,17 +494,13 @@ final class MediaRanges: @unchecked Sendable {
             }
         }
         if wifiOnly { request.requireUnmeteredWiFi() }
-        #if DEBUG
         let requestID = UUID()
-        #endif
         let isSpec = speculative
         response.onComplete = { [weak self, trace, transfers, grant] r, task in
             if r.rejectsResource { grant.markRejected() }
             defer { transfers.leave() }
-            #if DEBUG
             self?.pool.setDebugRequest(requestID, nil)
             self?.signalDebug()
-            #endif
             self?.lock.withLock { self?.tasks.removeAll { $0 === task } }
             if !isSpec || streams {
                 trace(r.metricsLine(bytes: max(r.received, r.wireBytes ?? 0, task.countOfBytesReceived), speculative: isSpec, charged: 0))
@@ -523,10 +513,8 @@ final class MediaRanges: @unchecked Sendable {
             task.delegate = response
             transfers.enter()
             tasks.append(task)
-            #if DEBUG
             pool.setDebugRequest(requestID, (file, bounds))
             signalDebug()
-            #endif
             task.resume()
             return task
         }
@@ -711,9 +699,7 @@ final class MediaRanges: @unchecked Sendable {
                 if cancelled { throw CancellationError() }
                 pool.store(response.body, for: file, at: base)
             }
-            #if DEBUG
             signalDebug()
-            #endif
             if !speculative { windowFailed = false } // Successful demand can re-enable read-ahead after a failed range.
             return response.body
         }

@@ -689,6 +689,8 @@ private final class TestAudioCDN: URLProtocol {
             const {attachNativePlayback} = await import('./dist/native-playback.js');
             const native = createNativeLibrary(window.webkit.messageHandlers.oneplay);
             await native.loadAccountState('state');
+            // Release omits the developer audition capability. The user's Debug switch still shows the rails.
+            delete native.state.debugPlayback;
             document.getElementById('status').hidden = true;
             window.followedRows = [];
             const drawer = attachNativePlayback(native,document.getElementById('footer'),
@@ -723,6 +725,11 @@ private final class TestAudioCDN: URLProtocol {
         let item = try XCTUnwrap(player.snapshot["item"] as? String)
         await fulfillment(of: [pending], timeout: 5)
         try await waitForUI("!!document.querySelector('.audio-ranges > :last-child .lookup')")
+        let keepsBars = try await page.callAsyncJavaScript("""
+            const reply = await window.webkit.messageHandlers.oneplay.postMessage({op:'playback', version:1, action:'snapshot'});
+            return reply.snapshot.bars?.length === 3;
+            """, arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertEqual(keepsBars as? Bool, true)
         _ = try await page.callAsyncJavaScript("await Promise.all(document.querySelector('.expansion').getAnimations().map(a => a.finished))",
                                                arguments: [:], in: nil, contentWorld: .page)
         let screen = try await page.takeSnapshot(configuration: nil)

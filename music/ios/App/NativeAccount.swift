@@ -86,10 +86,8 @@ enum MediaLookup: Sendable {
     private var offline = false
     private var evidence = "no-evidence"
     var onNetworkPathChange: (() -> Void)?
-    #if DEBUG
     private(set) var mediaRequests = [UUID: IndexedTrack]()
     var onMediaRequestChange: (() -> Void)?
-    #endif
     var onEvidenceChange: ((String) -> Void)?
 
     private var signInTask: Task<[String: Any], Error>?
@@ -442,11 +440,9 @@ enum MediaLookup: Sendable {
             // Mark only the item metadata request. Token acquisition, retries and the audition hold have separate lifetimes.
             let (response, file): (HTTPURLResponse, FileHandle)
             do {
-                #if DEBUG
                 let id = UUID()
                 if let track { mediaRequests[id] = track; onMediaRequestChange?() }
                 defer { if track != nil { mediaRequests[id] = nil; onMediaRequestChange?() } }
-                #endif
                 (response, file) = try await download(current, timeoutMs: timeoutMs)
             }
             try checkAdmission(epoch)

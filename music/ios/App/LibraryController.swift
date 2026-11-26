@@ -11,6 +11,7 @@ import WebKit
     private let store: WKWebsiteDataStore
     private var account: NativeAccount?
     private(set) var player: NativePlayback?
+    private var systemPlayback: SystemPlayback?
     let pins: OfflinePins
     private var pinRevision = -1
     private var pinParts: (revision: Int, data: Data)?
@@ -20,9 +21,7 @@ import WebKit
     /// Only one document can stage a queue. Every append checks its build ID and offset.
     private var selectionIntent: String?
     private var staged: (id: String, count: Int, tracks: [IndexedTrack])?
-    #if DEBUG
     private var showingAudioRanges = false
-    #endif
     #if DEBUG
     private var pickedFiles: CheckedContinuation<[URL], Error>?
     #endif
@@ -70,9 +69,7 @@ import WebKit
                     try await account.media(driveID: drive, itemID: item, lookup: request, wifiOnly: wifiOnly)
                 }
                 player?.onChange = { [weak self] debugOnly in self?.signalPlayerChange(debugOnly: debugOnly) }
-                #if DEBUG
                 account.onMediaRequestChange = { [weak self] in self?.signalPlayerChange(debugOnly: true) }
-                #endif
                 account.diagnostics.onPending = { [weak self] in self?.signalPendingDiagnostics() }
                 account.onNetworkPathChange = { [weak self] in self?.player?.cancelWiFiReadsIfMetered() }
                 pins.lookup = { drive, item, lookup in try await account.media(driveID: drive, itemID: item, lookup: lookup) }
@@ -81,7 +78,7 @@ import WebKit
                 pins.onChange = { [weak self] in
                     guard let self else { return }
                     let limited = ["evidence:not-online", "evidence:signed-out"].contains(account.snapshot["evidence"] as? String ?? "")
-                    player?.setOfflineAvailability(limited ? pins.completeKeys : nil)
+                    if player?.setOfflineAvailability(limited ? pins.completeKeys : nil) == true { systemPlayback?.publishNowPlaying() }
                     if UIApplication.shared.applicationState == .active {
                         webView?.evaluateJavaScript("window.dispatchEvent(new Event('oneplay-pins'))", completionHandler: nil)
                     }
@@ -101,8 +98,10 @@ import WebKit
                 }
                 pins.updateEvidence(account.snapshot["evidence"] as? String ?? "no-evidence")
                 await pins.connectSession()
-                NotificationCenter.default.addObserver(self, selector: #selector(audioInterrupted(_:)),
-                    name: AVAudioSession.didBecomeInactiveNotification, object: nil)
+                if let player {
+                    systemPlayback = SystemPlayback(player: player) { [weak self] in self?.signalPlayerChange(debugOnly: false) }
+                    systemPlayback?.publishNowPlaying()
+                }
                 servicesReady = true
                 if isViewLoaded { loadPage() }
             } catch {
@@ -115,13 +114,6 @@ import WebKit
         }
     }
 
-    /// The operating system can interrupt playback while the library page is suspended.
-    @objc private func audioInterrupted(_ note: Notification) {
-        guard let context = note.userInfo?[AVAudioSession.deactivationContextKey] as? AVAudioSession.DeactivationContext, context.source == .system else { return }
-        player?.pauseForInterruption()
-        signalPlayerChange(debugOnly: false)
-    }
-
     /// Best effort. JS also pulls on startup, so a suspended or replaced page can miss this signal.
     func signalPendingDiagnostics() {
         guard let page = webView, page.url == BundledShell.page else { return }
@@ -129,15 +121,13 @@ import WebKit
     }
 
     private func signalPlayerChange(debugOnly: Bool) {
-        if !debugOnly { pins.releaseUnusedLeases() }
-        guard let page = webView, page.url == BundledShell.page, UIApplication.shared.applicationState == .active else { return }
-        if debugOnly {
-            #if DEBUG
-            guard showingAudioRanges else { return }
-            #else
-            return
-            #endif
+        if !debugOnly {
+            player?.handleOutputChange(.parkPaused)
+            systemPlayback?.publishNowPlaying()
+            pins.releaseUnusedLeases()
         }
+        guard let page = webView, page.url == BundledShell.page, UIApplication.shared.applicationState == .active else { return }
+        if debugOnly && !showingAudioRanges { return }
         guard let player, let account, account.snapshot["driveID"] is String else { return }
         page.callAsyncJavaScript("window.dispatchEvent(new CustomEvent('oneplay-playback', {detail:sample}))",
                                  arguments: ["sample": playbackSample(player, account)], in: nil, in: .page, completionHandler: nil)
@@ -145,10 +135,7 @@ import WebKit
 
     /// Replies and pushed transitions share one sequence so a delayed command reply cannot rewind the drawer.
     private func playbackSample(_ player: NativePlayback, _ account: NativeAccount, includeDenied: Bool = false) -> [String: Any] {
-        var lookups: [IndexedTrack]?
-        #if DEBUG
-        if showingAudioRanges { lookups = Array(account.mediaRequests.values) }
-        #endif
+        let lookups = showingAudioRanges ? Array(account.mediaRequests.values) : nil
         playbackSequence += 1
         var snapshot = player.snapshot(lookups: lookups, pinSizes: lookups == nil ? [:] : pins.sizes, includeDenied: includeDenied)
         let denied = snapshot.removeValue(forKey: "denied")
@@ -232,9 +219,7 @@ import WebKit
         pinParts = nil
         inventoryParts = nil
         selectionIntent = nil
-        #if DEBUG
         showingAudioRanges = false
-        #endif
         #if DEBUG
         if pickedFiles != nil {
             pickedFiles?.resume(throwing: NativeAccountError.cancelled)
@@ -310,12 +295,14 @@ import WebKit
                 pins.closeAdmission()
                 try account.beginSignOut(theme: args["theme"] as? String)
                 player?.stop()
+                systemPlayback?.publishNowPlaying()
                 replyHandler(true, nil)
                 retirePageAndReload()
             } catch {
                 replyHandler(nil, "cleanupFailed")
                 if account.cleanupPending {
                     player?.stop()
+                    systemPlayback?.publishNowPlaying()
                     detachPage()
                     showUnavailable()
                 }
@@ -393,6 +380,7 @@ import WebKit
                         staged = (id, count, [])
                         if let session = args["session"] as? String, let revision = args["revision"] as? Int {
                             player.fence(session: session, revision: revision)
+                            systemPlayback?.publishNowPlaying()
                         }
                     case "queueChunk":
                         guard let id = args["build"] as? String, staged?.id == id,
@@ -435,10 +423,11 @@ import WebKit
                         guard let item = args["item"] as? String else { throw NativeAccountError.invalidRequest }
                         try player.apply(action, item: item, seconds: args["seconds"] as? Double)
                     }
-                    #if DEBUG
-                    showingAudioRanges = args["debugRanges"] as? Bool == true
-                    #endif
+                    // Queue and access updates share this bridge. Only the drawer sets its subscription.
+                    if let showing = args["debugRanges"] as? Bool { showingAudioRanges = showing }
                     if ["start", "revise", "fence", "seek", "skip", "pause", "cycleMode", "next", "previous", "access", "timer", "play"].contains(action) {
+                        player.handleOutputChange(.parkPaused)
+                        systemPlayback?.publishNowPlaying()
                         try await player.waitForCheckpointWrites()
                     }
                     var sample = playbackSample(player, account, includeDenied: action == "readAccess")

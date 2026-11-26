@@ -1,5 +1,6 @@
 import AVFoundation
 import XCTest
+import MediaPlayer
 import os
 @testable import OnePlayMusic
 
@@ -346,6 +347,142 @@ extension PlaybackTests {
         }
         XCTFail("Timed out at \(player.snapshot)")
         throw PlaybackError("Missing playback transition")
+    }
+
+    /// A streamed cover, a pinned cover, and an untagged successor exercise the
+    /// same publish callbacks used when WebKit is suspended across a gapless join.
+    @MainActor func testSystemArtworkFollowsAudibleRecording() async throws {
+        let bundle = Bundle(for: Self.self)
+        let tag = try Data(contentsOf: XCTUnwrap(bundle.url(forResource: "FrontAndBackCovers", withExtension: "id3")))
+        let tone = try Data(contentsOf: XCTUnwrap(bundle.url(forResource: "AudibleTail", withExtension: "mp3")))
+        let tagged = tag + tone.dropFirst(44)
+        let pool = MediaPool()
+        let media = MediaLocation(url: URL(string: "https://audio.test/cover")!, etag: "v1", size: Int64(tagged.count))
+        pool.store(tagged, for: .init(drive: "d", item: "stream", version: "v1", size: media.size), at: 0)
+        let tracks = ["stream", "pin", "plain"].map { IndexedTrack(driveId: "d", itemId: $0, path: [$0], key: $0, sourceRootKey: "d") }
+        let player = NativePlayback(pool: pool) { _, item, _, _ in
+            guard item == "stream" else { throw PlaybackError("Unexpected network lookup for pinned artwork") }
+            return media
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try PlaybackStore(root: root, home: "covers", drive: "d")
+        try FileManager.default.createDirectory(at: store.pinDirectory, withIntermediateDirectories: true)
+        try tagged.write(to: store.pinURL(tracks[1].fileKey))
+        try tone.write(to: store.pinURL(tracks[2].fileKey))
+        try player.restoreIfNeeded(from: store)
+        let controls = SystemPlayback(player: player) {}
+        player.onChange = { if !$0 { controls.publishNowPlaying() } }
+        defer { player.onChange = nil; player.stop(); controls.publishNowPlaying() }
+        try player.start(tracks: tracks, delaySeconds: 0, nearEnd: false, forceRefresh: false)
+        let center = MPNowPlayingInfoCenter.default()
+        let icon = try XCTUnwrap(NowPlayingArtwork.icon)
+        for track in tracks {
+            let bounds = track.itemId == "plain" ? icon.bounds : CGRect(x: 0, y: 0, width: 40, height: 24)
+            _ = try await waitFor(player) { sample in
+                let info = center.nowPlayingInfo
+                let cover = info?[MPMediaItemPropertyArtwork] as? MPMediaItemArtwork
+                return sample["key"] as? String == track.itemId && info?[MPMediaItemPropertyTitle] as? String == track.itemId && cover?.bounds == bounds
+            }
+            let cover = try XCTUnwrap(center.nowPlayingInfo?[MPMediaItemPropertyArtwork] as? MPMediaItemArtwork)
+            let compact = CGSize(width: bounds.width / 2, height: bounds.height / 2)
+            XCTAssertEqual(cover.image(at: compact)?.size, compact)
+        }
+        try await player.stopAndDrain()
+        controls.publishNowPlaying()
+        XCTAssertNil(center.nowPlayingInfo)
+    }
+
+    /// A real decoder must retain its render position through system deactivation, even
+    /// after its graph and the suspended web UI have both disappeared.
+    @MainActor func testSystemInterruptionAndRemoteControls() async throws {
+        let (player, tracks) = try liveQueue()
+        let controls = SystemPlayback(player: player) {}
+        defer { player.stop(); controls.publishNowPlaying() }
+        var library = tracks
+        library[0].album = "Comedy"
+        try player.start(tracks: library, delaySeconds: 0, nearEnd: false, forceRefresh: false)
+        let playing = try await waitFor(player) { ($0["position"] as? Double ?? 0) >= 0.25 }
+        let original = try XCTUnwrap(playing["item"] as? String)
+        XCTAssertEqual(AVAudioSession.sharedInstance().mode, .spokenAudio)
+        XCTAssertEqual(AVAudioSession.sharedInstance().routeSharingPolicy, .longFormAudio)
+        controls.publishNowPlaying()
+        let commands = MPRemoteCommandCenter.shared()
+        XCTAssertFalse(commands.previousTrackCommand.isEnabled)
+        XCTAssertTrue(commands.nextTrackCommand.isEnabled)
+        let center = MPNowPlayingInfoCenter.default()
+        XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyAlbumTitle] as? String, "Comedy")
+        player.handleOutputChange(.interruption(mayResume: true))
+        controls.publishNowPlaying()
+        let position = try XCTUnwrap(player.snapshot["position"] as? Double)
+        XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyElapsedPlaybackTime] as? Double, position)
+        XCTAssertEqual(center.nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double, 0)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(player.snapshot["position"] as? Double, position)
+        try player.finishInterruption(shouldResume: true)
+        let resumed = try await waitFor(player) { $0["state"] as? String == "playing" }
+        XCTAssertEqual(resumed["item"] as? String, original)
+        XCTAssertEqual(try XCTUnwrap(resumed["position"] as? Double), position, accuracy: 0.15)
+        XCTAssertTrue(try player.applyRemote("next"))
+        let next = try await waitFor(player) { $0["state"] as? String == "playing" && $0["key"] as? String == "B" }
+        controls.publishNowPlaying()
+        XCTAssertEqual(center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String, "B")
+        XCTAssertTrue(commands.previousTrackCommand.isEnabled)
+        XCTAssertFalse(try player.applyRemote("seek", seconds: 1, displayedItem: original))
+        XCTAssertTrue(try player.applyRemote("seek", seconds: 0.5, displayedItem: next["item"] as? String))
+        XCTAssertTrue(try player.applyRemote("previous"))
+        _ = try await waitFor(player) { $0["state"] as? String == "playing" && $0["key"] as? String == "A" }
+        print("System controls resumed the original occurrence at \(position)s")
+    }
+
+    func testInterruptionRecommendationRespectsLaterIntent() async throws {
+        let (player, tracks) = try liveQueue()
+        defer { player.stop() }
+        try player.start(tracks: tracks, delaySeconds: 0, nearEnd: false, forceRefresh: false)
+        for outcome in ["decline", "pause", "disconnect", "toggle", "prepaused"] {
+            XCTAssertTrue(try player.applyRemote("play"))
+            _ = try await waitFor(player) { $0["state"] as? String == "playing" }
+            if outcome == "prepaused" { XCTAssertTrue(try player.applyRemote("pause")) }
+            player.handleOutputChange(.interruption(mayResume: true))
+            if outcome == "pause" || outcome == "toggle" { XCTAssertTrue(try player.applyRemote(outcome)) }
+            if outcome == "disconnect" { player.handleOutputChange(.routeDisconnected) }
+            try player.finishInterruption(shouldResume: outcome != "decline")
+            try player.finishInterruption(shouldResume: true) // Duplicate/late recommendation.
+            XCTAssertEqual(player.snapshot["state"] as? String, "paused", outcome)
+        }
+        player.stop()
+        try player.finishInterruption(shouldResume: true)
+        XCTAssertNil(player.snapshot["item"])
+    }
+
+    #if DEBUG
+    func testStoppedHardwareGraphRetainsItsPlayheadWithoutAPage() async throws {
+        let (player, tracks) = try liveQueue()
+        defer { player.stop() }
+        try player.start(tracks: tracks, delaySeconds: 0, nearEnd: false, forceRefresh: false)
+        let first = try await waitFor(player) { $0["state"] as? String == "playing" }
+        let graph = try XCTUnwrap(player.engineForTesting)
+        try await Task.sleep(for: .milliseconds(1150)) // No snapshot while the graph renders.
+        graph.stop()
+        graph.reset()
+        XCTAssertTrue(player.handleOutputChange(.configuration(graph)))
+        let resumed = try await waitFor(player) { $0["state"] as? String == "playing" }
+        XCTAssertEqual(resumed["item"] as? String, first["item"] as? String)
+        XCTAssertGreaterThan(try XCTUnwrap(resumed["position"] as? Double), 0.55)
+        XCTAssertFalse(player.handleOutputChange(.configuration(graph))) // Notification from the old engine.
+    }
+    #endif
+
+    func testNavigationCannotExtendSleepDeadline() async throws {
+        let (player, tracks) = try liveQueue(timer: .milliseconds(600))
+        defer { player.stop() }
+        try player.start(tracks: tracks, delaySeconds: 0, nearEnd: false, forceRefresh: false, initialMode: .timer)
+        _ = try await waitFor(player) { $0["state"] as? String == "playing" }
+        player.handleOutputChange(.interruption(mayResume: true))
+        try player.changeTimer("45m")
+        try await Task.sleep(for: .milliseconds(650))
+        try player.finishInterruption(shouldResume: true)
+        XCTAssertEqual(player.snapshot["state"] as? String, "paused")
     }
 
     func testRemovedCurrentFinishesThenUsesSurvivingFormerNeighbor() async throws {

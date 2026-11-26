@@ -30,7 +30,9 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     func sceneDidEnterBackground(_ scene: UIScene) {
-        (window?.rootViewController as? LibraryController)?.player?.checkpoint()
+        let player = (window?.rootViewController as? LibraryController)?.player
+        player?.handleOutputChange(.parkPaused)
+        player?.checkpoint()
     }
 
     func sceneDidBecomeActive(_ scene: UIScene) {

@@ -10,6 +10,7 @@ struct IndexedTrack: Codable, Equatable, Sendable {
     var fileKey: String { driveId + ":" + itemId }
     var title: String? = nil
     var album: String? = nil
+    var systemTitle: String? = nil
 }
 
 private enum Recording: Sendable {
@@ -131,7 +132,11 @@ final class NativePlayback: @unchecked Sendable {
     private let lookup: Lookup
     private let worker = DispatchQueue(label: "me.unto.oneplay.music.decode", qos: .default)
     private let lock = NSLock()
+    // Activation and release run on the serial decoder. A system deactivation also
+    // clears ownership under the player lock, before issuing a resumption recommendation.
+    private var ownsAudioSession = false
     private var active: PlaybackRun?
+    private var interruptedItem: String?
     private var mode = QueueMode.all
     private var timerSetting = "30m"
     private var expiry: Task<Void, Never>?
@@ -165,11 +170,12 @@ final class NativePlayback: @unchecked Sendable {
     }
 
     /// Preserve the canonical library and bookmark while restricting the next pass to complete files.
-    func setOfflineAvailability(_ keys: Set<String>?) {
+    @discardableResult func setOfflineAvailability(_ keys: Set<String>?) -> Bool {
         lock.withLock {
-            guard keys != offlineKeys else { return }
+            guard keys != offlineKeys else { return false }
             offlineKeys = keys
             if let run = active { configure(run, mode: mode); saveCheckpoint() }
+            return true
         }
     }
 
@@ -358,6 +364,11 @@ final class NativePlayback: @unchecked Sendable {
     var status: String { lock.withLock { active?.status ?? "Stopped" } }
     var sessionID: String { lock.withLock { active == nil ? "" : session } }
 
+    /// Only the occurrence whose title was published may supply its cover.
+    func artworkReader(for item: String) -> NowPlayingArtwork.ReadPrefix? {
+        lock.withLock { active?.artworkReader(for: item) }
+    }
+
     /// A fresh document samples the running node without restarting the decoder.
     var snapshot: [String: Any] { snapshot(lookups: nil) }
 
@@ -400,6 +411,7 @@ final class NativePlayback: @unchecked Sendable {
             } else { bookmark = nil }
             let bookmarked = bookmark.flatMap { spot in Self.validPosition(spot.seconds) ? eligible.first { tracks[$0].key == spot.key } : nil }
             let initial = bookmarked ?? (selected ? startIndex : first)
+            interruptedItem = nil
             self.favorite = favorite
             configuredMode = initialMode
             structureDirty = true
@@ -438,6 +450,7 @@ final class NativePlayback: @unchecked Sendable {
         let ordered = urls.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
         lock.withLock {
             saveCheckpoint()
+            interruptedItem = nil
             favorite = nil
             folderKey = ""
             mode = .all
@@ -478,38 +491,79 @@ final class NativePlayback: @unchecked Sendable {
             ticker = timer
         }
         run.setDeadline(deadline)
-        guard !run.startsAtEnd else { return }
-        worker.async {
-            run.playAndReport(issuedAt: issuedAt, delaySeconds: delaySeconds, nearEnd: nearEnd, forceRefresh: forceRefresh)
+        worker.async { [self] in
+            releaseIdleAudioSession()
+            if !run.startsAtEnd {
+                run.playAndReport(issuedAt: issuedAt, delaySeconds: delaySeconds, nearEnd: nearEnd,
+                                  forceRefresh: forceRefresh, setOutputActive: setOutputActive)
+            }
+            releaseIdleAudioSession()
         }
     }
 
+    /// Take focus only after the first chunk has decoded. A paused cold restore never activates.
+    private func setOutputActive(_ playing: Bool) throws {
+        guard playing else { releaseIdleAudioSession(); return }
+        #if os(iOS)
+        let audio = AVAudioSession.sharedInstance()
+        try audio.setCategory(.playback, mode: .spokenAudio, policy: .longFormAudio)
+        try audio.setPrefersInterruptionOnRouteDisconnect(true)
+        try audio.setActive(true)
+        lock.withLock { ownsAudioSession = true }
+        #endif
+    }
+
+    /// Runs on the decoder queue, after the retiring I/O has stopped. The successor's
+    /// intent determines whether this is a handoff inside OnePlay or the end of listening.
+    private func releaseIdleAudioSession() {
+        #if os(iOS)
+        guard lock.withLock({ ownsAudioSession && active?.wantsPlay != true }) else { return }
+        do {
+            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            lock.withLock { ownsAudioSession = false }
+        } catch { diagnostics?.record("Audio session deactivation failed") }
+        #endif
+    }
+
+    #if DEBUG
+    /// XCTest stops a live graph to exercise the loss of the hardware render clock.
+    var engineForTesting: AVAudioEngine? { lock.withLock { active?.engine } }
+    #endif
+
     /// A command belongs to the item that the listener touched, including a repeated play of the same URL.
-    func apply(_ action: String, item: String, seconds: Double?) throws {
+    @discardableResult
+    func apply(_ action: String, item: String, seconds: Double?) throws -> Bool {
+        try lock.withLock { try applyLocked(action, item: item, seconds: seconds) }
+    }
+
+    /// Remote transport keys address the audible occurrence even while WebKit is suspended.
+    func applyRemote(_ command: String, seconds: Double? = nil, displayedItem: String? = nil) throws -> Bool {
+        try lock.withLock { try applyLocked(command, item: displayedItem, seconds: seconds) }
+    }
+
+    @discardableResult private func applyLocked(_ action: String, item: String?, seconds: Double?, automaticResume: Bool = false) throws -> Bool {
         let issuedAt = ProcessInfo.processInfo.systemUptime
-        try lock.withLock {
-            guard let run = active else { return }
-            if fencedRevision != nil && (action == "next" || action == "previous") { return }
-            defer { saveCheckpoint() }
-            if action == "cycleMode" {
-                let next = mode.following
-                if configure(run, mode: next, item: item) { armTimer(playing: active?.wantsPlay == true) }
-                return
-            }
-            if action == "play", let keys = offlineKeys, let anchor = run.persistenceAnchor(),
-               let track = catalog[anchor.cursor.index].indexed, !keys.contains(track.fileKey), run.lease(for: track.fileKey) == nil {
-                throw PlaybackError("This track is unavailable offline.")
-            }
-            guard let result = try run.apply(action, item: item, seconds: seconds) else { return }
-            if let restart = result.restart {
-                // A seek can keep the occurrence. Only a newly accepted target supersedes its wait.
-                targetRevision += 1
-                replaceRun(cursor: restart.cursor, advanced: restart.advanced, position: restart.position, paused: restart.paused,
-                           seekItem: restart.seekItem, duration: restart.duration, admitted: restart.admitted, budget: run.budget, issuedAt: issuedAt)
-            }
-            if fencedRevision != nil { continueAfterFence = result.playing }
-            armTimer(playing: result.playing)
+        guard let run = active else { return false }
+        if fencedRevision != nil && (action == "next" || action == "previous") { return false }
+        defer { saveCheckpoint() }
+        if action == "cycleMode" {
+            let next = mode.following
+            guard configure(run, mode: next, item: item) else { return false }
+            armTimer(playing: active?.wantsPlay == true)
+            return true
         }
+        guard let result = try run.apply(action, item: item, seconds: seconds, interruptedItem: interruptedItem,
+                                         offlineKeys: offlineKeys, resumeBefore: automaticResume ? deadline : nil) else { return false }
+        interruptedItem = nil
+        if let restart = result.restart {
+            // A seek can keep the occurrence. Only a newly accepted target supersedes its wait.
+            targetRevision += 1
+            replaceRun(cursor: restart.cursor, advanced: restart.advanced, position: restart.position, paused: restart.paused,
+                       seekItem: restart.seekItem, duration: restart.duration, admitted: restart.admitted, budget: run.budget, issuedAt: issuedAt)
+        }
+        if fencedRevision != nil { continueAfterFence = result.playing }
+        if !automaticResume || deadline == nil { armTimer(playing: result.playing) }
+        return true
     }
 
     /// A compatible revision keeps the decoder, node and prepared bytes. Only a different
@@ -521,6 +575,7 @@ final class NativePlayback: @unchecked Sendable {
         structureDirty = structureDirty || mode != newMode
         mode = newMode
         if updated.revoked {
+            interruptedItem = nil
             active = nil
             armTimer(playing: false)
         } else if let point = updated.restart {
@@ -644,21 +699,68 @@ final class NativePlayback: @unchecked Sendable {
             defer { saveCheckpoint() }
             guard mode == .timer, let run = active else { return }
             configure(run, mode: mode)
-            armTimer(playing: active?.wantsPlay == true)
+            // An interruption preserves the cutoff already promised to the listener.
+            // The changed setting governs the next user-initiated Play.
+            if interruptedItem == nil { armTimer(playing: active?.wantsPlay == true) }
         }
     }
 
-    func pauseForInterruption() {
+    /// A stopped audio graph can lose both the node timeline and its queued PCM.
+    /// Keep the occurrence and its admitted bytes, and rebuild from the frozen position.
+    enum OutputChange {
+        case interruption(mayResume: Bool)
+        case configuration(AVAudioEngine)
+        case servicesReset
+        case routeDisconnected
+        case parkPaused
+    }
+
+    @discardableResult func handleOutputChange(_ change: OutputChange) -> Bool {
         lock.withLock {
-            guard let run = active else { return }
-            run.pauseForInterruption()
-            armTimer(playing: false)
-            continueAfterFence = false
+            switch change {
+            case .interruption, .servicesReset: ownsAudioSession = false
+            default: break
+            }
+            guard let run = active else { return false }
+            switch change {
+            case .interruption(mayResume: false), .servicesReset, .routeDisconnected:
+                interruptedItem = nil
+            default: break
+            }
+            guard let (point, next) = run.retireOutput(for: change) else { return false }
+            let paused: Bool
+            switch change {
+            case .interruption(let mayResume):
+                if mayResume && !point.paused { interruptedItem = point.seekItem }
+                if !mayResume { armTimer(playing: false) }
+                continueAfterFence = false
+                paused = true
+            case .servicesReset, .routeDisconnected:
+                armTimer(playing: false)
+                continueAfterFence = false
+                paused = true
+            case .parkPaused, .configuration: paused = point.paused
+            }
+            replaceRun(cursor: point.cursor, advanced: point.advanced, position: point.position,
+                       paused: paused, seekItem: point.seekItem, duration: point.duration,
+                       admitted: point.admitted, budget: run.budget, restoredNext: next)
             saveCheckpoint()
+            return true
         }
     }
 
-    func stop() { lock.withLock { active?.cancel(); active = nil; armTimer(playing: false); saveCheckpoint() } }
+    /// Only the occurrence that iOS interrupted can consume this one-shot recommendation.
+    func finishInterruption(shouldResume: Bool) throws {
+        try lock.withLock {
+            guard let item = interruptedItem else { return }
+            interruptedItem = nil
+            if shouldResume, deadline.map({ $0 > .now }) ?? true {
+                try applyLocked("play", item: item, seconds: nil, automaticResume: true)
+            }
+        }
+    }
+
+    func stop() { lock.withLock { interruptedItem = nil; active?.cancel(); active = nil; armTimer(playing: false); saveCheckpoint() } }
 
     func cancelWiFiReadsIfMetered() { lock.withLock { pool.cancelWiFiReadsIfMetered() } }
 
@@ -667,7 +769,7 @@ final class NativePlayback: @unchecked Sendable {
 
     /// Logout drains all in-flight bytes before removing the diagnostic recording. Retrying cleanup is safe.
     func stopAndDrain() async throws {
-        lock.withLock { ticker?.cancel(); ticker = nil; store = nil; accessRevision = 0; accessDirty = false; spots.removeAll(); hasHistory = false; savedPoint = nil; savedCursor = nil; structureDirty = true; favorite = nil; folder = []; folderKey = ""; configuredMode = nil; active?.cancel(); active = nil; catalog = []; canonical = []; slots = [:]; connectedShares = nil; deniedRoots = []; mode = .all; armTimer(playing: false); pool = MediaPool(unmeteredWiFi: pool.unmeteredWiFi) }
+        lock.withLock { interruptedItem = nil; ticker?.cancel(); ticker = nil; store = nil; accessRevision = 0; accessDirty = false; spots.removeAll(); hasHistory = false; savedPoint = nil; savedCursor = nil; structureDirty = true; favorite = nil; folder = []; folderKey = ""; configuredMode = nil; active?.cancel(); active = nil; catalog = []; canonical = []; slots = [:]; connectedShares = nil; deniedRoots = []; mode = .all; armTimer(playing: false); pool = MediaPool(unmeteredWiFi: pool.unmeteredWiFi) }
         await withCheckedContinuation { continuation in writer.async { self.pendingWrites.removeAll(); continuation.resume() } }
         await withCheckedContinuation { continuation in worker.async { continuation.resume() } }
         do { try FileManager.default.removeItem(at: destination) }
@@ -702,7 +804,7 @@ private final class PlaybackRun: @unchecked Sendable {
     private var sources = [MediaRanges]()
     private weak var preparingWindow: MediaRanges.SuccessorWindow?
     private var message = "Preparing playback"
-    private let engine = AVAudioEngine()
+    fileprivate let engine = AVAudioEngine()
     private let node = AVAudioPlayerNode()
     private let rate = 44_100
     private var scheduled: Int64 = 0
@@ -724,11 +826,9 @@ private final class PlaybackRun: @unchecked Sendable {
     private var requiredInput = 0
     private var waitingInputs = Set<Int>()
     private var lastFrame: Int64 = 0
+    private var graphStarted = false
     private var started = false
     private var drainingFinal = false
-    #if os(iOS)
-    private var sessionActivated = false
-    #endif
     private var lastPlayed: DispatchGroup?
 
     /// The two anchors cover the currently audible item and an already scheduled successor.
@@ -742,6 +842,7 @@ private final class PlaybackRun: @unchecked Sendable {
         var nodeFrame: Int64
         let fileFrame: Int64
         var duration: MP3RangeDecoder.Length
+        var streamedFile: MediaPool.File? = nil
     }
     private var anchor: Anchor
     private var successor: Anchor?
@@ -772,6 +873,29 @@ private final class PlaybackRun: @unchecked Sendable {
         }
     }
 
+    /// Capture the same file lease or versioned blocks as the audible decoder. The
+    /// returned reader runs off the playback worker and never changes its byte cursor.
+    func artworkReader(for item: String) -> NowPlayingArtwork.ReadPrefix? {
+        lock.withLock {
+            let entry = audibleAnchor(at: min(renderedFrame(), scheduled))
+            guard item == entry.item, let track = tracks[entry.index].indexed else { return nil }
+            guard let file = entry.streamedFile else {
+                guard let file = pinLeases[track.fileKey] else { return nil }
+                return { count in Int64(count) <= file.size ? try? file.read(0, count) : nil }
+            }
+            return { [pool] count in
+                guard Int64(count) <= file.size else { return nil }
+                var data = Data()
+                for offset in stride(from: 0, to: count, by: MediaRanges.block) {
+                    let needed = min(count - offset, MediaRanges.block)
+                    guard let block = pool.read(file, at: Int64(offset)), block.count >= needed else { return nil }
+                    data.append(block.prefix(needed))
+                }
+                return data
+            }
+        }
+    }
+
     func snapshot(lookups: [IndexedTrack]?, pinSizes: [String: Int]) -> [String: Any] {
         lock.withLock {
             expireIfDue()
@@ -787,11 +911,12 @@ private final class PlaybackRun: @unchecked Sendable {
             let seconds = started ? Double(entry.fileFrame + max(0, frame - entry.nodeFrame)) / Double(rate) : lastPosition
             var result: [String: Any] = ["item": entry.item, "advanced": entry.advanced, "title": track.title ?? path.last ?? "", "key": track.key ?? track.itemId, "path": path, "state": state,
                     "album": track.album ?? "", "position": seconds, "duration": Double(entry.duration.frames) / Double(rate), "message": message]
+            result["systemTitle"] = track.systemTitle
+            result["canPrevious"] = nextPolicy != .fenced && (entry.cursor.held.map { $0.previous != nil } ?? (entry.cursor.slot > 0 || mode == .repeat || mode == .shuffle))
+            result["canNext"] = nextPolicy != .fenced && (entry.next != nil || entry.cursor.held != nil)
             result["sourceRootKey"] = track.sourceRootKey
             if entry.cursor.held != nil { result.removeValue(forKey: "path") }
-            #if DEBUG
             if let lookups { result["bars"] = debugBars(at: entry, lookups: lookups, pinSizes: pinSizes) }
-            #endif
             return result
         }
     }
@@ -824,7 +949,6 @@ private final class PlaybackRun: @unchecked Sendable {
             message = paused ? "Paused at end of track" : "Finished \(tracks.count) track(s)"
         }
     }
-    #if DEBUG
     private func debugBars(at entry: Anchor, lookups: [IndexedTrack], pinSizes: [String: Int]) -> [[String: Any]] {
         return [entry.cursor.neighbor(-1, mode: mode)?.index, entry.index, nextPolicy == .fenced ? nil : entry.next?.index].map { index in
             guard let ordinal = index, let track = tracks[ordinal].indexed else { return [:] }
@@ -837,7 +961,6 @@ private final class PlaybackRun: @unchecked Sendable {
             return bar
         }
     }
-    #endif
 
     var wantsPlay: Bool { lock.withLock { !paused && terminal == nil } }
     var status: String {
@@ -924,14 +1047,19 @@ private final class PlaybackRun: @unchecked Sendable {
     }
 
     /// Sample and stop the touched occurrence in one critical section, before its successor can be scheduled.
-    func apply(_ action: String, item: String, seconds: Double?) throws -> (restart: Point?, playing: Bool)? {
+    func apply(_ command: String, item expected: String?, seconds: Double?, interruptedItem: String?, offlineKeys: Set<String>?, resumeBefore: ContinuousClock.Instant?) throws -> (restart: Point?, playing: Bool)? {
         try lock.withLock {
             expireIfDue()
             let frame = min(renderedFrame(), scheduled)
             let entry = audibleAnchor(at: frame)
             // A failed or naturally ended run remains controllable after its preparation
             // worker has been cancelled. An explicit Stop/replacement removes the run.
-            guard item == entry.item, !cancelled || terminal != nil else { return nil }
+            let item = entry.item
+            guard expected == nil || expected == item, !cancelled || terminal != nil else { return nil }
+            if let resumeBefore, .now >= resumeBefore { return nil }
+            let action = command == "toggle" ? ((!paused && terminal == nil) || interruptedItem == item ? "pause" : "play") : command
+            if action == "play", let offlineKeys, let key = tracks[entry.index].indexed?.fileKey,
+               !offlineKeys.contains(key), pinLeases[key] == nil { throw PlaybackError("This track is unavailable offline.") }
             // Only continuations of this occurrence or its admitted immediate successor may start from retained bytes.
             func admission(_ index: Int) -> MediaLocation? {
                 guard terminal == nil else { return nil }
@@ -995,12 +1123,27 @@ private final class PlaybackRun: @unchecked Sendable {
         }
     }
 
-    /// Stop audible output immediately, including when Graph or the CDN is unresponsive.
-    func pauseForInterruption() {
+    /// Freeze the render anchor before stopping the node. Configuration notifications from
+    /// retired engines and repeated interruptions of a parked run have no effect.
+    func retireOutput(for change: NativePlayback.OutputChange) -> (Point, PlayCursor?)? {
         lock.withLock {
-            _ = renderedFrame()
-            if started { node.pause() }
-            paused = true
+            expireIfDue()
+            guard !cancelled, terminal == nil, !startsAtEnd else { return nil }
+            switch change {
+            case .configuration(let changed):
+                guard changed === engine, graphStarted, !engine.isRunning else { return nil }
+            case .interruption, .routeDisconnected:
+                guard !paused || graphStarted else { return nil }
+            case .parkPaused:
+                guard paused && graphStarted else { return nil }
+            case .servicesReset: break // Every audio object predating the reset is invalid.
+            }
+            let frame = min(renderedFrame(), scheduled)
+            let entry = audibleAnchor(at: frame)
+            let seconds = started ? Double(entry.fileFrame + max(0, frame - entry.nodeFrame)) / Double(rate) : lastPosition
+            let location = sources.last { $0.occurrence == entry.index + 1 }?.admission ?? (entry.index == startIndex ? admitted : nil)
+            cancelLocked()
+            return ((entry.cursor, .seconds(seconds), paused, entry.item, entry.duration, location, entry.advanced), entry.next)
         }
     }
 
@@ -1086,16 +1229,26 @@ private final class PlaybackRun: @unchecked Sendable {
     }
 
     private func wait(until target: Int64) throws {
-        while clock < target {
+        var stoppedSince: ContinuousClock.Instant?
+        while lock.withLock({ renderedFrame() < target }) {
             try checkCancellation()
-            guard engine.isRunning && lock.withLock({ paused || node.isPlaying }) else { throw PlaybackError("Audio output interrupted") }
+            try checkOutput(&stoppedSince)
             Thread.sleep(forTimeInterval: 0.012)
         }
         try checkCancellation()
     }
 
+    /// The graph may stop before iOS delivers its lifecycle notification. Bound the wait
+    /// for an unexplained output failure while allowing an intentional pause to last indefinitely.
+    private func checkOutput(_ stoppedSince: inout ContinuousClock.Instant?) throws {
+        if lock.withLock({ paused || (engine.isRunning && node.isPlaying) }) { stoppedSince = nil }
+        else if let since = stoppedSince {
+            if since.duration(to: .now) > .seconds(2) { throw PlaybackError("Audio output interrupted") }
+        } else { stoppedSince = .now }
+    }
+
     /// Advance the schedule clock through starvation once. The decoder stays at its first missing frame.
-    @discardableResult private func enqueue(_ pcm: AVAudioPCMBuffer, frames: Range<Int>, incoming: (index: Int, duration: MP3RangeDecoder.Length)? = nil) throws -> Int64 {
+    @discardableResult private func enqueue(_ pcm: AVAudioPCMBuffer, frames: Range<Int>, incoming: (file: MediaPool.File?, duration: MP3RangeDecoder.Length)? = nil) throws -> Int64 {
         guard !frames.isEmpty else { return scheduled }
         let part: AVAudioPCMBuffer
         if frames == 0..<Int(pcm.frameLength) { part = pcm }
@@ -1121,7 +1274,7 @@ private final class PlaybackRun: @unchecked Sendable {
             }
             let start = scheduled
             if let incoming, let cursor = anchor.next {
-                successor = Anchor(cursor: cursor, next: cursor.neighbor(1, mode: mode), item: UUID().uuidString, advanced: true, nodeFrame: start, fileFrame: Int64(frames.lowerBound), duration: incoming.duration)
+                successor = Anchor(cursor: cursor, next: cursor.neighbor(1, mode: mode), item: UUID().uuidString, advanced: true, nodeFrame: start, fileFrame: Int64(frames.lowerBound), duration: incoming.duration, streamedFile: incoming.file)
             }
             let played = DispatchGroup()
             played.enter()
@@ -1156,11 +1309,15 @@ private final class PlaybackRun: @unchecked Sendable {
     private func drainAudio() throws {
         try checkCancellation()
         guard started else { return }
+        var stoppedSince: ContinuousClock.Instant?
         while lastPlayed?.wait(timeout: .now() + 0.1) == .timedOut {
             try checkCancellation()
-            guard engine.isRunning && lock.withLock({ paused || node.isPlaying }) else { throw PlaybackError("Audio output interrupted") }
+            lock.withLock { _ = renderedFrame() }
+            try checkOutput(&stoppedSince)
         }
         try checkCancellation()
+        // A stopped engine also completes scheduled buffers. Only rendered PCM can finish a song.
+        try wait(until: scheduled)
         #if DEBUG
         // The tap batches up to 4096 frames even when it is asked for 1024. Leave the render graph
         // alive for the pending callback and a silent buffer, so the measured file includes the last sound.
@@ -1169,11 +1326,11 @@ private final class PlaybackRun: @unchecked Sendable {
     }
 
     /// Convert operational errors into safe diagnostics. Native account errors expose a bounded category.
-    func playAndReport(issuedAt: Double, delaySeconds: Int, nearEnd: Bool, forceRefresh: Bool) {
+    func playAndReport(issuedAt: Double, delaySeconds: Int, nearEnd: Bool, forceRefresh: Bool, setOutputActive: (Bool) throws -> Void) {
         let queuedMs = Int((ProcessInfo.processInfo.systemUptime - issuedAt) * 1000)
         log.info("Start item=\(self.startIndex + 1) seekSeconds=\(self.startSeconds) workerWaitMs=\(queuedMs)")
         do {
-            try play(delaySeconds: delaySeconds, nearEnd: nearEnd, forceRefresh: forceRefresh)
+            try play(delaySeconds: delaySeconds, nearEnd: nearEnd, forceRefresh: forceRefresh, setOutputActive: setOutputActive)
             report("Finished \(lock.withLock { anchor.cursor.order.count }) track(s)", terminal: "ended")
         } catch is CancellationError {
             report("Stopped", terminal: "ended")
@@ -1203,9 +1360,6 @@ private final class PlaybackRun: @unchecked Sendable {
         if capturing { node.removeTap(onBus: 0) }
         #endif
         engine.stop()
-        #if os(iOS)
-        if sessionActivated { try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
-        #endif
     }
 
     /// Defer decoding a paused seek until Play. Replacing or stopping the run also releases this wait.
@@ -1214,19 +1368,10 @@ private final class PlaybackRun: @unchecked Sendable {
         try checkCancellation()
     }
 
-    private func play(delaySeconds: Int, nearEnd: Bool, forceRefresh: Bool) throws {
+    private func play(delaySeconds: Int, nearEnd: Bool, forceRefresh: Bool, setOutputActive: (Bool) throws -> Void) throws {
         try waitWhilePaused()
         #if DEBUG
         let timingStart = ProcessInfo.processInfo.systemUptime
-        #endif
-        #if os(iOS)
-        let audio = AVAudioSession.sharedInstance()
-        try audio.setCategory(.playback)
-        try audio.setActive(true)
-        sessionActivated = true
-        #endif
-        #if DEBUG
-        let activated = ProcessInfo.processInfo.systemUptime
         #endif
         var (source, decoder) = try open(lock.withLock { tracks[startIndex] }, ordinal: startIndex + 1, input: 0, speculative: false, admitted: admitted)
         #if DEBUG
@@ -1265,16 +1410,41 @@ private final class PlaybackRun: @unchecked Sendable {
         try checkCancellation()
         lock.withLock {
             lastPosition = Double(firstFrame) / Double(rate)
-            anchor = Anchor(cursor: anchor.cursor, next: anchor.next, item: anchor.item, advanced: anchor.advanced, nodeFrame: 0, fileFrame: firstFrame + Int64(chunk.audible.lowerBound), duration: decoder.length)
+            anchor = Anchor(cursor: anchor.cursor, next: anchor.next, item: anchor.item, advanced: anchor.advanced, nodeFrame: 0, fileFrame: firstFrame + Int64(chunk.audible.lowerBound), duration: decoder.length, streamedFile: source?.file)
         }
         #if DEBUG
         let decoded = ProcessInfo.processInfo.systemUptime
         #endif
-        try engine.start()
+        // Activation can block while Pause or timer expiry arrives. Commit graph startup
+        // under the run lock, and return unused focus before waiting for another Play.
+        while true {
+            try waitWhilePaused()
+            try setOutputActive(true)
+            let startedGraph = try lock.withLock {
+                if cancelled { throw CancellationError() }
+                expireIfDue()
+                guard !paused else { return false }
+                try engine.start()
+                graphStarted = true
+                return true
+            }
+            if startedGraph { break }
+            try setOutputActive(false)
+        }
+        // Hardware can discard the node clock while the decoder is blocked on a network
+        // read. Keep a recent render position independently of WebKit and disk checkpoints.
+        let clockSampler = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        clockSampler.schedule(deadline: .now() + .milliseconds(500), repeating: .milliseconds(500), leeway: .milliseconds(50))
+        clockSampler.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.lock.withLock { _ = self.renderedFrame() }
+        }
+        clockSampler.resume()
+        defer { clockSampler.cancel() }
         #if DEBUG
         let engineStarted = ProcessInfo.processInfo.systemUptime
         func ms(_ interval: Double) -> Int { Int((interval * 1000).rounded()) }
-        log.notice("First PCM seek=\(self.startSeconds) sessionMs=\(ms(activated-timingStart)) openMs=\(ms(opened-activated)) connectMs=\(ms(connected-opened)) decodeMs=\(ms(decoded-connected)) engineMs=\(ms(engineStarted-decoded))")
+        log.notice("First PCM seek=\(self.startSeconds) openMs=\(ms(opened-timingStart)) connectMs=\(ms(connected-opened)) decodeMs=\(ms(decoded-connected)) engineMs=\(ms(engineStarted-decoded))")
         #endif
         var nextFrame = firstFrame + Int64(chunk.pcm.frameLength)
         var ordinal = startIndex + 1
@@ -1424,7 +1594,7 @@ private final class PlaybackRun: @unchecked Sendable {
                 let retain = head.final ? min(88,head.audible.count/2) : 0
                 let cut = head.audible.upperBound-retain
                 let boundary = try enqueue(head.pcm, frames: head.audible.lowerBound..<cut,
-                                           incoming: (nextIndex, nextDecoder.length))
+                                           incoming: (incoming?.file, nextDecoder.length))
                 log.notice("ready item=\(nextIndex + 1) prefixFrames=\(cut-head.audible.lowerBound) specBytes=\(incoming?.specBytes ?? 0) overlap=\(mix) boundary=\(boundary)")
                 try wait(until: boundary + 1)
                 lock.withLock {

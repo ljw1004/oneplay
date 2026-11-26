@@ -1,3 +1,4 @@
+import { cleanMediaSessionTitle } from './media-title.js';
 import type { NativeLibrary } from './native-library.js';
 import { createPlaybackUi, timeString } from './playback-ui.js';
 import type { FolderPath } from './tree.js';
@@ -122,7 +123,7 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
         if (!sample.item) return;
         ui.titleEl.textContent = sample.title ?? path?.at(-1) ?? '';
         ui.setPlayPausePlaying(['playing', 'positioning', 'buffering'].includes(sample.state ?? ''));
-        if (strip && !strip.hidden && sample.bars) paintRanges(strip, sample);
+        if (!strip.hidden && sample.bars) paintRanges(strip, sample);
         if (!ui.isScrubbing()) ui.scrubberTimeEl.textContent = sample.duration
             ? `${timeString(position())} / ${timeString(sample.duration)}` : timeString(position());
         if (sample.state === 'error' && (last.item !== sample.item || last.state !== 'error'))
@@ -142,7 +143,7 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
                     return !folderRoot || folderRoot.startsWith('fav:') || folderRoot === root;
                 });
             }
-            const debugRanges = !!strip && !strip.hidden && ui.isExpanded() && !document.hidden;
+            const debugRanges = !strip.hidden && ui.isExpanded() && !document.hidden;
             const reply = await native.playback(action, {...args, debugRanges}) as PlaybackReply;
             paint(reply, action);
             return reply;
@@ -161,6 +162,10 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
         send(action, {item: sample.item});
         return action;
     };
+    const strip = document.createElement('div');
+    strip.className = 'audio-ranges';
+    strip.hidden = true;
+    paintRanges(strip, {bars: [{}, {}, {}]});
     const ui = createPlaybackUi({
         footerEl: footer,
         getMode: () => sample.mode ?? 'all',
@@ -179,19 +184,13 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
             return {startTime: position(), isCurrent: () => item === sample.item,
                 commitScrubIfCurrent: seconds => send('seek', {item, seconds})};
         },
-        onExpandedChange: () => { if (strip) send('snapshot'); },
+        onExpandedChange: () => { send('snapshot'); },
         onChevronClick: () => { if (sample.path) reveal(sample.path); },
         onFooterPlayPauseClick: toggle, onCenterTapToggle: toggle,
         onPrev: () => send('previous', {item: sample.item}), onNext: () => send('next', {item: sample.item}),
         onSeekBy: seconds => send('skip', {item: sample.item, seconds}),
     });
-    const strip = native.state.debugPlayback ? document.createElement('div') : undefined;
-    if (strip) {
-        strip.className = 'audio-ranges';
-        strip.hidden = true;
-        paintRanges(strip, {bars: [{}, {}, {}]});
-        ui.expansionEl.prepend(strip);
-    }
+    ui.expansionEl.prepend(strip);
     window.addEventListener('oneplay-playback', event => {
         if (!document.hidden) paint((event as CustomEvent<PlaybackReply>).detail);
     });
@@ -216,6 +215,10 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
     async function transfer(queue: LibraryQueue, action: 'start' | 'revise', args: Record<string, unknown>): Promise<void> {
         const generation = ++buildGeneration;
         const {tracks, ...folder} = queue;
+        // Clean only the outgoing chunk so a 30k queue yields between bridge messages.
+        const systemTitles = (chunk: typeof tracks) => chunk.map(track => ({
+            ...track, systemTitle: cleanMediaSessionTitle(track.title, track.album),
+        }));
         const commit = async (data: Record<string, unknown>) => {
             const connected = getConnected?.();
             if (connected) await native.syncPlaybackMembership(connected);
@@ -239,14 +242,14 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
         };
         try {
             if (tracks.length <= 512) {
-                await commit({tracks});
+                await commit({tracks: systemTitles(tracks)});
                 return;
             }
             const build = crypto.randomUUID();
             await native.playback('beginQueue', {build, count: tracks.length, ...args});
             for (let offset = 0; offset < tracks.length; offset += 512) {
                 if (generation !== buildGeneration) return;
-                await native.playback('queueChunk', {build, offset, tracks: tracks.slice(offset, offset + 512)});
+                await native.playback('queueChunk', {build, offset, tracks: systemTitles(tracks.slice(offset, offset + 512))});
             }
             if (generation === buildGeneration) await commit({build});
         } catch (error) {
@@ -385,7 +388,7 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
         currentFolder: () => sample.folder,
         collapse: () => ui.setExpanded(false),
         setDebugEnabled(enabled: boolean): void {
-            if (!strip || strip.hidden === !enabled) return;
+            if (strip.hidden === !enabled) return;
             strip.hidden = !enabled;
             // Recompute the open drawer height and immediately update its native subscription.
             if (ui.isExpanded()) ui.setExpanded(true);

@@ -158,6 +158,9 @@
 - **Treat OS `play` actions as play-only; avoid toggle semantics.**
 - **Clamp and guard `setPositionState` inputs; platform implementations can throw on edge values.**
 
+- On a real tagged MP3, `kAudioFilePropertyAlbumArtwork` returned an unsupported-property error. Core Audio’s `kAudioFormatProperty_ID3TagToDictionary` exposed the front and back pictures from the same bytes. The native artwork test keeps this distinction covered with a 326-byte ID3 fixture.
+- A simulated audio session can publish metadata to the media daemon while SpringBoard shows no Lock Screen controls. We also played a four-second voice prompt in a separate simulator process and the other player kept advancing. Exercise the native decision logic with fixtures and use a physical device for cross-app arbitration, disconnects, and audible route handoffs. [Apple's simulator limitations](https://developer.apple.com/library/archive/documentation/Audio/Conceptual/AudioSessionProgrammingGuide/OptimizingForDeviceHardware/OptimizingForDeviceHardware.html)
+
 ## TypeScript and testability
 
 - **Avoid TDZ traps with synchronous builder callbacks.** Pass constructed objects into callbacks after initialization.

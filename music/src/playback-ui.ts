@@ -10,7 +10,6 @@
  * - Playback policy decisions and track selection.
  * - Reading or controlling the media element.
  */
-import { log } from './logger.js';
 import { type PlaybackMode } from './playback.js';
 
 /** A wheel release is valid only for the play on which the pointer went down. */
@@ -213,7 +212,7 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
         if (value && !footerEl.classList.contains('visible')) return;
         expanded = value;
         footerEl.classList.toggle('expanded', value);
-        expansion.style.maxHeight = value ? `${expansion.scrollHeight}px` : '0';
+        if (value) expansion.style.setProperty('--drawer-content-height', `${expansion.scrollHeight}px`);
         if (value) modeLabel.textContent = deps.getMode();
         deps.onExpandedChange(value);
     };
@@ -226,15 +225,8 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
         modeLabel.textContent = deps.getMode();
     });
 
-    let wasLandscape = window.matchMedia('(orientation: landscape)').matches;
     window.addEventListener('resize', () => {
-        const isLandscape = window.matchMedia('(orientation: landscape)').matches;
-        if (!wasLandscape && isLandscape && expanded) {
-            setExpanded(false);
-            log('playback: collapsed expanded controls on landscape entry');
-        }
-        wasLandscape = isLandscape;
-        if (expanded) expansion.style.maxHeight = `${expansion.scrollHeight}px`;
+        if (expanded) expansion.style.setProperty('--drawer-content-height', `${expansion.scrollHeight}px`);
     });
 
     expansionInner.addEventListener('click', (e) => {

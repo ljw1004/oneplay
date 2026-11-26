@@ -1,6 +1,5 @@
 import AVFoundation
 import UIKit
-import UniformTypeIdentifiers
 import WebKit
 
 /// Owns the one admitted page. Losing WebKit cancels its requests while the
@@ -22,9 +21,6 @@ import WebKit
     private var selectionIntent: String?
     private var staged: (id: String, count: Int, tracks: [IndexedTrack])?
     private var showingAudioRanges = false
-    #if DEBUG
-    private var pickedFiles: CheckedContinuation<[URL], Error>?
-    #endif
     /// Both library themes draw a blue header beneath the system status icons.
     override var preferredStatusBarStyle: UIStatusBarStyle { webView == nil ? .default : .lightContent }
 
@@ -225,13 +221,6 @@ import WebKit
         inventoryParts = nil
         selectionIntent = nil
         showingAudioRanges = false
-        #if DEBUG
-        if pickedFiles != nil {
-            pickedFiles?.resume(throwing: NativeAccountError.cancelled)
-            pickedFiles = nil
-            presentedViewController?.dismiss(animated: false)
-        }
-        #endif
         // beginSignOut already cancelled page-owned work when it committed the marker.
         if let account, !account.cleanupPending { account.detachView() }
         webView?.navigationDelegate = nil
@@ -450,19 +439,6 @@ import WebKit
                     if op == "chunk" { reply = try account.readChunk(id: id) }
                     else { account.abort(id: id); reply = true }
                 #if DEBUG
-                case "playLocal":
-                    guard let player, let nearEnd = args["nearEnd"] as? Bool, presentedViewController == nil
-                    else { replyHandler(nil, "invalidRequest"); return }
-                    let files: [URL] = try await withCheckedThrowingContinuation { continuation in
-                        pickedFiles = continuation
-                        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.mp3], asCopy: false)
-                        picker.allowsMultipleSelection = true
-                        picker.delegate = self
-                        present(picker, animated: true)
-                    }
-                    guard page === webView, !account.cleanupPending else { throw NativeAccountError.cancelled }
-                    try player.startLocalFiles(files, nearEnd: nearEnd)
-                    reply = true
                 case "playIndexed":
                     guard let player, account.snapshot["driveID"] is String,
                           let tracks = args["tracks"] as? [[String: String]], (1...10).contains(tracks.count),
@@ -484,17 +460,3 @@ import WebKit
         }
     }
 }
-
-#if DEBUG
-extension LibraryController: UIDocumentPickerDelegate {
-    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-        pickedFiles?.resume(throwing: NativeAccountError.cancelled)
-        pickedFiles = nil
-    }
-
-    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-        pickedFiles?.resume(returning: urls)
-        pickedFiles = nil
-    }
-}
-#endif

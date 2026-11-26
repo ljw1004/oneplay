@@ -251,7 +251,7 @@ const sync = createIndexSync({
     ensureShares: () => ensureShares(),
     showTree: (info, data, reindexing = false) => showTree(info, data, reindexing),
     showError: (message) => startup.showError(message),
-    renderSignInButtonIntoStatus: showSignIn,
+    renderSignInButtonIntoStatus: startup.renderSignInButtonIntoStatus,
     renderStartupErrorIntoStatusAndWireReload: (message) => startup.renderStartupErrorIntoStatusAndWireReload(message),
     markStartupTerminalState: (state) => startup.markStartupTerminalState(state),
     enterFirstTimeIndexingAndBypassStartupDeadline: () => startup.enterFirstTimeIndexingAndBypassStartupDeadline(),
@@ -337,18 +337,7 @@ async function simulateSignedOutForDebug(): Promise<void> {
     browserAuth!.transition('evidence:signed-out');
 }
 
-/** The local-file join check is available before the first sign-in and in airplane mode. */
-function showSignIn(): void {
-    if (startup.hasReachedDeadline()) return;
-    startup.renderSignInButtonIntoStatus();
-    if (!native?.state.debugPlayback) return;
-    const localFiles = document.createElement('button');
-    localFiles.textContent = 'Test local MP3 files…';
-    localFiles.addEventListener('click', () => showPlaybackTest());
-    statusEl().appendChild(localFiles);
-}
-
-/** A Debug build can audition local files or up to ten indexed MP3 siblings from the tapped row.
+/** A Debug build can audition up to ten indexed MP3s starting at the current recording.
  * Swift owns the schedule after Play, including every Graph call made under lock. */
 function showPlaybackTest(path?: readonly string[]): void {
     if (!native?.state.debugPlayback) return;
@@ -363,7 +352,7 @@ function showPlaybackTest(path?: readonly string[]): void {
     }
     const tracks = root && folder ? names.slice(first, first + 10)
         .map(name => ({ driveId: root.driveId, itemId: folder.children[name].id })) : undefined;
-    showModal(path ? `Test playback from ${names[first]}` : 'Test local MP3 playback', (modal, close) => {
+    showModal(path ? `Test playback from ${names[first]}` : 'Playback tests', (modal, close) => {
         const add = (label: string, action: () => Promise<unknown>) => {
             const button = document.createElement('button');
             button.className = 'settings-pill';
@@ -379,14 +368,16 @@ function showPlaybackTest(path?: readonly string[]): void {
             });
             modal.appendChild(button);
         };
-        const play = (nearEnd: boolean, forceRefresh = false, delaySeconds = 0) => tracks
-            ? native.playIndexed(tracks, nearEnd, forceRefresh, delaySeconds)
-            : native.playLocal(nearEnd);
-        if (!path && nativePlayer?.currentPath()) add('Test playing album…', async () => showPlaybackTest(nativePlayer?.currentPath()));
-        add('Play from beginning', () => play(false));
-        add('Play near first join', () => play(true));
-        if (tracks) for (const delay of [0, 5, 10]) {
-            add(delay ? `Force renewal, hold ${delay}s` : 'Force renewal now', () => play(true, true, delay));
+        if (tracks) {
+            const play = (nearEnd: boolean, forceRefresh = false, delaySeconds = 0) =>
+                native.playIndexed(tracks, nearEnd, forceRefresh, delaySeconds);
+            add('Play from beginning', () => play(false));
+            add('Play near first join', () => play(true));
+            for (const delay of [0, 5, 10]) {
+                add(delay ? `Force renewal, hold ${delay}s` : 'Force renewal now', () => play(true, true, delay));
+            }
+        } else if (nativePlayer?.currentPath()) {
+            add('Test playing album…', async () => showPlaybackTest(nativePlayer?.currentPath()));
         }
         add('Playback status', async () => showToastMessage(await native.readPlaybackStatus()));
         add('Stop playback', native.stopPlayback);
@@ -405,7 +396,7 @@ async function signInAndRefreshLibrary(): Promise<void> {
         if (!tree && !startup.isStartupTerminalUiRendered()) startup.renderStartupErrorIntoStatusAndWireReload(STARTUP_ERROR_MESSAGE);
     } catch (error) {
         const outcome = error instanceof Error ? error.message : String(error);
-        if (!tree) showSignIn();
+        if (!tree) startup.renderSignInButtonIntoStatus();
         if (outcome !== 'cancelled') showToastMessage(outcome === 'wrongAccount'
             ? 'Reconnect with the OneDrive account used for this library.'
             : 'OneDrive sign-in failed. Please try again.');
@@ -514,7 +505,7 @@ function openSettingsPage(): void {
             localStorage.setItem('oneplay_music_theme', next);
             applyTheme();
         },
-        onTestLocalPlayback: native?.state.debugPlayback ? () => showPlaybackTest() : undefined,
+        onOpenPlaybackTests: native?.state.debugPlayback ? () => showPlaybackTest() : undefined,
         theme: themePreference,
         onDebugExpire: simulateSignedOutForDebug,
         onDebugToggle: (next) => setRuntimeDebugEnabled(next),
@@ -1256,7 +1247,7 @@ async function startupInner(): Promise<void> {
                 return;
             }
         }
-        showSignIn();
+        startup.renderSignInButtonIntoStatus();
         log('showing sign-in');
         return;
     }

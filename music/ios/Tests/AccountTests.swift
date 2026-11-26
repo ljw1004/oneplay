@@ -1094,7 +1094,11 @@ private final class TestAudioCDN: URLProtocol {
         _ = try await page.callAsyncJavaScript("return await window.webkit.messageHandlers.oneplay.postMessage({op:'signIn'})",
                                                arguments: [:], in: nil, contentWorld: .page)
         let file = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "ScaleTone", withExtension: "mp3"))
-        try player.startLocalFiles([file], nearEnd: true)
+        let store = try XCTUnwrap(account.openPlaybackStore())
+        let track = IndexedTrack(driveId: "library", itemId: "tone")
+        try FileManager.default.createDirectory(at: store.pinDirectory, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: file, to: store.pinURL(track.fileKey))
+        try player.start(tracks: [track], delaySeconds: 0, nearEnd: true, forceRefresh: false)
         addTeardownBlock { try await player.stopAndDrain() }
         let warm = ContinuousClock.now + .seconds(8)
         while player.status == "Preparing playback", ContinuousClock.now < warm { try await Task.sleep(for: .milliseconds(30)) }

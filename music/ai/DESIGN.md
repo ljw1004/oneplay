@@ -91,6 +91,8 @@ Modern iOS apps like Podcasts have the playback controls in a "pill" area that s
 
 You can swipe this playback-control areas up where it expands into a half-screen-height larger area that has an iPod style scroll-wheel. (This is similar to Safari on iPhone which prior to iOS 26 had a control area at the bottom with addess bar, and you could expand it to fill half the hieght for Bookmarks/Share. Bookmarks has blue Done text to dismiss; share has a close icon. In Safari when the popup appears then the rest of the screen is almost imperceptibly faded out, but we will leave the rest of the screen (the playlist area) usable and normal.)
 
+On a landscape phone, expanding the player fills the screen height between the blue side safe areas. The bottom bar has room for a two-line title and Play/Pause. The centered wheel uses the remaining height, with the playback mode switch at the upper left. An open player stays open through rotation.
+
 In our "playback controls" area we want to give as much space possible to track title: two full lines of text. This is unconventional, but reflects my personal preoccupation that track titles are typically 60-120 characters long and need plenty of space to see them all. There will be a single Play/Pause/Resume button at the right, and a "current track" indicator to the left. For the Play/Pause/Resume button let's start with just a simple glyph, no border or surrounding matter, just like the Podcasts app. That way the button won't carry heavier weight/border/chrome than the text.
 
 The motive this design is

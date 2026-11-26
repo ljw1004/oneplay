@@ -1,5 +1,6 @@
         *,*::before,*::after{box-sizing:border-box;}
-html{height:100%;background:var(--bg-header);overscroll-behavior:none;touch-action:pan-x pan-y;}
+/* Keep WebKit's landscape autosizing from enlarging individual long filenames. */
+html{height:100%;background:var(--bg-header);overscroll-behavior:none;touch-action:pan-x pan-y;-webkit-text-size-adjust:100%;text-size-adjust:100%;}
 html,body{margin:0;padding:0;color:var(--text-primary);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
 body{background:var(--bg-header);height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:0;padding:env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);overflow:hidden;overscroll-behavior:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}
 #status-bar-color{display:none;}
@@ -152,6 +153,7 @@ to{transform:rotate(360deg);}
 .footer-gripper{display:flex;justify-content:center;padding:6px 0 2px;}
 .footer-gripper::before{content:'';width:36px;height:5px;border-top:2px solid var(--border-footer);border-bottom:2px solid var(--border-footer);}
 .expansion{max-height:0;overflow:hidden;transition:max-height 300ms ease;}
+#footer.expanded .expansion{max-height:var(--drawer-content-height);}
 .expansion-inner{position:relative;display:flex;align-items:center;justify-content:center;flex:1 1 auto;min-height:0;}
 .audio-ranges{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;padding:2px 12px 6px;font:11px system-ui;color:var(--text-tertiary);}
 .audio-ranges[hidden]{display:none;}
@@ -169,6 +171,17 @@ to{transform:rotate(360deg);}
 @media(prefers-reduced-motion:reduce){.audio-range-rail .fetching,.audio-range-rail .lookup{animation:none;}}
 .mode-label{position:absolute;top:0;left:0;appearance:none;border:none;background:none;color:var(--text-tertiary);font-size:14px;padding:8px 12px;cursor:pointer;min-width:44px;min-height:44px;display:flex;align-items:center;justify-content:center;}
 .scrubber-shell{touch-action:none;aspect-ratio:1 / 1;width:min(360px,max(0px,calc(100% - 100px)));margin:24px;margin-bottom:10px;position:relative;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;}
+/* On a landscape phone the open player owns the safe width. The title, gripper
+ * and optional native diagnostics take their natural heights before the wheel
+ * sizes itself to the remaining space. The mode button sits beside the wheel. */
+@media (orientation:landscape) and (max-height:500px){
+    #footer.expanded{position:fixed;inset:env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);width:auto;}
+    #footer.expanded .footer-gripper{padding-block:12px;}
+    #footer.expanded .expansion{display:flex;flex-direction:column;flex:1;min-height:0;max-height:none;}
+    #footer.expanded .expansion-inner{container-type:size;}
+    #footer.expanded .scrubber-shell{width:min(100cqh,calc(100cqw - 100px));margin:0;}
+    #footer.expanded .footer-bar{padding-bottom:calc(4px + env(safe-area-inset-bottom));}
+}
 .scrubber-wheel{position:absolute;inset:0;border-radius:50%;background:radial-gradient(circle closest-side,transparent 0 calc(100% - 65px),var(--scrubber-border) calc(100% - 65px) calc(100% - 64px),var(--bg-surface) calc(100% - 64px) calc(100% - 1px),var(--scrubber-border) calc(100% - 1px) calc(100% - 0px));pointer-events:none;}
 .scrubber-text{position:absolute;font-size:16px;color:var(--text-tertiary);inset:0;margin:auto;width:calc(100% - 80px);aspect-ratio:1 / 1;display:flex;align-items:center;justify-content:center;text-align:center;pointer-events:none;}
 .scrubber-spinner{display:none;width:36px;height:36px;}

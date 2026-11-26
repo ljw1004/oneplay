@@ -287,19 +287,27 @@ extension PlaybackTests {
     }
 
     #if DEBUG
-    /// A missing successor uses the same scheduling failure path as a denied Graph recording.
+    /// A denied successor must allow the audible pinned recording to finish.
     /// Compare both ends of the generated outgoing tone with its independent local decode.
     func testUnavailableSuccessorFinishesAudibleRecording() async throws {
         let tone = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "ScaleTone", withExtension: "mp3"))
-        let missing = tone.deletingLastPathComponent().appendingPathComponent("Z-missing.mp3")
-        let capture = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".caf")
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try PlaybackStore(root: root, home: "listener", drive: "d")
+        let track = IndexedTrack(driveId: "d", itemId: "tone")
+        let missing = IndexedTrack(driveId: "d", itemId: "missing")
+        try FileManager.default.createDirectory(at: store.pinDirectory, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: tone, to: store.pinURL(track.fileKey))
+        let capture = root.appendingPathComponent("capture.caf")
         let player = NativePlayback(captureURL: capture) { _,_,_,_ in throw NativeAccountError.forbidden }
-        try player.startLocalFiles([tone, missing], nearEnd: true)
+        try player.restoreIfNeeded(from: store)
+        try player.start(tracks: [track, missing], delaySeconds: 0, nearEnd: true, forceRefresh: false)
         let deadline = ContinuousClock.now.advanced(by: .seconds(15))
-        while !player.status.hasPrefix("Playback failed") && ContinuousClock.now < deadline {
+        let deniedStatus = "OneDrive denied access to this recording"
+        while player.status != deniedStatus && ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(50))
         }
-        XCTAssertTrue(player.status.hasPrefix("Playback failed"), player.status)
+        XCTAssertEqual(player.status, deniedStatus)
         func audibleFrames(_ url: URL) throws -> Int {
             let file = try AVAudioFile(forReading: url)
             let pcm = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: UInt32(file.length)))
@@ -311,7 +319,7 @@ extension PlaybackTests {
             return end-start
         }
         let denied = try audibleFrames(capture)
-        try player.startLocalFiles([tone], nearEnd: true)
+        try player.start(tracks: [track], delaySeconds: 0, nearEnd: true, forceRefresh: false)
         let referenceDeadline = ContinuousClock.now.advanced(by: .seconds(15))
         while !player.status.hasPrefix("Finished") && ContinuousClock.now < referenceDeadline {
             try await Task.sleep(for: .milliseconds(50))

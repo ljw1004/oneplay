@@ -51,7 +51,7 @@ interface OpenOptions {
     readonly onTimerChange: (next: TimerDuration) => void;
     readonly theme: ThemePreference;
     readonly onThemeChange: (next: ThemePreference) => void;
-    readonly onTestLocalPlayback?: () => void;
+    readonly onOpenPlaybackTests?: () => void;
     readonly onDebugExpire: () => Promise<void>;
     readonly onDebugToggle: (next: boolean) => void;
 }
@@ -477,12 +477,12 @@ export function createSettings(container: HTMLElement): SettingsView {
             debug.append(debugLineEl, debugButton, ' ', logsButton, ' ', expireButton);
             body.appendChild(debug);
 
-            if (initial.onTestLocalPlayback) {
-                const localFiles = document.createElement('button');
-                localFiles.className = 'settings-pill';
-                localFiles.textContent = 'Test local MP3 files…';
-                localFiles.addEventListener('click', initial.onTestLocalPlayback);
-                debug.append(' ', localFiles);
+            if (initial.onOpenPlaybackTests) {
+                const playbackTests = document.createElement('button');
+                playbackTests.className = 'settings-pill';
+                playbackTests.textContent = 'Playback tests…';
+                playbackTests.addEventListener('click', initial.onOpenPlaybackTests);
+                debug.append(' ', playbackTests);
             }
 
             root.append(header, body);

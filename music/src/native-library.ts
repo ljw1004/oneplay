@@ -236,7 +236,6 @@ export function createNativeLibrary(handler: ReplyHandler) {
         },
         playIndexed: (tracks: {driveId: string; itemId: string}[], nearEnd: boolean, forceRefresh: boolean, delaySeconds: number) =>
             post({ op: 'playIndexed', tracks, nearEnd, forceRefresh, delaySeconds }),
-        playLocal: (nearEnd: boolean) => post({ op: 'playLocal', nearEnd }),
         readPlaybackStatus: async () => String(await post({ op: 'playbackStatus' })),
         stopPlayback: () => post({ op: 'stopPlayback' }),
     };

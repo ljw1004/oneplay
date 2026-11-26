@@ -1,6 +1,59 @@
 const assert = require('node:assert/strict');
 
 module.exports = {
+    /** Rotating an open phone player must leave its wheel and two-line title fully usable. */
+    async 'wheel: landscape fits the wheel, mode and wrapped title after rotation'(page) {
+        const url = globalThis.__ONEPLAY_TEST_URL;
+        await page.setViewportSize({width:390, height:844});
+        await page.route('https://graph.microsoft.com/**', route => route.abort());
+        await page.route(url + 'seed', route => route.fulfill({contentType:'text/html', body:'<title>Seed</title>'}));
+        await page.goto(url + 'seed');
+        const title = "Trodd en Bratt Say 'Well Done You' – Series Two, Episode Four – "
+            + "The complete Sunday evening broadcast, including the introduction and closing credits.mp3";
+        await page.evaluate(async title => {
+            const {dbPut} = await import('./dist/db.js');
+            const children = Object.fromEntries(['GoldenEye.mp3', title].map((name, i) => [name, {id:String(i)}]));
+            await dbPut('index:show', {kind:'MusicData', schemaVersion:1, count:2, size:20, folder:{id:'root', children}});
+            localStorage.setItem('account_info', JSON.stringify({driveId:'show', displayName:'Comedy Offline'}));
+        }, title);
+        await page.goto(url);
+        await page.waitForFunction(() => !!window._testPlayback);
+        await page.evaluate(async title => {
+            const folder = ['OnePlay Music','show'];
+            window._testTree.setSelectedPath(folder);
+            await window._testPlayback.restoreVisualState(folder, [...folder,title], 'all', false, 0);
+        }, title);
+        await page.locator('.footer-gripper').click();
+        await page.setViewportSize({width:844, height:390});
+        const footer = page.locator('#footer.expanded');
+        await footer.waitFor();
+        const wheel = await footer.locator('.scrubber-shell').boundingBox();
+        const bar = await footer.locator('.footer-bar').boundingBox();
+        const grip = await footer.locator('.footer-gripper').boundingBox();
+        assert.equal(grip.y, 1);
+        assert.equal(bar.y + bar.height, 390);
+        assert.equal(wheel.y, grip.y + grip.height);
+        assert.equal(wheel.width, wheel.height);
+        assert.equal(wheel.y + wheel.height, bar.y);
+        assert.ok((await footer.locator('.footer-title').boundingBox()).height > 28, 'Title uses both lines');
+        const mode = footer.locator('.mode-label');
+        await mode.click();
+        assert.equal(await mode.textContent(), 'repeat');
+        await page.locator('.footer-gripper').click();
+        await page.locator('#children .file').first().click({trial:true});
+        const glyphHeights = await page.locator('#children .file .row-name').evaluateAll(names => names.map(name => {
+            const glyph = document.createRange();
+            glyph.setStart(name.firstChild, 0);
+            glyph.setEnd(name.firstChild, 1);
+            return glyph.getBoundingClientRect().height;
+        }));
+        assert.equal(glyphHeights.length, 2);
+        assert.equal(glyphHeights[0], glyphHeights[1], 'Short and long filenames use the same rendered text size');
+        await page.locator('.footer-gripper').click();
+        assert.deepEqual(await footer.locator('.scrubber-shell').boundingBox(), wheel);
+        await page.locator('.footer-gripper').click();
+    },
+
     /** Decode distinct files through the browser player while row positions and a prepared successor change. */
     async 'wheel: browser playlist edits keep audible identity through a fenced boundary and cold restart'(page) {
         const url = globalThis.__ONEPLAY_TEST_URL;

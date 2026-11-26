@@ -150,6 +150,7 @@ export function createIndexStartup(deps: IndexStartupDeps): IndexStartupControll
     };
 
     const renderSignInButtonIntoStatus = (): void => {
+        if (terminalState === 'deadline') return;
         const el = statusEl();
         const treeContainer = document.getElementById('tree-container');
         const settingsContainer = document.getElementById('settings-container');

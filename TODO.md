@@ -12,23 +12,6 @@
 
 **If the guidance is encouraging**, prototype two private tracks on an installed iPhone PWA. Try Drive’s `files.download` URI and test seeking, locked-screen advance, and access-token expiry. If playback passes, address duplicate filenames with ID-based navigation, isolate account storage, and build a resumable folder scan with a Drive changes token committed alongside the local index. If eligibility remains unresolved, keep public Google Drive support on hold. [Provider evaluation and technical background](google-dropbox.md) · [Drive download operations](https://developers.google.com/workspace/drive/api/guides/long-running-operations)
 
-## Native iOS playback and OneDrive sign-in for Music
-
-**Recommendation.** Prototype a Swift app that bundles the existing HTML and JavaScript in a `WKWebView`. Today, even when OnePlay has prefetched the next track, JavaScript must receive the audio element’s `ended` event and start playback. The design goal is that a listener can press Play, lock the phone, and reach the tenth track without the web view running again. Native sign-in also lets the listener reconnect to OneDrive without losing their place in the library. [Current track transition](music/src/playback.ts) · [Apple’s background playback guide](https://developer.apple.com/documentation/avfoundation/configuring-your-app-for-media-playback)
-
-**Queue and playback.** TypeScript keeps the library, favorites, search, indexing, and foreground sync. When the listener chooses music, it sends Swift the ordered queue, starting position, and mode. Each entry carries its logical playlist path and its OneDrive drive and item IDs, so two appearances of the same recording can share a file and still have distinct places in the queue. Swift owns the live queue, shuffle and repeat, sleep timer, per-favorite resume position, and lock-screen controls. On return, the web UI reads the current track and position from Swift.
-
-**Audio files.** Use an `AVQueuePlayer` with a playback audio session and the background audio capability. TypeScript decides which favorites are pinned. Swift stores one local file per recording so the player can open it while locked. For streaming, Swift resolves a fresh OneDrive URL shortly before a track plays. Only the next few items need preparing, even for a queue of 30,000 tracks. [AVQueuePlayer](https://developer.apple.com/documentation/avfoundation/avqueueplayer) · [Graph download URL lifetime](https://learn.microsoft.com/en-us/graph/api/resources/driveitem?view=graph-rest-1.0#instance-attributes)
-
-**OneDrive sign-in.** The current browser flow uses a refresh token with a fixed 24-hour lifetime. Add the iOS/macOS platform to OnePlay’s existing Entra registration so the app keeps access to the same OneDrive app folder for favorites, shares, and indexes. Use MSAL for iOS as the single sign-in for playback and library requests. It can renew access silently and present a system sign-in sheet when Microsoft requires interaction. [Refresh-token lifetimes](https://learn.microsoft.com/en-us/entra/identity-platform/refresh-tokens) · [MSAL for iOS](https://learn.microsoft.com/en-us/entra/msal/objc/acquire-tokens)
-
-**Next action.** Try one playlist on a physical iPhone before porting the download manager. Proceed if all three checks pass:
-
-1. Lock the phone and skip past the prepared tracks. A streamed track must start using a URL Swift obtains while locked.
-2. In airplane mode, play consecutive downloaded tracks, then interrupt playback with a call or headphone disconnect. Reopen OnePlay and check that the footer and the favorite’s saved position match what played.
-3. More than 24 hours after initial sign-in, open the library and refresh it. Sync must succeed with the library still on screen.
-
-The main ongoing cost is keeping playback behavior consistent between Swift and the PWA’s TypeScript player, especially shuffle order, timer expiry, and “remember my spot.”
 
 ## OnePlay Video
 

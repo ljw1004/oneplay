@@ -18,6 +18,7 @@ $(SRCROOT)/../src/logger.ts
 $(SRCROOT)/../src/media-title.ts
 $(SRCROOT)/../src/modal.ts
 $(SRCROOT)/../src/native-library.ts
+$(SRCROOT)/../src/native-pins.ts
 $(SRCROOT)/../src/native-playback.ts
 $(SRCROOT)/../src/path-names.ts
 $(SRCROOT)/../src/playback-engine.ts

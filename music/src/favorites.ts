@@ -35,6 +35,7 @@ import { readGraphJson, type AuthFetch } from './auth.js';
  *  throwing stubs so accidental I/O paths fail fast. */
 export interface FavoritesDeps {
     authFetch: AuthFetch;
+    fencePinEdit?: () => Promise<() => void> | undefined;
     fenceQueueEdit?: () => Promise<void> | undefined;
     dbGet<T>(key: string): Promise<T | undefined>;
     dbPut(key: string, value: unknown): Promise<void>;
@@ -506,19 +507,21 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
     }
 
     async function commitEdit(change: () => Favorite[] | undefined,
-        options: { queueEdit?: boolean; origin?: 'sync'; serverTime?: number } = {}): Promise<boolean> {
+        options: { pinEdit?: boolean; queueEdit?: boolean; origin?: 'sync'; serverTime?: number } = {}): Promise<boolean> {
+        const fencePins = (options.pinEdit || options.queueEdit) && deps.fencePinEdit;
         const fenced = !!options.queueEdit && !!deps.fenceQueueEdit;
         const write = serializeWrite(async () => {
             const next = change();
             if (!next) return false;
             const data = { version: 1, updatedAt: options.serverTime ?? Date.now(), favorites: next };
+            const releasePins = fencePins ? await fencePins() : undefined;
             try {
                 if (fenced) await deps.fenceQueueEdit!();
                 await deps.dbPut(IDB_KEY, data);
             } catch (error) {
-                if (fenced) throw error;
+                if (fenced || fencePins) throw error;
                 logCatch('favorites:dbPut')(error);
-            }
+            } finally { releasePins?.(); }
             favorites = next;
             updatedAt = data.updatedAt;
             loadedMembership = true;
@@ -529,7 +532,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
         try {
             changed = await write;
         } catch (error) {
-            if (fenced) await onChange(options.origin); // release the fence using the admitted graph
+            if (fenced || fencePins) await onChange(options.origin); // release the fence using the admitted graph
             throw error;
         }
         if (changed) await onChange(options.origin);
@@ -752,7 +755,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync')
 
         async setOfflinePin(id, pin) {
             await commitEdit(() => findById(id)
-                ? favorites.map(f => f.id === id ? { ...f, offlinePin: pin } : f) : undefined);
+                ? favorites.map(f => f.id === id ? { ...f, offlinePin: pin } : f) : undefined, {pinEdit: true});
         },
 
         _testOnlySuppressSave(suppress) {

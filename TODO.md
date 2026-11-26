@@ -46,3 +46,17 @@ The main ongoing cost is keeping playback behavior consistent between Swift and 
 2. Cast a BBC episode, try its subtitles, and seek halfway through. Stop casting, then resume on the phone the following night. This tests the bookmark and whether the actual rip’s video, audio, and subtitles work on both screens. [Cast media support](https://developers.google.com/cast/docs/media)
 
 **Later options.** For offline viewing, consider downloading a selected episode or playlist with its size shown up front. For a home NAS, establish how the Chromecast would fetch the video as well as how OnePlay would browse the share. A media server such as Jellyfin is worth exploring if the collection needs format conversion. [Jellyfin playback options](https://jellyfin.org/docs/general/post-install/transcoding/)
+
+## Attach behaviors to existing folders
+
+The only way we have to set "remember my spot" or "available offline" is through making something a shortcut or a playlist.
+
+Also I don't actually even know where "one/shuffle/all/repeat/timer" is stored. I tried setting it to One while playing a track from OneDrive, then I played a song from a favorite folder (which changed it to Shuffle), then I went back to another folder in OneDrive and played a songe there and it got reset to All.
+
+My only user so far has asked if the affordance can be made not only to shortcuts/playlists, but also to folders within their OneDrive directly.
+
+I'm not quite sure how that would work.
+- Would we allow "make available offline" on per-track basis within OneDrive, or only for folders?
+- Would we maybe display stars next to folders within OneDrive? Or just the "offline" button?
+- I don't know where to anchor the "one/shuffle/all/repeat/timer" choice for folders within OneDrive. Would it be only for starred folders within OneDrive? I can imagine this getting really confusing.
+- Or maybe it would solely be an offline thing? (But then, there'd be the danger that a user might forget which things they had made available offline, buried deep within their OneDrive)

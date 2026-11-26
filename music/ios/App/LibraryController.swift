@@ -11,6 +11,10 @@ import WebKit
     private let store: WKWebsiteDataStore
     private var account: NativeAccount?
     private(set) var player: NativePlayback?
+    let pins: OfflinePins
+    private var pinRevision = -1
+    private var pinParts: (revision: Int, data: Data)?
+    private var inventoryParts: (revision: Int, data: Data)?
     private var playbackSequence = 0
     private var subscription = UUID().uuidString
     /// Only one document can stage a queue. Every append checks its build ID and offset.
@@ -24,7 +28,8 @@ import WebKit
     #endif
     private(set) var webView: WKWebView?
 
-    init(account: NativeAccount? = nil, store: WKWebsiteDataStore? = nil, player: NativePlayback? = nil) {
+    init(account: NativeAccount? = nil, store: WKWebsiteDataStore? = nil, player: NativePlayback? = nil, pinConfiguration: URLSessionConfiguration? = nil) {
+        self.pins = OfflinePins(configuration: pinConfiguration ?? (account == nil ? .background(withIdentifier: OfflinePins.identifier) : .ephemeral))
         self.player = player
         self.account = account
         self.store = store ?? WKWebsiteDataStore(forIdentifier: UUID(uuidString: "83178CEF-278A-4625-9E7C-C7526D5AF452")!)
@@ -39,10 +44,24 @@ import WebKit
         player?.releaseCachedAudio()
     }
 
+    private var starting = false
+    private var servicesReady = false
+    private var startupFailed = false
+
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
         shell.onReplacePage = { [weak self] in self?.retirePageAndReload() }
+        if servicesReady { loadPage() }
+        else if startupFailed { showUnavailable() }
+        else { startServices() }
+    }
+
+    /// A daemon wake can arrive without a scene. Restore the account and its effective source
+    /// policy before adopting transfers. A later scene attaches to the same running services.
+    func startServices() {
+        guard !starting else { return }
+        starting = true
         Task { [self] in
             do {
                 let account = try self.account ?? NativeAccount()
@@ -56,7 +75,19 @@ import WebKit
                 #endif
                 account.diagnostics.onPending = { [weak self] in self?.signalPendingDiagnostics() }
                 account.onNetworkPathChange = { [weak self] in self?.player?.cancelWiFiReadsIfMetered() }
+                pins.lookup = { drive, item, lookup in try await account.media(driveID: drive, itemID: item, lookup: lookup) }
+                pins.playerHolds = { [weak self] key in self?.player?.holdsPin(key) == true }
+                pins.allowsSource = { [weak self] root in self?.player?.allowsPinSource(root) == true }
+                pins.onChange = { [weak self] in
+                    guard let self else { return }
+                    let limited = ["evidence:not-online", "evidence:signed-out"].contains(account.snapshot["evidence"] as? String ?? "")
+                    player?.setOfflineAvailability(limited ? pins.completeKeys : nil)
+                    if UIApplication.shared.applicationState == .active {
+                        webView?.evaluateJavaScript("window.dispatchEvent(new Event('oneplay-pins'))", completionHandler: nil)
+                    }
+                }
                 account.onEvidenceChange = { [weak self] evidence in
+                    self?.pins.updateEvidence(evidence)
                     self?.webView?.callAsyncJavaScript(
                         "window.dispatchEvent(new CustomEvent('oneplay-evidence', {detail:evidence}))",
                         arguments: ["evidence": evidence], in: nil, in: .page, completionHandler: nil)
@@ -64,12 +95,22 @@ import WebKit
                 if account.cleanupPending {
                     try await finishCleanup(account)
                 }
-                if let storage = try account.openPlaybackStore(), let player { try await Task.detached { try player.restoreIfNeeded(from: storage) }.value }
+                if let storage = try account.openPlaybackStore(), let player {
+                    try await Task.detached { try player.restoreIfNeeded(from: storage) }.value
+                    try await pins.bind(storage)
+                }
+                pins.updateEvidence(account.snapshot["evidence"] as? String ?? "no-evidence")
+                await pins.connectSession()
                 NotificationCenter.default.addObserver(self, selector: #selector(audioInterrupted(_:)),
                     name: AVAudioSession.didBecomeInactiveNotification, object: nil)
-                loadPage()
+                servicesReady = true
+                if isViewLoaded { loadPage() }
             } catch {
-                showUnavailable()
+                // Drain outstanding daemon events even when private storage cannot be opened.
+                pins.closeAdmission()
+                await pins.connectSession()
+                startupFailed = true
+                if isViewLoaded { showUnavailable() }
             }
         }
     }
@@ -88,6 +129,7 @@ import WebKit
     }
 
     private func signalPlayerChange(debugOnly: Bool) {
+        if !debugOnly { pins.releaseUnusedLeases() }
         guard let page = webView, page.url == BundledShell.page, UIApplication.shared.applicationState == .active else { return }
         if debugOnly {
             #if DEBUG
@@ -135,6 +177,7 @@ import WebKit
             if let theme = account.cleanupTheme {
                 try Data(theme.utf8).write(to: self.deviceTheme, options: .atomic)
             }
+            await self.pins.unbindAndCancel()
             try await self.player?.stopAndDrain()
             await self.clearLibraryStore()
         }
@@ -142,6 +185,7 @@ import WebKit
 
     func loadPage() {
         guard webView == nil, let account, !account.cleanupPending else { return }
+        pinRevision = -1
         subscription = UUID().uuidString
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = store
@@ -185,6 +229,8 @@ import WebKit
 
     func detachPage() {
         staged = nil
+        pinParts = nil
+        inventoryParts = nil
         selectionIntent = nil
         #if DEBUG
         showingAudioRanges = false
@@ -206,6 +252,49 @@ import WebKit
         webView = nil
     }
 
+    private func handlePins(_ args: [String: Any], account: NativeAccount) throws -> Any {
+        guard account.snapshot["driveID"] is String, let action = args["action"] as? String else { throw NativeAccountError.unbound }
+        switch action {
+        case "snapshot":
+            let reply = pins.snapshot(after: args["after"] as? Int)
+            guard let files = reply["files"] as? [String: Int], let missing = reply["missing"] as? [String],
+                  files.count + missing.count > 512, let revision = reply["revision"] as? Int else { return reply }
+            let data = try JSONSerialization.data(withJSONObject: reply)
+            inventoryParts = (revision, data)
+            return ["revision": revision, "parts": (data.count + GraphTransport.chunkSize - 1) / GraphTransport.chunkSize]
+        case "inventoryPart":
+            guard let batch = inventoryParts, args["revision"] as? Int == batch.revision,
+                  let i = args["index"] as? Int, i >= 0, i <= (batch.data.count - 1) / GraphTransport.chunkSize
+            else { throw NativeAccountError.invalidRequest }
+            let lo = i * GraphTransport.chunkSize, hi = min(lo + GraphTransport.chunkSize, batch.data.count)
+            if hi == batch.data.count { inventoryParts = nil }
+            return batch.data[lo..<hi].base64EncodedString()
+        case "ownerPart":
+            guard let revision = args["revision"] as? Int, revision > pinRevision,
+                  let text = args["text"] as? String, text.utf8.count <= GraphTransport.chunkSize
+            else { throw NativeAccountError.invalidRequest }
+            if args["first"] as? Bool == true, revision >= (pinParts?.revision ?? -1) { pinParts = (revision, Data()) }
+            guard pinParts?.revision == revision else { throw NativeAccountError.cancelled }
+            pinParts!.data.append(contentsOf: text.utf8)
+            if args["last"] as? Bool == true {
+                defer { pinParts = nil }
+                guard let owners = try JSONSerialization.jsonObject(with: pinParts!.data) as? [[String: Any]] else { throw NativeAccountError.invalidRequest }
+                try pins.apply(owners: owners)
+                pinRevision = revision
+            }
+        case "owners", "fence":
+            guard let revision = args["revision"] as? Int else { throw NativeAccountError.invalidRequest }
+            if revision > pinRevision {
+                if action == "fence" { try pins.control(action, quota: nil) }
+                else if let rows = args["owners"] as? [[String: Any]] { try pins.apply(owners: rows) }
+                else { throw NativeAccountError.invalidRequest }
+                pinRevision = revision
+            }
+        default: try pins.control(action, quota: args["quota"] as? Int)
+        }
+        return true
+    }
+
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage,
                                replyHandler: @escaping (Any?, String?) -> Void) {
         let frame = message.frameInfo
@@ -218,6 +307,7 @@ import WebKit
         // Close admission in this delegate turn, before any queued operation can start.
         if op == "signOut" {
             do {
+                pins.closeAdmission()
                 try account.beginSignOut(theme: args["theme"] as? String)
                 player?.stop()
                 replyHandler(true, nil)
@@ -233,7 +323,7 @@ import WebKit
             return
         }
 
-        Task {
+        Task<Void, Never> {
             guard page === webView, !account.cleanupPending else { replyHandler(nil, "detached"); return }
             do {
                 let reply: Any
@@ -243,11 +333,13 @@ import WebKit
                     // Cold startup loaded the existing account before admitting this page.
                     // A fresh interactive pairing has an empty store after sign-out cleanup.
                     guard page === webView, !account.cleanupPending else { throw NativeAccountError.cancelled }
-                    if let storage = try account.openPlaybackStore() { try player?.restoreIfNeeded(from: storage) }
+                    if let storage = try account.openPlaybackStore() { try player?.restoreIfNeeded(from: storage); try await pins.bind(storage) }
                     #if DEBUG
                     state["debugPlayback"] = true
                     #endif
                     reply = state
+                case "pins":
+                    reply = try handlePins(args, account: account)
                 case "diagnostics":
                     reply = try account.diagnostics.entries(after: (args["after"] as? String).flatMap(UUID.init(uuidString:)))
                 case "playback":
@@ -279,11 +371,18 @@ import WebKit
                         let allowed = args["allowed"] as? [String] ?? []
                         let proof = args["proof"] as? String
                         staleProof = (!denied.isEmpty || !allowed.isEmpty) && (proof == nil || proof != account.currentShareProof)
+                        do {
                         applied = expected == subscription && !staleProof
                             ? try player.updateAccess(base: base, connected: (args["connected"] as? [String]).map(Set.init),
                                                       denied: Set(denied), allowed: Set(allowed),
                                                       disconnected: Set(args["disconnected"] as? [String] ?? []))
                             : false
+                        } catch {
+                            // A failed durable access write can already have revoked the source in memory.
+                            try pins.reconcile()
+                            throw error
+                        }
+                        if applied == true { try pins.reconcile() }
                     case "timer":
                         guard let setting = args["timer"] as? String else { throw NativeAccountError.invalidRequest }
                         try player.changeTimer(setting)

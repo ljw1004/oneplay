@@ -142,6 +142,32 @@ export function createNativeLibrary(handler: ReplyHandler) {
         signOut: (theme: string) => post({ op: 'signOut', theme }),
         fetch: request,
         followContent: (url: string, signal?: AbortSignal) => request(url, false, { signal, timeoutMs: 30000 }, true),
+        /** A large projection commits on its final piece. A snapshot's pieces all describe one revision. */
+        async pins(action: string, args: Record<string, unknown> = {}) {
+            const send = (name: string, fields: Record<string, unknown>) => post({op: 'pins', action: name, ...fields});
+            if (action === 'owners') {
+                const contents = JSON.stringify(args.owners);
+                if (contents.length > 65536) {
+                    for (let offset = 0; offset < contents.length;) {
+                        let end = Math.min(offset + 65536, contents.length);
+                        // WebKit converts each piece to a Swift String. Keep surrogate pairs together.
+                        if (end < contents.length && /[\uD800-\uDBFF]/.test(contents[end-1])) end--;
+                        await send('ownerPart', {revision: args.revision, first: offset === 0, last: end === contents.length,
+                            text: contents.slice(offset, end)});
+                        offset = end;
+                    }
+                    return {};
+                }
+            }
+            const result = await send(action, args) as {parts?: number; revision?: number};
+            if (!result.parts) return result;
+            const chunks: Uint8Array<ArrayBuffer>[] = [];
+            for (let index = 0; index < result.parts; index++) {
+                const body = await send('inventoryPart', {revision: result.revision, index}) as string;
+                chunks.push(Uint8Array.from(atob(body), c => c.charCodeAt(0)));
+            }
+            return JSON.parse(await new Blob(chunks).text()) as unknown;
+        },
         playback: (action: string, args: Record<string, unknown> = {}) => post({op: 'playback', version: 1, action, ...args}),
         /** Read the last durable decisions before rendering cached shares. This read also
          * binds the document's first write to the observed account revision. */

@@ -7,6 +7,7 @@ struct IndexedTrack: Codable, Equatable, Sendable {
     var path: [String]? = nil
     var key: String? = nil
     var sourceRootKey: String? = nil
+    var fileKey: String { driveId + ":" + itemId }
     var title: String? = nil
     var album: String? = nil
 }
@@ -155,6 +156,23 @@ final class NativePlayback: @unchecked Sendable {
     private func blocked(_ root: String) -> Bool {
         deniedRoots.contains(root) || (root.hasPrefix("share:") && connectedShares?.contains(root) == false)
     }
+    func allowsPinSource(_ root: String) -> Bool { lock.withLock { !blocked(root) } }
+    func holdsPin(_ key: String) -> Bool { lock.withLock { active?.lease(for: key) != nil } }
+    private var offlineKeys: Set<String>?
+    private var playableOrder: [Int] {
+        guard let offlineKeys else { return canonical }
+        return canonical.filter { catalog[$0].indexed.map { offlineKeys.contains($0.fileKey) } ?? true }
+    }
+
+    /// Preserve the canonical library and bookmark while restricting the next pass to complete files.
+    func setOfflineAvailability(_ keys: Set<String>?) {
+        lock.withLock {
+            guard keys != offlineKeys else { return }
+            offlineKeys = keys
+            if let run = active { configure(run, mode: mode); saveCheckpoint() }
+        }
+    }
+
     private func nextPolicy(for mode: QueueMode) -> NextPolicy {
         if fencedRevision != nil { return .fenced }
         return mode == .one || (mode == .timer && timerSetting == "end-of-track") ? .manualOnly : .automatic
@@ -227,9 +245,9 @@ final class NativePlayback: @unchecked Sendable {
             timerSetting = record.timer
             session = UUID().uuidString
             fencedRevision = record.fenced ? revision : nil
-            let eligible = cursor.revised(for: canonical, from: mode, to: mode)
+            let eligible = cursor.revised(for: playableOrder, from: mode, to: mode)
             replaceRun(cursor: eligible, position: point.atEnd ? .end : .seconds(point.seconds), paused: true,
-                       duration: point.duration, restoredNext: canonical == record.canonical && point.slot == record.cursor.slot ? record.next : nil)
+                       duration: point.duration, restoredNext: eligible.order == cursor.order && canonical == record.canonical && point.slot == record.cursor.slot ? record.next : nil)
             savedCursor = cursor
             savedPoint = point
             savedNextOrder = mode == .shuffle && cursor.held == nil && cursor.slot == cursor.order.count - 1 ? record.next?.order : nil
@@ -369,8 +387,11 @@ final class NativePlayback: @unchecked Sendable {
             throw PlaybackError("Invalid playback request")
         }
         try lock.withLock {
-            let eligible = tracks.indices.filter { !blocked(tracks[$0].sourceRootKey ?? "") }
-            guard let first = eligible.first, !selected || eligible.contains(startIndex) else { throw NativeAccountError.forbidden }
+            let allowed = tracks.indices.filter { !blocked(tracks[$0].sourceRootKey ?? "") }
+            let eligible = offlineKeys.map { keys in allowed.filter { keys.contains(tracks[$0].fileKey) } } ?? allowed
+            guard let first = eligible.first, !selected || eligible.contains(startIndex) else {
+                throw offlineKeys == nil ? NativeAccountError.forbidden : .unavailableOffline
+            }
             if legacyPosition != nil && (hasHistory || active != nil) { return }
             saveCheckpoint()
             let bookmark: FavoriteSpot?
@@ -389,7 +410,7 @@ final class NativePlayback: @unchecked Sendable {
             catalog = tracks.map(Recording.oneDrive)
             slots.removeAll()
             for (i, entry) in tracks.enumerated() { if let key = entry.key { slots[key] = i } }
-            canonical = eligible
+            canonical = allowed
 
             self.folder = folder
             self.folderKey = folderKey
@@ -434,9 +455,11 @@ final class NativePlayback: @unchecked Sendable {
                             seekItem: String? = nil, duration: MP3RangeDecoder.Length = .unknown, admitted: MediaLocation? = nil, budget: MediaRanges.Budget = .init(),
                             delaySeconds: Int = 0, nearEnd: Bool = false, forceRefresh: Bool = false,
                             issuedAt: Double = ProcessInfo.processInfo.systemUptime, restoredNext: PlayCursor? = nil) {
+        // Keep the descriptor across a seek or resume even if the last pin was removed.
+        let carry = catalog[cursor.index].indexed.flatMap { active?.lease(for: $0.fileKey) }
         active?.cancel()
         let run = PlaybackRun(tracks: catalog, cursor: cursor, restoredNext: restoredNext, advanced: advanced, mode: mode, nextPolicy: nextPolicy(for: mode), position: position, paused: paused, seekItem: seekItem, duration: duration,
-                              admitted: admitted, lookup: lookup, captureURL: destination, diagnostics: diagnostics, pool: pool, budget: budget) { [weak self] debugOnly in
+                              admitted: admitted, pinStore: store, lease: carry, lookup: lookup, captureURL: destination, diagnostics: diagnostics, pool: pool, budget: budget) { [weak self] debugOnly in
             DispatchQueue.main.async { [weak self] in
                 if !debugOnly { self?.checkpoint() }
                 self?.onChange?(debugOnly)
@@ -473,6 +496,10 @@ final class NativePlayback: @unchecked Sendable {
                 if configure(run, mode: next, item: item) { armTimer(playing: active?.wantsPlay == true) }
                 return
             }
+            if action == "play", let keys = offlineKeys, let anchor = run.persistenceAnchor(),
+               let track = catalog[anchor.cursor.index].indexed, !keys.contains(track.fileKey), run.lease(for: track.fileKey) == nil {
+                throw PlaybackError("This track is unavailable offline.")
+            }
             guard let result = try run.apply(action, item: item, seconds: seconds) else { return }
             if let restart = result.restart {
                 // A seek can keep the occurrence. Only a newly accepted target supersedes its wait.
@@ -488,7 +515,7 @@ final class NativePlayback: @unchecked Sendable {
     /// A compatible revision keeps the decoder, node and prepared bytes. Only a different
     /// immediate audio decision needs the existing stop-and-seek path to retract submitted PCM.
     @discardableResult private func configure(_ run: PlaybackRun, mode newMode: QueueMode, item: String? = nil, resumeAtBoundary: Bool = false) -> Bool {
-        let updated = run.configure(catalog: catalog, canonical: canonical, mode: newMode,
+        let updated = run.configure(catalog: catalog, canonical: playableOrder, mode: newMode,
             nextPolicy: nextPolicy(for: newMode), item: item, blocked: blocked, resumeAtBoundary: resumeAtBoundary)
         guard updated.applied else { return false }
         structureDirty = structureDirty || mode != newMode
@@ -663,6 +690,9 @@ private final class PlaybackRun: @unchecked Sendable {
     private let diagnostics: NativeDiagnostics?
     let budget: MediaRanges.Budget
     private let pool: MediaPool
+    private var pinLeases = [String: LocalMP3]()
+    func lease(for key: String) -> LocalMP3? { lock.withLock { pinLeases[key] } }
+    private let pinStore: PlaybackStore?
     private let lookup: NativePlayback.Lookup
     private let log = Logger(subsystem: "me.unto.oneplay.music", category: "Playback")
     private let lock = NSLock()
@@ -766,12 +796,14 @@ private final class PlaybackRun: @unchecked Sendable {
         }
     }
 
-    init(tracks: [Recording], cursor: PlayCursor, restoredNext: PlayCursor?, advanced: Bool, mode: QueueMode, nextPolicy: NextPolicy, position: Position, paused: Bool, seekItem: String?, duration: MP3RangeDecoder.Length, admitted: MediaLocation?, lookup: @escaping NativePlayback.Lookup, captureURL: URL, diagnostics: NativeDiagnostics?, pool: MediaPool, budget: MediaRanges.Budget, signalChange: @escaping @Sendable (Bool) -> Void) {
+    init(tracks: [Recording], cursor: PlayCursor, restoredNext: PlayCursor?, advanced: Bool, mode: QueueMode, nextPolicy: NextPolicy, position: Position, paused: Bool, seekItem: String?, duration: MP3RangeDecoder.Length, admitted: MediaLocation?, pinStore: PlaybackStore?, lease: LocalMP3?, lookup: @escaping NativePlayback.Lookup, captureURL: URL, diagnostics: NativeDiagnostics?, pool: MediaPool, budget: MediaRanges.Budget, signalChange: @escaping @Sendable (Bool) -> Void) {
         self.admitted = admitted
         self.signalChange = signalChange
         self.budget = budget
         self.pool = pool
         self.tracks = tracks
+        self.pinStore = pinStore
+        if let lease, let key = tracks[cursor.index].indexed?.fileKey { pinLeases[key] = lease }
         self.startCursor = cursor
         self.mode = mode
         self.nextPolicy = nextPolicy
@@ -983,7 +1015,13 @@ private final class PlaybackRun: @unchecked Sendable {
     }
 
     private func report(_ text: String, terminal state: String? = nil) {
-        lock.withLock { message = text; terminal = state }
+        lock.withLock {
+            message = text
+            terminal = state
+            // A finished footer has no decoder. Explicit cancellation may be handing a
+            // descriptor to its replacement in the caller's seek/next critical section.
+            if state != nil && (!cancelled || state == "error") { pinLeases.removeAll() }
+        }
         if state != nil { signalChange(false) }
         log.notice("\(text, privacy: .public)")
     }
@@ -1388,7 +1426,12 @@ private final class PlaybackRun: @unchecked Sendable {
                 log.notice("ready item=\(nextIndex + 1) prefixFrames=\(cut-head.audible.lowerBound) specBytes=\(incoming?.specBytes ?? 0) overlap=\(mix) boundary=\(boundary)")
                 try wait(until: boundary + 1)
                 lock.withLock {
-                    if let successor { anchor = successor; self.successor = nil }
+                    if let successor {
+                        anchor = successor
+                        self.successor = nil
+                        let promoted = tracks[anchor.index].indexed?.fileKey
+                        pinLeases = pinLeases.filter { $0.key == promoted }
+                    }
                 }
                 signalChange(false)
                 source?.cancelAndDrain()
@@ -1435,7 +1478,23 @@ private final class PlaybackRun: @unchecked Sendable {
     private func open(_ recording: Recording, ordinal: Int, input: Int, speculative: Bool, admitted: MediaLocation? = nil, successorWindow: MediaRanges.SuccessorWindow? = nil, awaitDemand: (() throws -> Void)? = nil) throws -> (MediaRanges?, MP3RangeDecoder) {
         let track: IndexedTrack
         switch recording {
-        case .oneDrive(let indexed): track = indexed
+        case .oneDrive(let indexed):
+            track = indexed
+            if let file = lease(for: track.fileKey) { return (nil, try MP3RangeDecoder(bytes: file.size, read: file.read)) }
+            if let pinStore {
+                do {
+                    let url = pinStore.pinURL(track.fileKey)
+                    let file = try LocalMP3(url)
+                    // A streaming seek remains on its admitted version when a newer pin has arrived.
+                    if admitted == nil || (try? PinReceipt.read(from: url))?.version == admitted?.etag {
+                        let decoder = try MP3RangeDecoder(bytes: file.size, read: file.read)
+                        lock.withLock { pinLeases[track.fileKey] = file }
+                        return (nil, decoder)
+                    }
+                } catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {
+                    // A cache miss falls through to the existing streaming reader.
+                }
+            }
         #if DEBUG
         case .local(let url):
             let file = try LocalMP3(url)
@@ -1523,11 +1582,11 @@ private final class PlaybackRun: @unchecked Sendable {
     }
 }
 
-#if DEBUG
 /// One decoder owns this file descriptor and the picker access grant through its last synchronous byte read.
 private final class LocalMP3 {
     private let url: URL
     private let scoped: Bool
+    private let lock = NSLock()
     private let file: FileHandle
     let size: Int64
 
@@ -1549,8 +1608,9 @@ private final class LocalMP3 {
     }
 
     func read(_ offset: Int64, _ count: Int) throws -> Data {
-        try file.seek(toOffset: UInt64(offset))
-        return try file.read(upToCount: count) ?? Data()
+        try lock.withLock {
+            try file.seek(toOffset: UInt64(offset))
+            return try file.read(upToCount: count) ?? Data()
+        }
     }
 }
-#endif

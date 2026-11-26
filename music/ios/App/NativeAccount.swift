@@ -6,7 +6,7 @@ import OSLog
 
 /// The only errors that may cross the page boundary. Underlying SDK and HTTP errors can contain signed URLs.
 enum NativeAccountError: String, LocalizedError {
-    case interactionRequired, cancelled, wrongAccount, unbound, invalidRequest, unavailable, cleanupPending, forbidden, transient
+    case interactionRequired, cancelled, wrongAccount, unbound, invalidRequest, unavailable, cleanupPending, forbidden, transient, unavailableOffline
     var errorDescription: String? { rawValue }
 
     static func classify(_ error: Error) -> Self {
@@ -45,7 +45,7 @@ struct AccountRecord: Codable, Equatable {
 
 /// A replacement identifies the Graph grant that the CDN rejected, including after an HTTP redirect.
 enum MediaLookup: Sendable {
-    case reuse(MediaLocation? = nil), replace(MediaLocation), force
+    case reuse(MediaLocation? = nil), replace(MediaLocation), fresh, force
 }
 
 @MainActor final class NativeAccount {
@@ -602,6 +602,8 @@ enum MediaLookup: Sendable {
             forceRefresh = false
         case .replace(let rejected):
             if let known, known !== rejected, !known.isRejected { return known }
+            forceRefresh = false
+        case .fresh:
             forceRefresh = false
         case .force:
             forceRefresh = true

@@ -28,6 +28,7 @@
     "test/unit/search.test.ts",
     "test/unit/indexer.test.ts",
     "test/unit/native-library.test.ts",
+    "test/unit/native-pins.test.ts",
     "test/unit/shares.test.ts",
     "test/unit/playback-engine.test.ts",
     "test/unit/media-title.test.ts",

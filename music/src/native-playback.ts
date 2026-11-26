@@ -248,10 +248,10 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
                 await native.playback('queueChunk', {build, offset, tracks: tracks.slice(offset, offset + 512)});
             }
             if (generation === buildGeneration) await commit({build});
-        } catch {
+        } catch (error) {
             if (generation === buildGeneration) {
                 pendingRevision = action === 'revise';
-                showError('The player could not load this queue. Try again.');
+                showError(String(error).includes('unavailableOffline') ? 'No offline tracks are available here.' : 'The player could not load this queue. Try again.');
                 if (action === 'revise') throw new Error('Queue revision was not acknowledged');
             }
         } finally {

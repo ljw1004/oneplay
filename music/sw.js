@@ -23,6 +23,7 @@ const APP_SHELL = [
     './dist/index.js',
     './dist/auth.js',
     './dist/native-library.js',
+    './dist/native-pins.js',
     './dist/native-playback.js',
     './dist/db.js',
     './dist/downloads.js',

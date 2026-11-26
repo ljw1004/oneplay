@@ -82,6 +82,89 @@ private final class TestAudioCDN: URLProtocol {
     private let drive = Data(#"{"id":"library"}"#.utf8)
     private let batch = "https://graph.microsoft.com/v1.0/$batch"
 
+    /// Drive the actual favorite menu against the native transfer delegate, then replace WebKit
+    /// without network and start the same favorite through the library's Play control.
+    func testBundledPinActionBarAndOfflineReopen() async throws {
+        let tone = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "ScaleTone", withExtension: "mp3"))
+        let size = try Data(contentsOf: tone).count
+        let account = try NativeAccount(recordFile: record, identity: TestIdentity()) { [self] req in
+            if req.url?.path == "/v1.0/me/drive" { return try response(req, data: drive) }
+            if req.url?.path == "/v1.0/drives/library/items/a" {
+                let media: [String: Any] = ["id": "a", "size": size, "eTag": "v", "@microsoft.graph.downloadUrl": "https://pin.test/tone"]
+                return try response(req, data: JSONSerialization.data(withJSONObject: media))
+            }
+            return try response(req, status: 404, data: Data())
+        }
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [PinCDN.self]
+        let controller = LibraryController(account: account, store: .nonPersistent(), pinConfiguration: config)
+        let host = try XCTUnwrap((UIApplication.shared.delegate as? AppDelegate)?.library)
+        host.addChild(controller)
+        host.view.addSubview(controller.view)
+        controller.didMove(toParent: host)
+        defer {
+            controller.player?.stop()
+            controller.detachPage()
+            controller.willMove(toParent: nil)
+            controller.view.removeFromSuperview()
+            controller.removeFromParent()
+        }
+        var page = try await readyPage(in: controller)
+        _ = try await page.callAsyncJavaScript("""
+            const {dbPut} = await import('./dist/db.js');
+            localStorage.setItem('account_info', JSON.stringify({driveId:'library',displayName:'Listener'}));
+            await dbPut('index:library',{kind:'MusicData',count:1,size:20,folder:{id:'album',children:{'First.mp3':{id:'a'}}}});
+            await dbPut('favorites',{updatedAt:1,favorites:[{kind:'playlist',id:'reader',name:'Offline album',members:[
+                {driveId:'library',sourceRootKey:'library',itemId:'a',isFolder:false,path:['First.mp3']}]}]});
+            """, arguments: [:], in: nil, contentWorld: .page)
+        _ = try await account.signIn(presenting: controller)
+        page.reload()
+        page = try await readyPage(in: controller, excluding: page)
+        func openDialog() async throws {
+            _ = try await page.callAsyncJavaScript("""
+                if (!window._testTree) throw new Error('Missing library: '+JSON.stringify(window.__ONEPLAY_MUSIC_LOGS?.slice(-18)));
+                window._testTree.setSelectedPath(['OnePlay Music']);
+                const row = [...document.querySelectorAll('.tree-row')].find(row => row.textContent.includes('Offline album'));
+                if (!row) throw new Error('Missing favorite: ' + document.body.innerText.slice(0,600));
+                row.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true}));
+                document.querySelector('#action-bar .right-btn').click();
+                const action = [...document.querySelectorAll('.action-dropdown button')].find(b => /available offline/i.test(b.textContent));
+                action.click();
+                """, arguments: [:], in: nil, contentWorld: .page)
+        }
+        try await openDialog()
+        _ = try await page.evaluateJavaScript("document.querySelector('.modal .modal-cancel').click()")
+        // A successful account request is native signed-in evidence, even when other sync routes are unavailable.
+        _ = try await account.media(driveID: "library", itemID: "a")
+        let deadline = ContinuousClock.now + .seconds(8)
+        while !controller.pins.completeKeys.contains("library:a"), .now < deadline { try await Task.sleep(for: .milliseconds(30)) }
+        let before = try await page.evaluateJavaScript("JSON.stringify([window._testFavorites.getAll().map(f=>[f.name,f.offlinePin]),window._testAuth.getEvidence(),document.querySelector('.modal')?.innerText])")
+        XCTAssertEqual(controller.pins.completeKeys, ["library:a"], "snapshot=\(controller.pins.snapshot(after:nil)), page=\(before ?? "")")
+        account.updateNetworkPath(offline: true, interfaces: [])
+        page.reload()
+        page = try await readyPage(in: controller, excluding: page)
+        try await openDialog()
+        let ready = ContinuousClock.now + .seconds(3)
+        var progress = ""
+        repeat {
+            progress = try await page.evaluateJavaScript("document.querySelector('.offline-progress').textContent") as? String ?? ""
+            if progress.contains("✓") { break }
+            try await Task.sleep(for: .milliseconds(25))
+        } while .now < ready
+        XCTAssertTrue(progress.contains("1 track") && progress.contains("✓"), progress)
+        let shot = XCTAttachment(image: try await page.takeSnapshot(configuration: nil))
+        shot.name = "Native offline favorite after WebKit relaunch"
+        shot.lifetime = .keepAlways
+        add(shot)
+        _ = try await page.callAsyncJavaScript("""
+            document.querySelector('.modal-close').click();
+            await window._testTree.onPlayClick(['OnePlay Music','fav:reader']);
+            """, arguments: [:], in: nil, contentWorld: .page)
+        let play = ContinuousClock.now + .seconds(5)
+        while controller.player?.snapshot["state"] as? String != "playing", .now < play { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertEqual(controller.player?.snapshot["state"] as? String, "playing", controller.player?.status ?? "")
+    }
+
     func testOfflineColdStartAndBothInterruptedCleanupPoints() async throws {
         try pair()
         let id = TestIdentity()

@@ -4,6 +4,16 @@ import UIKit
 @main final class AppDelegate: UIResponder, UIApplicationDelegate {
     // The account and audio session live through a WebKit process replacement.
     lazy var library = LibraryController()
+
+    func application(_ application: UIApplication, handleEventsForBackgroundURLSession identifier: String,
+                     completionHandler: @escaping () -> Void) {
+        guard identifier == OfflinePins.identifier else { completionHandler(); return }
+        library.pins.onFinishEvents = { [weak self] in
+            self?.library.pins.onFinishEvents = nil
+            completionHandler()
+        }
+        library.startServices()
+    }
 }
 
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
@@ -24,7 +34,9 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     func sceneDidBecomeActive(_ scene: UIScene) {
-        (window?.rootViewController as? LibraryController)?.signalPendingDiagnostics()
+        let library = window?.rootViewController as? LibraryController
+        library?.pins.resumePending()
+        library?.signalPendingDiagnostics()
     }
 
     func scene(_ scene: UIScene, openURLContexts contexts: Set<UIOpenURLContext>) { forwardCallback(contexts) }

@@ -1,5 +1,6 @@
 import { createAuth, isAbortError, type EvidenceState } from './auth.js';
 import { showModal } from './modal.js';
+import { createNativePins } from './native-pins.js';
 import { attachNativePlayback } from './native-playback.js';
 import { connectBundledLibrary } from './native-library.js';
 import { buildFavoritePlaybackStorageValue, parseFavoritePlaybackStorageValue, parseGlobalPlaybackSave,
@@ -171,7 +172,8 @@ auth.onEvidenceChange = (newState, prevState) => {
         else if (prevState === 'evidence:not-online') sync.requestPullFromOneDrive('online').catch(logCatch('native online pull'));
     }
     downloads?.handleEvidenceTransition();
-    computeAndPushOfflineState();
+    if (nativePins) { renderNativePins(true); nativePins.refresh().catch(logCatch('offline evidence')); }
+    else computeAndPushOfflineState();
     settings?.updateAuthAction(newState);
 };
 
@@ -184,6 +186,7 @@ let nativePlayer: ReturnType<typeof attachNativePlayback> | undefined;
 let favorites: Favorites | undefined;
 let select: Select | undefined;
 let downloads: Downloads | undefined;
+let nativePins: ReturnType<typeof createNativePins> | undefined;
 let settings: SettingsView | undefined;
 let timerDuration: TimerDuration = '30m';
 let themePreference: ThemePreference = 'light';
@@ -241,6 +244,7 @@ const sync = createIndexSync({
     getPlayback: () => playback,
     onPlaybackRootsChange: () => {
         ++nativeLibraryGeneration;
+        if (nativePins) computeAndPushOfflineState();
         nativePlayer?.refreshLibraryQueue().catch(logCatch('queue refresh'));
         if (playback) {
             playback.refreshLibraryQueue().then(restorePlaybackState).catch(logCatch('browser queue refresh'));
@@ -274,7 +278,7 @@ function invalidateSearchData(): void {
 function runSearchAndPushIntoTree(reason: SearchReason): void {
     if (!tree || !favorites || !searchOpen || !tree.isSearchModeOpen()) return;
     const roots = tree.getRoots();
-    const snapshot = downloads?.getSnapshot();
+    const snapshot = (nativePins ?? downloads)?.getSnapshot();
     const downloadedTrackKeys = snapshot?.downloadedKeys ?? new Set<string>();
     const evidenceState = snapshot?.evidence ?? auth.getEvidence();
     const deniedRootKeys = shares?.getDeniedRootKeys() ?? new Set<string>();
@@ -635,11 +639,6 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
                         }} : undefined);
             let selection = 0;
             const playAlbum = async (folderPath: readonly string[], trackPath?: readonly string[]) => {
-                const evidence = native.getEvidence();
-                if (evidence === 'evidence:not-online' || evidence === 'evidence:signed-out') {
-                    showToastMessage('Connect to OneDrive to play this track.');
-                    return;
-                }
                 const intent = ++selection;
                 nativePlayer!.beginSelection();
                 let generation = nativeLibraryGeneration;
@@ -761,8 +760,39 @@ let prevIconsJson = '';
 let prevEvidence: EvidenceState = 'no-evidence';
 let prevOfflineHadPending = false;
 
-function computeAndPushOfflineState(): void {
+/** Tree/search need new rows only when their playable set or a visible badge changes. */
+function renderNativePins(filesChanged: boolean): void {
+    if (!nativePins || !tree || !favorites) return;
+    const snap = nativePins.getSnapshot();
+    const roots = tree.getRoots();
+    const icons = new Map<string, 'complete' | 'paused' | 'downloading'>();
+    for (const favorite of favorites.getAll()) {
+        if (!favorite.offlinePin) continue;
+        const count = nativePins.favoriteProgress(favorite.id);
+        icons.set(favorite.id, classifyOfflineBadgeState(!count?.complete || count.downloaded < count.total,
+            snap.evidence, favorite.offlinePin.paused, snap.overQuota, !!snap.lastError));
+    }
+    const limited = snap.evidence === 'evidence:not-online' || snap.evidence === 'evidence:signed-out';
+    const repaint = prevEvidence !== snap.evidence || (limited && filesChanged);
+    tree.setEvidence(snap.evidence, path => {
+        const ids = resolveTrackIds(path, accountData, favorites!, roots);
+        return !!ids && snap.downloadedKeys.has(ids.driveId + ':' + ids.itemId);
+    });
+    const signature = JSON.stringify([...icons]);
+    tree.setOfflineIcons(icons);
+    if (repaint || prevIconsJson !== signature) tree.render();
+    prevIconsJson = signature;
+    prevEvidence = snap.evidence;
+    if (repaint) { invalidateSearchData(); runSearchAndPushIntoTree('offline-state'); }
+    select?.updateOfflineModal();
+}
+
+function computeAndPushOfflineState(): void | Promise<void> {
     if (!tree || !favorites) return;
+    if (nativePins) {
+        return nativePins.publishOwners([...favorites.getAll()], new Map(tree.getRoots()), new Set(shares?.getDeniedRootKeys()),
+            favorites.hasLoadedMembership?.() === true).catch(error => { logCatch('offline pin membership')(error); });
+    }
     if (!downloads) {
         if (native && prevEvidence !== native.getEvidence()) {
             prevEvidence = native.getEvidence();
@@ -871,8 +901,10 @@ async function ensureFavorites(): Promise<void> {
             // onChange: sync favorite roots into tree and re-render
             if (tree) {
                 ++nativeLibraryGeneration;
-                await nativePlayer?.refreshLibraryQueue(true);
                 tree.setFavorites(favorites!);
+                if (nativePins) await nativePins.publishOwners([...favorites!.getAll()], new Map(tree.getRoots()),
+                    new Set(shares?.getDeniedRootKeys()), favorites!.hasLoadedMembership?.() === true);
+                await nativePlayer?.refreshLibraryQueue(true);
                 if (select) select.setRoots(tree.getRoots());
                 // Update playback context so logical path resolution uses fresh data
                 if (playback) {
@@ -880,11 +912,11 @@ async function ensureFavorites(): Promise<void> {
                     await playback.refreshLibraryQueue(true);
                     await restorePlaybackState();
                 }
-                // Recompute offline state (favorites may have changed offlinePin)
-                computeAndPushOfflineState();
+                // An acknowledged local edit includes publishing the resulting pin owners.
+                if (!nativePins) await computeAndPushOfflineState();
             }
         };
-        favorites = createFavorites({authFetch: auth.fetch, dbGet, dbPut, fenceQueueEdit: async () => {
+        favorites = createFavorites({authFetch: auth.fetch, dbGet, dbPut, fencePinEdit: native ? () => nativePins?.fenceEdit() : undefined, fenceQueueEdit: async () => {
             ++nativeLibraryGeneration;
             return playback ? playback.fenceQueueEdit() : nativePlayer?.fenceQueueEdit();
         }}, origin => {
@@ -969,6 +1001,11 @@ function wireFavoritesUi(): void {
     }
 
     // Initialize downloads module (once, after favorites + tree + playback + select)
+    if (native && !nativePins) {
+        nativePins = createNativePins(native, renderNativePins);
+        select.setDownloads(nativePins);
+        nativePins.refresh().catch(logCatch('offline inventory'));
+    }
     if (!downloads && browserAuth) {
         downloads = createDownloads({
             authFetch: auth.fetch,

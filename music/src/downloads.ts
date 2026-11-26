@@ -76,6 +76,10 @@ export interface DownloadSnapshot {
 }
 
 /** Public API returned by createDownloads. */
+export type DownloadControls = Pick<Downloads, 'getSnapshot' | 'setQuota' | 'clearError'> & {
+    favoriteProgress?(id: string): { total: number; downloaded: number; bytes: number; complete: boolean } | undefined;
+};
+
 export interface Downloads {
     /**
      * Pushes the set of track keys that should be downloaded (activeKeys)

@@ -71,6 +71,8 @@
 
 ## Offline-first and persistence
 
+- Construct persistent directory URLs with an explicit directory flag. Foundation may otherwise infer a different trailing slash after the directory exists. OnePlay treated the second open of the same account directory as a different account during offline WebKit relaunch.
+
 - **Keep pre-render state synchronous and cache state asynchronous.** Use localStorage for instant UI restore; IndexedDB for heavy cached data.
 - **Separate high-frequency and low-frequency persisted fields.** Avoid rewriting large state blobs for tiny updates.
 - **Multiple writers to shared persisted objects must preserve unknown fields.** Read-modify-write, never overwrite with defaults.

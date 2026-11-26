@@ -29,7 +29,7 @@ import { setOfflineBadge, type FolderPath, type TreeView } from './tree.js';
 import { type Favorites, type RootsMap, type PlaylistMember, type ItemRef } from './favorites.js';
 import { walkFolder } from './indexer.js';
 import { log, logError } from './logger.js';
-import { type Downloads, QUOTA_OPTIONS_GB, classifyOfflineBadgeState } from './downloads.js';
+import { type DownloadControls, QUOTA_OPTIONS_GB, classifyOfflineBadgeState } from './downloads.js';
 import { collectPhysicalTracks } from './tracks.js';
 import { isWalkableRoot } from './roots.js';
 import { buildMembersFromSelection as buildMembersFromSelectionFromState } from './select-dialogs.js';
@@ -67,7 +67,7 @@ export interface Select {
     /** Called after a favorites action to navigate the tree to the target favorite. */
     onNavigateToFav: (favId: string) => void;
     /** Set the downloads module reference for offline menu items and modal. */
-    setDownloads(downloads: Downloads): void;
+    setDownloads(downloads: DownloadControls): void;
     /** Updates the offline modal DOM if it's currently open. Called on download state changes. */
     updateOfflineModal(): void;
 }
@@ -103,7 +103,7 @@ export function createSelect(
     let active = false;
     const selectedPaths = new Set<string>();
     let roots = initialRoots;
-    let downloadsRef: Downloads | undefined;
+    let downloadsRef: DownloadControls | undefined;
 
     // -- Action bar DOM (three-zone layout, built once) -----------------------
     // Left: share circle button. Center: selection summary text. Right: dynamic icon.
@@ -522,7 +522,7 @@ export function createSelect(
                 label: isOffline ? 'Available offline…' : 'Make available offline…',
                 onClick: () => {
                     if (active) select.exitSelectMode();
-                    showOfflineModal(favId, isOffline);
+                    showOfflineModal(favId);
                 },
             });
         }
@@ -601,6 +601,7 @@ export function createSelect(
         globalCountText: Text;
         quotaSelect: HTMLSelectElement;
         badgeEl: HTMLSpanElement;
+        title: HTMLElement;
         actionBtn: HTMLButtonElement;
         pauseBtn: HTMLSpanElement;
     } | undefined;
@@ -616,7 +617,7 @@ export function createSelect(
      * Reads favorite data from the favorites module (already available) and
      * download progress from the downloads snapshot API.
      */
-    const showOfflineModal = (favId: string, isCurrentlyOffline: boolean): void => {
+    const showOfflineModal = (favId: string): void => {
         if (!downloadsRef) return;
         const fav = favorites.getAll().find(f => f.id === favId);
         if (!fav) return;
@@ -638,7 +639,6 @@ export function createSelect(
 
         // Title
         const h3 = document.createElement('h3');
-        h3.textContent = isCurrentlyOffline ? 'Available Offline' : 'Make Available Offline';
         modal.appendChild(h3);
 
         // Fav row: name + icon + badge, matching tree row display order
@@ -696,13 +696,12 @@ export function createSelect(
         const actionBtn = document.createElement('button');
         actionBtn.type = 'button';
         actionBtn.className = 'modal-cancel';
-        actionBtn.textContent = isCurrentlyOffline ? 'Make unavailable offline' : 'Make available offline';
 
         actions.appendChild(actionBtn);
         modal.appendChild(actions);
 
         // Store references for live updates
-        modalEls = { statsEl, warningEl, globalCountText, quotaSelect, badgeEl, actionBtn, pauseBtn };
+        modalEls = { title: h3, statsEl, warningEl, globalCountText, quotaSelect, badgeEl, actionBtn, pauseBtn };
 
         const close = (): void => {
             backdrop.remove();
@@ -715,10 +714,15 @@ export function createSelect(
         backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
 
         actionBtn.addEventListener('click', async () => {
-            if (isCurrentlyOffline) {
-                await favorites.setOfflinePin(favId, undefined);
-            } else {
-                await favorites.setOfflinePin(favId, { paused: false });
+            const current = favorites.getAll().find(f => f.id === favId);
+            if (!current) return;
+            actionBtn.disabled = true;
+            try { await favorites.setOfflinePin(favId, current.offlinePin ? undefined : {paused: false}); }
+            catch (error) {
+                logError('Could not save offline pin: ' + String(error));
+                warningEl.textContent = 'Could not save the download setting. Try again.';
+                actionBtn.disabled = false;
+                return;
             }
             close();
         });
@@ -726,6 +730,10 @@ export function createSelect(
         pauseBtn.addEventListener('click', async () => {
             const currentFav = favorites.getAll().find(f => f.id === favId);
             if (!currentFav?.offlinePin) return;
+            if (downloadsRef!.getSnapshot().lastError && !currentFav.offlinePin.paused) {
+                downloadsRef!.clearError();
+                return;
+            }
             const wasPaused = currentFav.offlinePin.paused;
             if (wasPaused) downloadsRef!.clearError(); // resume also clears latched error
             await favorites.setOfflinePin(favId, { paused: !wasPaused });
@@ -743,18 +751,16 @@ export function createSelect(
         if (!modalEls || !modalFavId || !downloadsRef) return;
         const { statsEl, warningEl, globalCountText, quotaSelect, badgeEl, pauseBtn } = modalEls;
         const fav = favorites.getAll().find(f => f.id === modalFavId);
-        if (!fav) return;
-
-        // Compute per-favorite track keys (one-time per update)
-        const tracks = collectPhysicalTracks(modalFavId, favorites, roots);
-        const trackKeys = new Set(tracks.map(t => `${t.driveId}:${t.itemId}`));
-        const totalTracks = trackKeys.size;
+        if (!fav) { modalEls.actionBtn.disabled = true; pauseBtn.remove(); return; }
+        modalEls.title.textContent = fav.offlinePin ? 'Available Offline' : 'Make Available Offline';
+        modalEls.actionBtn.textContent = fav.offlinePin ? 'Make unavailable offline' : 'Make available offline';
 
         const snap = downloadsRef.getSnapshot();
-        const downloadedCount = Array.from(trackKeys).filter(k => snap.downloadedKeys.has(k)).length;
-
-        // Stats line: "28 tracks" | "Downloading 3/28 tracks ⏸︎" | "Paused 3/28 tracks ▶︎" | "28 tracks, 43 Mb ✓"
-        const hasMissingTracks = downloadedCount < totalTracks;
+        const cached = downloadsRef.favoriteProgress?.(modalFavId);
+        const keys = downloadsRef.favoriteProgress ? [] : collectPhysicalTracks(modalFavId, favorites, roots).map(t => t.driveId + ':' + t.itemId);
+        const totalTracks = cached?.total ?? keys.length;
+        const downloadedCount = cached?.downloaded ?? keys.filter(k => snap.downloadedKeys.has(k)).length;
+        const hasMissingTracks = downloadedCount < totalTracks || cached?.complete === false;
         const incomplete = !!fav.offlinePin && hasMissingTracks;
         const trackLabel = `${totalTracks} track${totalTracks !== 1 ? 's' : ''}`;
         const iconState = classifyOfflineBadgeState(
@@ -768,12 +774,14 @@ export function createSelect(
         const isDownloading = iconState === 'downloading';
 
         statsEl.textContent = '';
-        if (!fav.offlinePin) {
+        if (downloadsRef.favoriteProgress && (!cached || (!cached.complete && !cached.total))) {
+            statsEl.textContent = 'Waiting for the library…';
+        } else if (!fav.offlinePin) {
             statsEl.textContent = trackLabel;
-        } else if (downloadedCount === totalTracks) {
+        } else if (!hasMissingTracks) {
             // Estimate this favorite's bytes proportionally from global totals
-            const favBytes = snap.downloadedKeys.size > 0
-                ? snap.totalBytes * downloadedCount / snap.downloadedKeys.size : 0;
+            const favBytes = cached?.bytes ?? (snap.downloadedKeys.size > 0
+                ? snap.totalBytes * downloadedCount / snap.downloadedKeys.size : 0);
             statsEl.textContent = `${trackLabel}, ${formatBytes(favBytes)} \u2713`;
         } else if (isDownloading) {
             pauseBtn.textContent = '\u2002\u23F8\uFE0E'; // ⏸︎

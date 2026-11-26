@@ -79,7 +79,6 @@ async function exercise({pinnedCount,tracksPerAlbum,seedCount,bytesPerTrack}) {
         localStorage.setItem('quota-test-pending', pending);
         window._testTree.setSelectedPath(['OnePlay Music','quota']);
         document.querySelector('#children .folder').dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true}));
-        document.querySelector('#action-bar .right-btn').click();
         document.querySelector('.action-dropdown button').click();
         await until(() => document.querySelector('.offline-warning')?.textContent === 'Reached storage limit', 'Warning missing');
         const quota = document.querySelector('.offline-global select');

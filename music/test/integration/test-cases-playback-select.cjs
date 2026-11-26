@@ -805,7 +805,6 @@ module.exports = {
         await favRow.click({ button: "right" });
         await waitForSelectMode(page, true);
 
-        await page.locator("#action-bar .right-btn").click();
         await waitForActionDropdown(page);
 
         const offlineItem = page.locator(".action-dropdown button", {
@@ -845,7 +844,6 @@ module.exports = {
         const openOfflineModal = async () => {
             await favRow.click({ button: "right" });
             await waitForSelectMode(page, true);
-            await page.locator("#action-bar .right-btn").click();
             await waitForActionDropdown(page);
             await page.locator(".action-dropdown button", {
                 hasText: /Available offline|Make available offline/i,
@@ -899,7 +897,8 @@ module.exports = {
         await clickAccount(page);
         await enterSelectViaRightClick(page);
 
-        await page.locator("#action-bar .share-btn").click();
+        const share = page.locator("#action-bar .share-btn");
+        if (await share.getAttribute("aria-expanded") !== "true") await share.click();
         await waitForActionDropdown(page);
         await page.locator(".action-dropdown button", { hasText: "Put in new playlist" }).first().click();
 
@@ -949,7 +948,6 @@ module.exports = {
         await playlistRow.click({ button: "right" });
         await waitForSelectMode(page, true);
 
-        await page.locator("#action-bar .right-btn").click();
         await waitForActionDropdown(page);
         await page.locator(".action-dropdown button", { hasText: "Rename" }).first().click();
         await waitForSelectMode(page, false);
@@ -1045,7 +1043,8 @@ module.exports = {
         await page.locator("#children .tree-row", { hasText: targetName }).click({ button: "right" });
         await waitForSelectMode(page, true);
         // Click share button to open popup
-        await page.locator("#action-bar .share-btn").click();
+        const share = page.locator("#action-bar .share-btn");
+        if (await share.getAttribute("aria-expanded") !== "true") await share.click();
         await waitForActionDropdown(page);
         // Click "Add as Shortcut" in the popup
         const hasShortcutOption = await page.locator(".action-dropdown button", { hasText: "Add as Shortcut" }).count();

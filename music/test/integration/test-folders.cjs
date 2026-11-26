@@ -106,7 +106,6 @@ async function seedFolderDevice(page, {cloud = {}, holdSecond = false, scale = f
     const right = page.getByRole('button', {name:'Folder actions', exact:true});
     const folderMenu = async row => {
         await row.click({button:'right'});
-        await right.click();
         return page.locator('.action-dropdown');
     };
     const choose = async (row, label, confirm = true) => {
@@ -124,6 +123,64 @@ async function seedFolderDevice(page, {cloud = {}, holdSecond = false, scale = f
 }
 
 module.exports = {
+    /** Use real button clicks so capture-phase pointerdown and the ensuing click are both exercised. */
+    async 'folders: action menus open on selection entry and toggle at the same anchor'(page) {
+        const {child} = await seedFolderDevice(page);
+        const menu = page.locator('.action-dropdown');
+        const share = page.locator('.share-btn');
+        const favorite = page.getByRole('button', {name:'Favorite actions'});
+        // In landscape the popup can appear under the original finger. Releasing
+        // over a command must leave that command available for a separate tap.
+        await page.setViewportSize({width:640, height:300});
+        const touch = await page.context().newCDPSession(page);
+        await touch.send('Emulation.setTouchEmulationEnabled', {enabled:true});
+        const point = await child('Keep').evaluate(row => {
+            const r = row.getBoundingClientRect();
+            return {x:r.right - 100, y:r.y + r.height / 2};
+        });
+        await touch.send('Input.dispatchTouchEvent', {type:'touchStart', touchPoints:[point]});
+        await menu.getByRole('button', {name:'Rename…'}).waitFor();
+        await menu.evaluate(async el => Promise.all(el.getAnimations().map(a => a.finished)));
+        assert.ok(await page.evaluate(({x,y}) => !!document.elementFromPoint(x,y)?.closest('.action-dropdown button'), point));
+        await touch.send('Input.dispatchTouchEvent', {type:'touchEnd', touchPoints:[]});
+        await touch.detach();
+        await page.setViewportSize({width:390, height:844});
+        await menu.getByRole('button', {name:'Rename…'}).waitFor();
+        assert.equal(await favorite.getAttribute('aria-expanded'), 'true');
+        await favorite.click();
+        assert.equal(await menu.count(), 0);
+        await favorite.click();
+        await menu.getByRole('button', {name:'Rename…'}).waitFor();
+        await share.click();
+        await menu.getByRole('button', {name:/Put in new playlist/}).waitFor();
+        assert.equal(await menu.count(), 1);
+        await share.click();
+        assert.equal(await menu.count(), 0);
+        await page.locator('#select-cancel').click();
+
+        await child('Keep').click();
+        const member = page.locator('#children .tree-row').first();
+        await member.click({button:'right'});
+        assert.equal(await share.getAttribute('aria-expanded'), 'true');
+        assert.ok(await page.getByRole('button', {name:'Delete selected items'}).isVisible());
+        await page.locator('#select-cancel').click();
+        await page.locator('#breadcrumbs .tree-row').first().locator('.row-name').click();
+        await child('OneDrive').click();
+        await child('Books').click();
+        await child('Dune').click();
+        await child('Disc').click();
+        const tracks = page.locator('#children .tree-row.file');
+        await tracks.first().click({button:'right'});
+        assert.equal(await share.getAttribute('aria-expanded'), 'true');
+        await tracks.nth(1).click();
+        assert.equal(await menu.count(), 0);
+        assert.equal(await page.locator('.action-bar-text').textContent(), '2 Tracks');
+        await share.click();
+        await menu.getByRole('button', {name:/Put in new playlist/}).waitFor();
+        await page.locator('#select-cancel').click();
+        assert.equal(await menu.count(), 0);
+    },
+
     /** Exercise production UI and storage against an isolated library with an overlapping playlist and album. */
     async 'folders: folder selection, dotted progress, and offline playback through a surviving playlist'(page) {
         const {child, crumb, pins, choose, right, folderMenu, mediaRequests, releaseSecond} = await seedFolderDevice(page, {holdSecond:true, overlap:true});
@@ -141,7 +198,6 @@ module.exports = {
         }]});
         await page.locator('body.select-mode .tree-row[aria-checked="true"]').waitFor();
         await touch.send('Input.dispatchTouchEvent', {type:'touchEnd', touchPoints:[]});
-        await right.click();
         await page.locator('.action-dropdown').getByRole('button', {name:add, exact:true}).click();
         await page.locator('.modal').getByRole('button', {name:'Close'}).click();
         await touch.detach();
@@ -277,7 +333,6 @@ module.exports = {
         assert.equal(await page.evaluate(() => window._testPlayback.getInfo().track.at(-1)), 'm:0');
         await crumb('OnePlay').locator('.row-name').click();
         await child('Keep').click({button:'right'});
-        await page.getByRole('button', {name:'Favorite actions'}).click();
         await page.getByRole('button', {name:'Available offline…', exact:true}).click();
         await page.locator('.modal').getByRole('button', {name:remove}).click();
         await child('Keep').locator('.offline-badge').waitFor({state:'hidden'});
@@ -627,7 +682,6 @@ module.exports = {
         await device.crumb('OnePlay').locator('.row-name').click();
         const inspect = async () => {
             await device.child('All Archive').click({button:'right'});
-            await page.getByRole('button', {name:'Favorite actions'}).click();
             await page.locator('.action-dropdown').getByRole('button', {name:add}).click();
         };
         await inspect();

@@ -34,7 +34,8 @@ import { buildMembersFromSelection as buildMembersFromSelectionFromState } from 
 import {
     showModal,
     addModalActions,
-    showDropdown,
+    toggleActionDropdown,
+    dismissActionDropdown,
     focusTextInput,
     configureNameTextInput,
 } from './modal.js';
@@ -115,6 +116,8 @@ export function createSelect(
     const shareBtn = document.createElement('button');
     shareBtn.type = 'button';
     shareBtn.className = 'action-btn share-btn';
+    shareBtn.setAttribute('aria-label', 'Playlist and shortcut actions');
+    shareBtn.setAttribute('aria-expanded', 'false');
     // iOS-style share glyph (box with upward arrow) — using SF Symbol equivalent
     shareBtn.innerHTML = '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13V3M10 3L6 7M10 3l4 4"/><path d="M3 10v7a1 1 0 001 1h12a1 1 0 001-1v-7"/></svg>';
 
@@ -231,7 +234,7 @@ export function createSelect(
      * Summary text: "N Tracks" / "N Folders" / "N Selected" / "Select Items".
      * Right button: ☆/♫ for single favorite, trash for multi-delete, hidden otherwise.
      */
-    const syncActionBar = (): void => {
+    const syncActionBar = (): HTMLButtonElement => {
         const count = selectedPaths.size;
         if (count === 0) {
             actionText.textContent = 'Select Items';
@@ -259,26 +262,34 @@ export function createSelect(
 
         const folder = actions.folder;
         const coverage = folder ? tree.getFolderOfflineState(folder).coverage : 'none';
-        rightBtn.onclick = null;
+        let toggleRightMenu: (() => void) | undefined;
         if (actions.moreMemory) {
             const favId = classifyPath([...selectedPaths][0]).favId!;
             const fav = favorites.getAll().find(f => f.id === favId);
             rightBtn.textContent = fav?.kind === 'playlist' ? '♫' : '☆';
             rightBtn.setAttribute('aria-label', 'Favorite actions');
-            rightBtn.onclick = () => showDropdown(rightBtn, buildFavItems(favId));
+            toggleRightMenu = () => toggleActionDropdown(rightBtn, buildFavItems(favId));
         } else if (folder && coverage !== 'covered') {
             rightBtn.innerHTML = '<svg aria-hidden="true" width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M2 5a1 1 0 011-1h5l2 2h7a1 1 0 011 1v8a1 1 0 01-1 1H3a1 1 0 01-1-1z"/></svg>';
             rightBtn.setAttribute('aria-label', 'Folder actions');
-            rightBtn.onclick = () => showDropdown(rightBtn, [{
+            toggleRightMenu = () => toggleActionDropdown(rightBtn, [{
                 label: offlineTitle(coverage !== 'none'),
                 onClick: () => showOfflineModal(folder),
             }]);
         } else if (actions.delete) {
             rightBtn.innerHTML = '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h14M7 5V4a1 1 0 011-1h4a1 1 0 011 1v1M5 5v12a1 1 0 001 1h8a1 1 0 001-1V5"/><path d="M8 9v5M12 9v5"/></svg>';
             rightBtn.setAttribute('aria-label', 'Delete selected items');
-            rightBtn.onclick = showDeleteModal;
         }
+        if (toggleRightMenu) {
+            if (!rightBtn.hasAttribute('aria-expanded')) rightBtn.setAttribute('aria-expanded', 'false');
+        } else {
+            if (rightBtn.getAttribute('aria-expanded') === 'true') dismissActionDropdown();
+            rightBtn.removeAttribute('aria-expanded');
+        }
+        rightBtn.onclick = toggleRightMenu ?? (actions.delete ? showDeleteModal : null);
         rightBtn.classList.toggle('hidden', !rightBtn.onclick);
+        // A playlist member can have a direct Delete button. Entry opens only menus.
+        return toggleRightMenu ? rightBtn : shareBtn;
     };
 
     // -- Modals ---------------------------------------------------------------
@@ -469,7 +480,7 @@ export function createSelect(
             onClick: () => showCreatePlaylistModal(buildMembersFromSelection()),
         });
 
-        showDropdown(shareBtn, items, 'action-dropdown');
+        toggleActionDropdown(shareBtn, items);
     };
 
     /** Builds the dropdown items for a single favorite shown from the action bar. */
@@ -798,16 +809,22 @@ export function createSelect(
         e.preventDefault();
     });
 
-    treeContainer.addEventListener('click', event => {
+    // WebKit and Chromium can retarget the release click to the newly opened menu
+    // when it covers the held coordinate. Consume that gesture anywhere on the page.
+    document.addEventListener('click', event => {
         if (!suppressLongPressClick || event.detail === 0) return;
         suppressLongPressClick = false;
         event.preventDefault();
         event.stopPropagation();
     }, true);
 
+    // A fresh press on any target, including the menu itself, owns its next click.
+    document.addEventListener('pointerdown', e => {
+        if (e.isPrimary) suppressLongPressClick = false;
+    }, true);
+
     treeContainer.addEventListener('pointerdown', (e) => {
         if (!e.isPrimary) return;
-        suppressLongPressClick = false;
         suppressContextMenu = false;
         if (e.button !== 0) return;
         if (active) return; // already in select mode
@@ -875,6 +892,7 @@ export function createSelect(
         getSelectedPaths: () => selectedPaths,
 
         toggle(path) {
+            dismissActionDropdown();
             const key = JSON.stringify(path);
             if (selectedPaths.has(key)) {
                 selectedPaths.delete(key);
@@ -895,8 +913,9 @@ export function createSelect(
             selectedPaths.clear();
             selectedPaths.add(JSON.stringify(path));
             select.onEnterSelect();
-            syncActionBar();
+            const menuButton = syncActionBar();
             tree.setSelectMode(true, selectedPaths);
+            menuButton.click();
             log(`select: entered with ${JSON.stringify(path)}`);
         },
 
@@ -915,6 +934,7 @@ export function createSelect(
             }
             lastLongPressEnterAt = 0;
             lastLongPressEnteredPath = undefined;
+            dismissActionDropdown();
             active = false;
             selectedPaths.clear();
             select.onExitSelect();

@@ -154,29 +154,37 @@ export function addModalActions(
     return confirmBtn;
 }
 
-/** Returns a stable string identity for an element (lazy-assigned). */
-function anchorId(el: HTMLElement): string {
-    if (el.dataset.anchorId) return el.dataset.anchorId;
-    const assigned = String(Math.floor(Math.random() * 1_000_000_000));
-    el.dataset.anchorId = assigned;
-    return assigned;
+/** Only one action-bar dropdown can be open, including during an anchor switch. */
+let closeOpenDropdown: (() => void) | undefined;
+
+export function dismissActionDropdown(): void {
+    closeOpenDropdown?.();
 }
 
-/** Shows a dropdown near anchorEl. Dismissed on outside click or re-tap. */
-export function showDropdown(
-    anchorEl: HTMLElement,
+/** Mount beside the button so the caret and animation follow it through layout changes. */
+export function toggleActionDropdown(
+    anchor: HTMLButtonElement,
     items: Array<{ label: string; danger?: boolean; chevron?: boolean; onClick: () => void }>,
-    className = 'action-dropdown',
 ): void {
-    const existing = document.querySelector(`.${className}`) as HTMLElement | null;
-    const wasAnchor = existing?.dataset.anchorId;
-    existing?.remove();
-
-    if (wasAnchor && wasAnchor === anchorId(anchorEl)) return;
+    const wasOpen = anchor.getAttribute('aria-expanded') === 'true';
+    dismissActionDropdown();
+    if (wasOpen) return;
 
     const dropdown = document.createElement('div');
-    dropdown.className = className;
-    dropdown.dataset.anchorId = anchorId(anchorEl);
+    dropdown.className = 'action-dropdown';
+
+    // The anchor owns its click, including taps on its SVG. Every other outside
+    // press dismisses without consuming the tap that selects the next row.
+    const dismissOutside = (e: PointerEvent): void => {
+        const target = e.target as Node;
+        if (!dropdown.contains(target) && !anchor.contains(target)) dismissActionDropdown();
+    };
+    closeOpenDropdown = () => {
+        document.removeEventListener('pointerdown', dismissOutside, true);
+        anchor.setAttribute('aria-expanded', 'false');
+        dropdown.remove();
+        closeOpenDropdown = undefined;
+    };
 
     for (const item of items) {
         const btn = document.createElement('button');
@@ -186,27 +194,13 @@ export function showDropdown(
         if (item.chevron) btn.classList.add('chevron');
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
-            dropdown.remove();
+            dismissActionDropdown();
             item.onClick();
         });
         dropdown.appendChild(btn);
     }
 
-    const rect = anchorEl.getBoundingClientRect();
-    dropdown.style.visibility = 'hidden';
-    document.body.appendChild(dropdown);
-    const dropH = dropdown.getBoundingClientRect().height;
-    dropdown.style.top = `${rect.top - dropH - 8}px`;
-    const dropW = dropdown.getBoundingClientRect().width;
-    dropdown.style.left = `${Math.min(Math.max(8, rect.left), window.innerWidth - 8 - dropW)}px`;
-    dropdown.style.visibility = '';
-
-    const dismiss = (e: Event): void => {
-        if (dropdown.contains(e.target as Node)) return;
-        dropdown.remove();
-        document.removeEventListener('pointerdown', dismiss, true);
-    };
-    setTimeout(() => {
-        document.addEventListener('pointerdown', dismiss, { capture: true });
-    }, 0);
+    anchor.after(dropdown);
+    anchor.setAttribute('aria-expanded', 'true');
+    document.addEventListener('pointerdown', dismissOutside, true);
 }

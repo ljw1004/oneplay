@@ -177,7 +177,6 @@ private final class TestAudioCDN: URLProtocol {
                 const row = [...document.querySelectorAll('.tree-row')].find(row => row.textContent.includes('Offline album'));
                 if (!row) throw new Error('Missing favorite: ' + document.body.innerText.slice(0,600));
                 row.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true}));
-                document.querySelector('#action-bar .right-btn').click();
                 const action = [...document.querySelectorAll('.action-dropdown button')].find(b => /available offline/i.test(b.textContent));
                 action.click();
                 """, arguments: [:], in: nil, contentWorld: .page)
@@ -209,7 +208,6 @@ private final class TestAudioCDN: URLProtocol {
                 }
                 document.dispatchEvent(new PointerEvent('pointerup', touch));
                 if (!document.body.classList.contains('select-mode')) throw Error('Touch release cleared selection');
-                document.querySelector('#action-bar .right-btn').click();
                 const menu = [...document.querySelectorAll('.action-dropdown button')];
                 const status = action === 'Make available offline' ? 'Make available offline' : 'Available offline…';
                 if (menu.length !== 1 || menu[0].textContent !== status) throw Error('Unexpected folder status menu');

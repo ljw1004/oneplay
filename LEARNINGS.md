@@ -22,6 +22,7 @@
 - **Look for existing code first**. If adding something, can you re-use existing code? or cleanly refactor existing code to serve the new purpose?
 - **Be happy to refactor**. As a good engineer you seek out opportunities to improve the health of the codebase, and are eager to do them.
 - **Keep a narrow fix local.** When two existing calls need the same request option, add it at both call sites. Extract a helper when the fix requires shared logic or the user asks for the refactor.
+- **Give plan reviews a KISS pass.** Ask what can be deleted using an existing contract. If a finding describes a rare case the project already accepts, keep that tradeoff unless the requested feature changes it. M18's general reviews proposed replacing whole-document sync even though M7 explicitly chose it.
 - **Preserve the reasoning in existing comments.** Explanations of invariants, propagation, and recovery are part of the design record. If a sentence needs correction for the task, edit that sentence and preserve the surrounding rationale.
 - **Give surprising options a brief reason at each use.** One line beside each `cache: 'no-store'` explains what a future maintainer could otherwise miss: the folder ETag can stay the same while its recursive size changes.
 

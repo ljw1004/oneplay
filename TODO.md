@@ -32,14 +32,10 @@
 
 ## Attach behaviors to existing folders
 
-The only way we have to set "remember my spot" or "available offline" is through making something a shortcut or a playlist.
+The player has one active playback mode. Each favorite remembers the last mode the listener picked while playing it, independently of “Remember my spot”. Starting the favorite or a song within it restores that mode. A favorite with no saved mode uses the current mode. Playing a folder under OneDrive or a share uses the existing Play button and carries on in the current mode.
 
-Also I don't actually even know where "one/shuffle/all/repeat/timer" is stored. I tried setting it to One while playing a track from OneDrive, then I played a song from a favorite folder (which changed it to Shuffle), then I went back to another folder in OneDrive and played a songe there and it got reset to All.
+Long-press a folder under OneDrive or a share, then tap the folder icon at the bottom right of the action bar. Its actions manage offline availability for the whole subtree. A partially offline folder offers both **Make available offline** and **Make unavailable offline**. The latter removes folder pins on that folder and its descendants. When a pinned ancestor already covers the selected folder, hide the folder menu. The breadcrumb trail shows the pinned ancestor.
 
-My only user so far has asked if the affordance can be made not only to shortcuts/playlists, but also to folders within their OneDrive directly.
+Folder pins sync across the listener’s devices through the same local save and best-effort upload as favorites. An offline edit is saved on the device. A refresh adopts newer cloud data. A later successful favorites save uploads the current local document. Disconnecting a share forgets its folder pins, including if the listener later reconnects the same share. Each device downloads its own files and reports its own progress. Removing the last pin clears its mark. The browser’s existing cache policy can keep the downloaded audio. Show the existing solid down-arrow after the name of the explicitly pinned folder and a dotted down-arrow on its ancestors. Folders covered by a pinned ancestor have no arrow. The dotted arrow has the same animated and hitting-a-wall variants as the solid arrow. Only folder pins contribute to these folder arrows. A track kept by a playlist or shortcut can still play offline after its folder pin is removed.
 
-I'm not quite sure how that would work.
-- Would we allow "make available offline" on per-track basis within OneDrive, or only for folders?
-- Would we maybe display stars next to folders within OneDrive? Or just the "offline" button?
-- I don't know where to anchor the "one/shuffle/all/repeat/timer" choice for folders within OneDrive. Would it be only for starred folders within OneDrive? I can imagine this getting really confusing.
-- Or maybe it would solely be an offline thing? (But then, there'd be the danger that a user might forget which things they had made available offline, buried deep within their OneDrive)
+M18 targets the current browser and bundled iOS apps. There are no existing users to migrate.

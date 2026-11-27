@@ -644,7 +644,7 @@ module.exports = {
         });
         assert(!state[0].hasCheck, "OnePlay Music breadcrumb should not have a checkbox");
         const oneDrive = state.find(r => r.name === "OneDrive");
-        assert(oneDrive && !oneDrive.hasCheck, "OneDrive breadcrumb should not have a checkbox");
+        assert(!oneDrive?.hasCheck, "OneDrive breadcrumb should not have a checkbox");
         const selectableCount = state.filter(r => r.hasCheck).length;
         assert(selectableCount >= 1, `Expected >=1 selectable breadcrumb checkbox, got ${selectableCount}`);
         await exitSelectMode(page);
@@ -656,7 +656,7 @@ module.exports = {
         await clickFirstFolder(page);
         await enterSelectViaRightClick(page);
         const beforeBreadcrumbs = await page.locator("#breadcrumbs .tree-row").count();
-        await page.locator("#breadcrumbs .tree-row[data-path]").nth(2).click();
+        await page.locator("#breadcrumbs .crumb.selected").click();
         await page.waitForFunction(
             () => document.querySelectorAll(".select-check.checked").length === 2,
             undefined,
@@ -677,6 +677,7 @@ module.exports = {
 
     /** OneDrive row is a no-op in select mode (does not navigate or exit). */
     async "select: OneDrive is no-op in select mode"(page) {
+        await ensureFavoritesExist(page);
         await clickAccount(page);
         await clickFirstFolder(page);
         // We're now at depth 3, enter select mode

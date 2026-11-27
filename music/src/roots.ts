@@ -12,6 +12,12 @@
 import { type MusicFolder } from './indexer.js';
 import { type FolderPin, type ItemRef, type Root, type RootsMap } from './favorites.js';
 
+/** A lone OneDrive account supplies the contents of the OnePlay home screen. */
+export function soleAccountKey(roots: RootsMap): string | undefined {
+    const root = roots.size === 1 ? roots.values().next().value : undefined;
+    return root?.type === 'onedrive' ? root.key : undefined;
+}
+
 /** Native retention follows a folder ID through renames within one connection. */
 export function folderPinOwnerId(pin: FolderPin): string {
     return 'folder:' + JSON.stringify([pin.sourceRootKey, pin.connectionId ?? null, pin.itemId]);

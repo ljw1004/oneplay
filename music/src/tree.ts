@@ -21,7 +21,7 @@
  * INVARIANTS:
  * - selectedPath always starts with "OnePlay Music".
  * - selectedPath[1] (if present) is always a key in the `roots` map, or else
- *   resolveFolder resets to the deepest valid prefix.
+ *   resolveFolderAndRepairSelection resets to the deepest valid prefix.
  * - In normal mode, render() is the sole function that mutates the DOM
  *   subtrees of breadcrumbsEl and childrenEl. In search mode, DOM writes are
  *   isolated to renderSearchHeader() and renderSearchResultsRows().
@@ -36,8 +36,17 @@ import { type PlaybackInfo } from './playback.js';
 import { type RootsMap, type Favorite, type Favorites, type FolderPin, isFavRef } from './favorites.js';
 import { type EvidenceState } from './auth.js';
 import { type SearchResult } from './search.js';
-import { folderPinPathKey, isPathDeniedByShare } from './roots.js';
+import { folderPinPathKey, isPathDeniedByShare, soleAccountKey } from './roots.js';
 import { resolvePathTailDisplayName } from './path-names.js';
+
+/** Appends the shared spinner glyph (⟳) used by sync and reindex states. */
+function addSpinner(parent: HTMLElement): void {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.classList.add('sync-spinner');
+    svg.innerHTML = '<circle cx="8" cy="8" r="5"/>';
+    parent.appendChild(svg);
+}
 
 /** Paint the same compact arrow in the trail, child list and offline details.
  * The pause bar and arrow share a viewBox, independently of text line height. */
@@ -160,10 +169,8 @@ export interface TreeView {
     onSearchResultClick: (result: SearchResult) => void;
 }
 
-/** Options for makeRow. Depth-derived flags (isAppRoot, isSelected)
- *  are computed inside makeRow from path. */
+/** The home crumb can represent an account prefix while retaining its root actions. */
 interface RowOptions {
-    readonly name: string;
     readonly isFolder: boolean;
     readonly isBreadcrumb: boolean;
     readonly path: FolderPath;
@@ -223,10 +230,17 @@ export function createTree(
         initialScrollMap ? Object.entries(initialScrollMap) : [],
     );
     let scrollRafPending = false;
-    /** Previous selectedPath, used to decide scroll restoration direction. */
-    let previousPath: FolderPath = selectedPath;
+    /** Physical or logical folder whose children were last drawn and own the scroll offset. */
+    let previousPath: FolderPath | undefined;
     /** Timeout id that clears temporary inline overflow used during FLIP. */
     let restoreOverflowTimeout: number | undefined;
+    /** Capture the list while it still owns the viewport, including navigation before the next scroll frame. */
+    function rememberListScroll(): void {
+        if (!previousPath || container.hidden || !childrenEl.childElementCount) return;
+        scrollMap.set(JSON.stringify(previousPath), {top: childrenEl.scrollTop});
+        if (scrollMap.size > 100) scrollMap.delete(scrollMap.keys().next().value!);
+    }
+
     /** Test-only FLIP-settled sequence for integration tests. */
     const bumpTestTreeFlipSeq = (): void => {
         const w = window as unknown as Record<string, unknown>;
@@ -434,15 +448,17 @@ export function createTree(
         getSelectedPath: () => selectedPath,
         setSelectedPath(path) {
             // Enforce invariant: selectedPath must start with "OnePlay Music".
-            selectedPath = path.length >= 1 && path[0] === 'OnePlay Music' ? path : ['OnePlay Music'];
+            const requested = path[0] === 'OnePlay Music' ? path : ['OnePlay Music'];
+            selectedPath = requested;
             render();
-            view.onPathChange(selectedPath);
+            // render already published any correction, including a folded bare account.
+            if (selectedPath === requested) view.onPathChange(selectedPath);
         },
         revealTrack(path) {
             // A folder transition can temporarily unclip the list, disabling scrolling.
             childrenEl.style.overflow = '';
             const parent = path.slice(0, -1);
-            if (!pathEquals(parent, selectedPath)) view.setSelectedPath(parent);
+            if (!pathEquals(parent, previousPath ?? selectedPath)) view.setSelectedPath(parent);
             view.closeSearchMode();
             trackRow(path)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
         },
@@ -509,6 +525,9 @@ export function createTree(
         },
         render() { render(); },
         openSearchMode(query, scrollTop) {
+            // Search takes ownership of the list. Its scroll offset belongs to its results.
+            rememberListScroll();
+            previousPath = undefined;
             searchModeOpen = true;
             searchQuery = query;
             searchResultsScrollTop = Math.max(0, scrollTop);
@@ -533,7 +552,7 @@ export function createTree(
         onSearchResultClick: (_result) => {},
     };
 
-    // -- resolveFolder -------------------------------------------------------
+    // -- resolveFolderAndRepairSelection -------------------------------------------------------
 
     /**
      * Resolves selectedPath to the list of child entries to display.
@@ -542,14 +561,15 @@ export function createTree(
      * selectedPath to the deepest valid prefix and returns those children.
      *
      * Three cases:
-     * 1. App root (selectedPath.length <= 1): list all roots. Favorites first
+     * 1. App root with multiple roots: list favorites first
      *    (in array order), then OneDrive accounts (sorted by key).
      * 2. Root is shortcut/playlist: delegate to favorites.resolveChildren.
      * 3. Root is OneDrive account: walk MusicFolder tree (existing logic).
      */
-    function resolveFolder(): Array<[string, boolean]> {
+    function resolveFolderAndRepairSelection(homeAccount: string | undefined): Array<[string, boolean]> {
         // App root: list all roots — favorites first, then accounts sorted
-        if (selectedPath.length <= 1) {
+        const rootKey = selectedPath[1] ?? homeAccount;
+        if (rootKey === undefined) {
             const favKeys: Array<[string, boolean]> = [];
             const accountKeys: Array<[string, boolean]> = [];
             const shareKeys: Array<[string, boolean]> = [];
@@ -567,7 +587,6 @@ export function createTree(
         }
 
         // Root level
-        const rootKey = selectedPath[1];
         const root = roots.get(rootKey);
         if (!root) {
             // If data hasn't loaded yet for this root, don't reset — return
@@ -576,7 +595,7 @@ export function createTree(
             // until setAccount(). Both cases: roots map won't have the key yet.
             if (rootKey.startsWith(FAV_PREFIX) ? !favoritesRef : roots.size === 0) return [];
             selectedPath = ['OnePlay Music'];
-            return resolveFolder();
+            return resolveFolderAndRepairSelection(homeAccount);
         }
 
         // Favorites: delegate to favorites module
@@ -589,7 +608,7 @@ export function createTree(
                 // Broken path — reset to deepest valid prefix
                 if (selectedPath.length > 2) {
                     selectedPath = selectedPath.slice(0, -1);
-                    return resolveFolder();
+                    return resolveFolderAndRepairSelection(homeAccount);
                 }
                 return [];
             }
@@ -604,7 +623,7 @@ export function createTree(
             if (!child || !isMusicFolder(child)) {
                 // Path is broken — reset to deepest valid prefix
                 selectedPath = selectedPath.slice(0, i);
-                return resolveFolder();
+                return resolveFolderAndRepairSelection(homeAccount);
             }
             current = child;
         }
@@ -668,8 +687,7 @@ export function createTree(
 
     /**
      * Creates a single tree row element. Used for both breadcrumb rows and
-     * child rows. Derives depth-based flags (isAppRoot, isSelected)
-     * from opts.path to keep callsites simple.
+     * child rows. The first visible crumb owns the home controls.
      *
      * At depth 2, dispatches on root type:
      * - 'onedrive': displays "OneDrive", optional re-index spinner
@@ -682,7 +700,9 @@ export function createTree(
         const isSelected = opts.isBreadcrumb && depth === selectedPath.length;
 
         // Root type dispatch at depth 2
-        const rootEntry = depth >= 2 ? roots.get(opts.path[1]) : undefined;
+        // The OnePlay crumb always navigates home. A sole account supplies its source indicators.
+        const rootKey = isAppRoot ? soleAccountKey(roots) : opts.path[1];
+        const rootEntry = rootKey === undefined ? undefined : roots.get(rootKey);
         const rootType = rootEntry?.type;
         const isAccount = depth === 2 && rootType === 'onedrive';
         const isShareRoot = depth === 2 && rootType === 'share';
@@ -772,9 +792,13 @@ export function createTree(
 
         }
 
+        const reindexing = depth <= 2 && (rootEntry?.type === 'onedrive' || rootEntry?.type === 'share')
+            && rootEntry.reindexing;
+        const showSpinner = !selectModeActive && ((isAppRoot && isSyncing) || reindexing);
+
         // Only a physical route can show a folder pin. A playlist containing the same tracks
         // has its own owner badge, and never marks the corresponding OneDrive album.
-        const keyFor = (subpath: FolderPath) => folderPinPathKey(opts.path[1],
+        const keyFor = (subpath: FolderPath) => folderPinPathKey(rootEntry!.key,
             rootEntry?.type === 'share' ? rootEntry.connectionId : undefined, subpath);
         const folderKey = opts.isFolder && (rootType === 'onedrive' || rootType === 'share')
             ? keyFor(opts.path.slice(2)) : undefined;
@@ -783,10 +807,18 @@ export function createTree(
         const iconState = isFavoriteRoot ? offlineIcons.get(opts.path[1].slice(FAV_PREFIX.length)) : folderIcon?.state;
         // Breadcrumb arrows coalesce to the right. Every ancestor of a pin is
         // partial, so checking the next crumb suffices even in a deep trail.
-        const nextKey = partial && opts.isBreadcrumb && !isSelected ? keyFor(selectedPath.slice(2, depth + 1)) : undefined;
-        if (iconState && !(nextKey && folderIcons.has(nextKey))) {
+        const nextKey = partial && opts.isBreadcrumb && !isSelected ? keyFor(selectedPath.slice(2, Math.max(2, depth) + 1)) : undefined;
+        const visibleIcon = nextKey && folderIcons.has(nextKey) ? undefined : iconState;
+        const replaceArrow = isAppRoot && showSpinner && visibleIcon;
+        if (visibleIcon) {
             const badge = document.createElement('span');
-            setOfflineBadge(badge, iconState, partial);
+            if (replaceArrow) {
+                // Use the arrow's footprint so sync cannot move or rewrap the next breadcrumb.
+                badge.className = 'crumb-status-spinner';
+                addSpinner(badge);
+            } else {
+                setOfflineBadge(badge, visibleIcon, partial);
+            }
             suffix.appendChild(badge);
         }
 
@@ -805,15 +837,6 @@ export function createTree(
                 suffix.appendChild(favIcon);
             }
         }
-
-        /** Appends the shared spinner glyph (⟳) used by sync and reindex states. */
-        const addSpinner = (parent: HTMLElement): void => {
-            const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-            svg.setAttribute('viewBox', '0 0 16 16');
-            svg.classList.add('sync-spinner');
-            svg.innerHTML = '<circle cx="8" cy="8" r="5"/>';
-            parent.appendChild(svg);
-        };
 
         // The menu occupies the left gutter. Only the text belongs to the path.
         if (isAppRoot) {
@@ -841,8 +864,6 @@ export function createTree(
             }
         }
 
-        const reindexing = depth === 2 && (rootEntry?.type === 'onedrive' || rootEntry?.type === 'share')
-            && rootEntry.reindexing;
         if (reindexing && !opts.isBreadcrumb) addSpinner(el);
 
         // Selected folder (not root, not account): play button.
@@ -876,7 +897,7 @@ export function createTree(
                 chevron.textContent = '›';
                 separator.appendChild(chevron);
             }
-            if (!selectModeActive && ((isAppRoot && isSyncing) || reindexing)) addSpinner(separator);
+            if (showSpinner && !replaceArrow) addSpinner(separator);
             suffix.appendChild(separator);
         }
 
@@ -986,8 +1007,15 @@ export function createTree(
 
         // Child rows: immediate children of selected folder
         const pathBeforeResolve = selectedPath;
-        const children = resolveFolder();
-        // resolveFolder may correct selectedPath (broken path fallback).
+        const homeAccount = soleAccountKey(roots);
+        const children = resolveFolderAndRepairSelection(homeAccount);
+        // Home stays home when another root appears. Child rows always retain the drive key.
+        if (homeAccount !== undefined && selectedPath.length === 2 && selectedPath[1] === homeAccount) {
+            selectedPath = selectedPath.slice(0, 1);
+        }
+        const displayedPath = homeAccount !== undefined && selectedPath.length === 1
+            ? [...selectedPath, homeAccount] : selectedPath;
+        // resolveFolderAndRepairSelection may correct selectedPath (broken path fallback).
         // If so, persist the correction via onPathChange.
         if (selectedPath !== pathBeforeResolve) view.onPathChange(selectedPath);
 
@@ -1002,25 +1030,23 @@ export function createTree(
             && !hasChildFolder
             && isTerminalEvidence
             && children.every(([name, isFolder]) =>
-                !isFolder && !isTrackCachedFn([...selectedPath, name]));
+                !isFolder && !isTrackCachedFn([...displayedPath, name]));
         const showSelectedPlayButton = children.length > 0 && !allImmediateFilesUnavailable;
-        const breadcrumbRows = selectedPath.map((_, i) => {
-            const prefix = selectedPath.slice(0, i + 1);
-            const isSelectedFolder = i === selectedPath.length - 1;
-            return makeRow({
-                name: prefix[prefix.length - 1],
+        const breadcrumbRows: HTMLElement[] = [];
+        for (let i = 0; i < selectedPath.length; i++) {
+            if (i === 1 && homeAccount !== undefined) continue;
+            breadcrumbRows.push(makeRow({
                 isFolder: true,
                 isBreadcrumb: true,
-                path: prefix,
-                showPlayButton: isSelectedFolder ? showSelectedPlayButton : true,
-            });
-        });
+                path: selectedPath.slice(0, i + 1),
+                showPlayButton: showSelectedPlayButton,
+            }));
+        }
 
         const childRows = children.map(([name, isFolder]) => makeRow({
-            name,
             isFolder,
             isBreadcrumb: false,
-            path: [...selectedPath, name],
+            path: [...displayedPath, name],
         }));
 
         // Capture live scroll before replacing DOM so same-path re-renders
@@ -1028,6 +1054,9 @@ export function createTree(
         // viewport even when scrollMap persistence is one frame behind.
         const hadChildrenRows = childrenEl.childElementCount > 0;
         const liveScrollBeforeRender = childrenEl.scrollTop;
+        const previous = previousPath;
+        const isSamePath = previous && pathEquals(displayedPath, previous);
+        if (!isSamePath) rememberListScroll();
 
         trail.classList.toggle('selecting', selectModeActive);
         trail.replaceChildren(search, breadcrumbRows[0]);
@@ -1036,19 +1065,20 @@ export function createTree(
         }
         breadcrumbsEl.replaceChildren(trail);
         fitBreadcrumbNames();
+        // A previous FLIP may have unclipped the list. Restore scrolling before applying its offset.
+        childrenEl.style.overflow = '';
         childrenEl.replaceChildren(...childRows);
 
         // -- Scroll restoration (M10) ----------------------------------------
         // After DOM replacement:
         // - Same-path re-renders restore live pre-render scroll.
         // - Navigation up restores persisted per-path scroll.
-        // - Navigation down/jump resets to 0.
+        // - Navigation down/jump resets to 0. Switching between the root and account lists
+        //   follows the same rule; only the home selection is shared between those lists.
         // Initial render has no existing rows, so it still uses persisted
         // scroll restoration (if available).
-        const pathKey = JSON.stringify(selectedPath);
-        const isSamePath = pathEquals(selectedPath, previousPath);
-        const isUpOrSame = selectedPath.length <= previousPath.length
-            && selectedPath.every((s, i) => s === previousPath[i]);
+        const pathKey = JSON.stringify(displayedPath);
+        const isUpOrSame = !previous || displayedPath.every((s, i) => s === previous[i]);
         const savedScroll = scrollMap.get(pathKey);
         if (isSamePath && hadChildrenRows) {
             childrenEl.scrollTop = liveScrollBeforeRender;
@@ -1057,11 +1087,11 @@ export function createTree(
         } else {
             childrenEl.scrollTop = 0;
         }
-        previousPath = selectedPath;
+        previousPath = displayedPath;
 
         // Empty-favorites placeholder: when at app root and user has no favorites,
         // show a hint above the account rows (where favorites would normally appear).
-        if (selectedPath.length <= 1 && favoritesRef && favoritesRef.getAll().length === 0) {
+        if (displayedPath.length === 1 && favoritesRef.getAll().length === 0) {
             const hint = document.createElement('div');
             hint.className = 'empty-favorites-hint';
             hint.textContent = 'press and hold on a folder to add it to favorites';
@@ -1074,7 +1104,8 @@ export function createTree(
         // its bounds during the 220ms animation. (#breadcrumbs has no overflow
         // clipping — it's always exactly sized to its content.)
         if (animate) {
-            childrenEl.style.overflow = 'visible';
+            // Unclipping a scrolled viewport resets its offset in both browser engines.
+            if (childrenEl.scrollTop === 0) childrenEl.style.overflow = 'visible';
             if (restoreOverflowTimeout !== undefined) clearTimeout(restoreOverflowTimeout);
             // INVARIANT: overflow must always return to stylesheet control.
             // Relying only on transitionend is fragile because re-renders can
@@ -1138,13 +1169,8 @@ export function createTree(
         scrollRafPending = true;
         requestAnimationFrame(() => {
             scrollRafPending = false;
-            const key = JSON.stringify(selectedPath);
-            scrollMap.set(key, {top: childrenEl.scrollTop});
-            // Cap at 100 entries: trim oldest (first inserted)
-            if (scrollMap.size > 100) {
-                const first = scrollMap.keys().next().value;
-                if (first !== undefined) scrollMap.delete(first);
-            }
+            if (!previousPath || searchModeOpen) return;
+            rememberListScroll();
             // Persist to localStorage
             const obj: Record<string, {top: number}> = {};
             for (const [k, v] of scrollMap) obj[k] = v;

@@ -503,13 +503,17 @@ async function configureStartupScenario(page, options) {
     }, options);
 }
 
-/** Clicks the OneDrive account row (from root level). */
+/** Open the account listing. At folded home its children are already visible. */
 async function clickAccount(page) {
-    await page.locator("#children .tree-row.folder", { hasText: "OneDrive" }).click();
-    // Wait for account to appear as breadcrumb (not a fixed timeout — first
-    // page load after SW unregistration can be slow).
-    await page.locator("#breadcrumbs .tree-row", { hasText: "OneDrive" })
-        .waitFor({ timeout: 5000 });
+    const accountPath = await page.evaluate(() => {
+        const roots = window._testTree.getRoots();
+        return roots.size === 1 ? undefined : JSON.stringify(['OnePlay Music',
+            [...roots.values()].find(root => root.type === 'onedrive').key]);
+    });
+    if (!accountPath) return;
+    const selector = '.tree-row[data-path=' + JSON.stringify(accountPath) + ']';
+    if (!await page.locator('#breadcrumbs ' + selector).count()) await page.locator('#children ' + selector).click();
+    await page.locator('#breadcrumbs ' + selector).waitFor();
 }
 
 /** Clicks the first folder in #children. */

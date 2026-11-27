@@ -298,12 +298,13 @@ restored value is kept until the action fully succeeds (not consumed eagerly).
 All top-level entries in the tree share a unified `RootsMap` (Map of string key
 → `Root` object). Root types are distinguished by a `type` discriminant:
 
-- `'account'` — a OneDrive account (key = driveId)
+- `'onedrive'` — a OneDrive account (key = driveId)
+- `'share'` — a connected shared folder (key = `share:{shareId}`)
 - `'shortcut'` — a favorited folder (key = `fav:{uuid}`)
 - `'playlist'` — a user-created playlist (key = `fav:{uuid}`)
 
 Display order: favorites first (in creation order), then accounts (sorted by
-key). Display names are resolved at render time from the Root object, never
+key), then shares in connection order. When OneDrive is the sole root, home keeps its app-root selection and displays the account folder. Its child paths and scroll offset still belong to that account. Display names are resolved at render time from the Root object, never
 used as map keys.
 
 

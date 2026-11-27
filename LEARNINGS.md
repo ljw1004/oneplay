@@ -80,7 +80,7 @@
 - **Multiple writers to shared persisted objects must preserve unknown fields.** Read-modify-write, never overwrite with defaults.
 - **Do not consume one-shot restore values before success.** Clear restored values only after the restore action completes.
 - **Deferred data must not trigger eager invalidation.** If dependencies are not loaded yet, defer validation instead of resetting state.
-- **Programmatic scroll/state restoration needs guardrails.** Empty-container scroll events and resource-default values can silently corrupt restored state.
+- **Programmatic scroll/state restoration needs guardrails.** Empty-container scroll events and resource-default values can silently corrupt restored state. When Search and the tree reuse a viewport, save the outgoing list’s offset before replacing it. Switching a scrolled viewport to `overflow: visible` for an animation can also reset its offset.
 - **Tests must clear persistent state in setup.** Shared browser profiles make state leakage otherwise inevitable.
 
 

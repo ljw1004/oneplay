@@ -16,10 +16,11 @@ module.exports = {
     async "tree: compact trail and flat children"(page) {
         await clickAccount(page);
         const names = "#children .tree-row .row-name";
+        const accountDepth = await page.locator(".crumb").count();
         const before = await page.locator(names).first().boundingBox();
         await clickFirstFolder(page);
         const crumbs = page.locator(".folder-trail .crumb");
-        assert(await crumbs.count() === 3, "Expected the app root, account and folder in the trail");
+        assert(await crumbs.count() === accountDepth + 1, "Expected one more folder in the trail");
         const folder = await crumbs.last().getAttribute("aria-current");
         assert(folder === "location", "The final breadcrumb should identify the current folder");
         const after = await page.locator(names).first().boundingBox();
@@ -135,6 +136,7 @@ module.exports = {
                 return [...range.getClientRects()].map(r => [r.x, r.y, r.width, r.height]);
             });
             return {
+                rootWeight: getComputedStyle(document.querySelector(".app-root")).fontWeight,
                 names: rects(".folder-trail .row-name"),
                 separators: rects(".crumb-separator > span"),
                 play: document.querySelector(".play-btn").getBoundingClientRect().toJSON(),
@@ -166,7 +168,7 @@ module.exports = {
         assert(idle.separators[0][0][1] === idle.separators[1][0][1], "Chevron baselines should match");
         assert(await page.locator(".app-root [role=img]").count() === 0,
             "Confirmed sign-in should leave the debug version alone");
-        assert(await page.locator(".app-root").evaluate(el => getComputedStyle(el).fontWeight) === "400",
+        assert(idle.rootWeight === "400",
             "An ancestor root uses regular weight");
         await page.evaluate(() => window._testTree.setSyncing(true));
         await page.locator(".app-root .crumb-separator .sync-spinner").waitFor();
@@ -276,7 +278,9 @@ module.exports = {
         );
         const firstTrackPath = await page.locator("#children .tree-row.file").first().getAttribute("data-path");
         assert(firstTrackPath, "Expected first search-track row to have data-path");
-        const expectedParentPath = JSON.stringify(JSON.parse(firstTrackPath).slice(0, -1));
+        const parent = JSON.parse(firstTrackPath).slice(0, -1);
+        const foldedHome = parent.length === 2 && await page.evaluate(() => window._testTree.getRoots().size === 1);
+        const expectedParentPath = JSON.stringify(foldedHome ? parent.slice(0, 1) : parent);
         const prevPlaybackSeq = await getTestSeq(page, "_testPlaybackSeq");
         await page.locator("#children .tree-row.file").first().click();
         await waitForPlaybackReady(page, prevPlaybackSeq);

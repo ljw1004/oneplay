@@ -132,7 +132,8 @@ export function addModalActions(
             errorLine.textContent = '';
             try {
                 await Promise.resolve(onConfirm(confirmAbort?.signal));
-                close();
+                // Some actions close before starting a navigation animation.
+                if (modal.isConnected) close();
             } catch (e) {
                 const aborted = confirmAbort?.signal.aborted === true;
                 if (aborted || (e instanceof DOMException && e.name === 'AbortError')) return;

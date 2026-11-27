@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const add = 'Make available offline', remove = 'Make unavailable offline';
 
 /** Each client starts with the same library, but keeps its own IndexedDB, download queue and network. */
-async function seedFolderDevice(page, {cloud = {}, holdSecond = false, scale = false, overlap = false} = {}) {
+async function seedFolderDevice(page, {cloud = {}, holdSecond = false, scale = false, overlap = false, soleAccount = false} = {}) {
     const url = globalThis.__ONEPLAY_TEST_URL;
     page.setDefaultTimeout(6500);
     const mediaRequests = [];
@@ -45,7 +45,7 @@ async function seedFolderDevice(page, {cloud = {}, holdSecond = false, scale = f
         return route.fulfill({status:request.method() === 'PUT' ? 200 : 404, json:{}});
     });
     await page.goto(url + 'seed');
-    await page.evaluate(async ({scale, overlap}) => {
+    await page.evaluate(async ({scale, overlap, soleAccount}) => {
         const {dbPut} = await import('./dist/db.js');
         const children = {Books:{id:'books', children:{
             Dune:{id:'dune', children:{Disc:{id:'disc', children:{'Opening.wav':{id:'first'}, 'Ending.wav':{id:'second'}}}}},
@@ -56,7 +56,7 @@ async function seedFolderDevice(page, {cloud = {}, holdSecond = false, scale = f
         const keep = {id:'keep', kind:'playlist', name:'Keep', hasPrivatePlayback:false, offlinePin:{paused:false},
             members:[{driveId:'drive', sourceRootKey:'drive', itemId:'first',
                 path:['Books','Dune','Disc','Opening.wav'], isFolder:false}]};
-        const favorites = [keep];
+        const favorites = soleAccount ? [] : [keep];
         const folderPins = [];
         if (scale === 'albums') {
             delete children.Books;
@@ -87,15 +87,20 @@ async function seedFolderDevice(page, {cloud = {}, holdSecond = false, scale = f
             favorites.push({id:'all-archive', kind:'shortcut', name:'All Archive', hasPrivatePlayback:false,
                 target:{driveId:'drive', sourceRootKey:'drive', itemId:'archive', path:['Archive'], isFolder:true}});
         }
-        await dbPut('index:drive', index('root', children, scale ? 30_000 : 3));
+        if (soleAccount) {
+            children.Jazz = {id:'jazz', children:{}};
+            // Enough loose tracks to give the account listing its own scroll offset.
+            for (let i = 0; i < 40; i++) children['Song ' + i + '.wav'] = {id:'song-' + i};
+        }
+        await dbPut('index:drive', index('root', children, scale ? 30_000 : soleAccount ? 43 : 3));
         const concertTracks = overlap ? {'Live.wav':{id:'concert-track'}} : {};
         await dbPut('index-share:token', index('shared-root', {Concert:{id:'concert', children:concertTracks}}, Object.keys(concertTracks).length));
-        await dbPut('shares', {version:1, updatedAt:1, shares:[{id:'connection', shareId:'token',
+        await dbPut('shares', {version:1, updatedAt:1, shares:soleAccount ? [] : [{id:'connection', shareId:'token',
             name:'Shared', rootKey:'share:token', driveId:'remote', rootItemId:'shared-root', addedAt:1, updatedAt:1}]});
         await dbPut('favorites', {version:1, updatedAt:1, favorites, ...(folderPins.length ? {folderPins} : {})});
         localStorage.setItem('account_info', JSON.stringify({driveId:'drive', displayName:'Listener'}));
         localStorage.setItem('access_token', 'test-fixture');
-    }, {scale, overlap});
+    }, {scale, overlap, soleAccount});
     await page.goto(url);
     const name = (scope, title) => page.locator('#' + scope + ' .tree-row').filter({
         has:page.locator('.row-name', {hasText:new RegExp('^' + title + '$')}),
@@ -117,12 +122,126 @@ async function seedFolderDevice(page, {cloud = {}, holdSecond = false, scale = f
         await modal.getByRole('button', {name:confirm ? label : 'Close', exact:true}).click();
         await modal.waitFor({state:'hidden'});
     };
-    if (scale === 'albums') await child('OneDrive').locator('.offline-badge.partial.downloading').waitFor();
+    if (soleAccount) await child('Books').waitFor();
+    else if (scale === 'albums') await child('OneDrive').locator('.offline-badge.partial.downloading').waitFor();
     else await child('Keep').locator('.offline-badge.complete').waitFor();
     return {child, crumb, pins, choose, right, folderMenu, mediaRequests, releaseSecond, network};
 }
 
 module.exports = {
+    async 'folders: flattened account paths, scroll and first shortcut at home'(page) {
+        const {child, choose} = await seedFolderDevice(page, {soleAccount:true});
+        const home = page.locator('.app-root');
+        const names = page.locator('#breadcrumbs .crumb .row-name');
+        assert.equal(await home.getAttribute('aria-current'), 'location');
+        assert.equal(await page.locator('.empty-favorites-hint').count(), 0);
+        const track = child('Song 39.wav');
+        assert.deepEqual(JSON.parse(await track.getAttribute('data-path')), ['OnePlay Music','drive','Song 39.wav']);
+        await page.getByRole('button', {name:'Search music'}).click();
+        await page.locator('.search-input').fill('Song 39');
+        await track.click();
+        await page.waitForFunction(() => window._testPlayback.getInfo()?.track.at(-1) === 'Song 39.wav');
+        assert.equal(await home.getAttribute('aria-current'), 'location');
+        await child('Books').click();
+        await page.locator('.footer-indicator').click();
+        assert.equal(await names.count(), 1);
+        assert(await track.evaluate(row => {
+            const bounds = row.getBoundingClientRect(), list = row.parentElement.getBoundingClientRect();
+            return bounds.top >= list.top && bounds.bottom <= list.bottom;
+        }));
+        await choose(child('Books'), add);
+        await home.locator('.offline-badge.partial').waitFor();
+        await child('Jazz').click();
+        await page.waitForFunction(() => document.querySelector('#children').style.overflow === '');
+        await page.evaluate(() => {
+            const tree = window._testTree;
+            const account = tree.getRoots().get('drive');
+            const folderBox = () => document.querySelector('.crumb.selected .row-name').getBoundingClientRect();
+            const before = folderBox();
+            for (const sync of [false,true]) for (const indexing of [false,true]) {
+                tree.setSyncing(sync);
+                tree.setAccount(account.key, account.folder, account.info, indexing);
+                const root = document.querySelector('.app-root');
+                if (root.querySelectorAll('.sync-spinner').length !== Number(sync || indexing)
+                    || !!root.querySelector('.offline-badge.partial') !== !(sync || indexing))
+                    throw Error('Wrong folded indicator for sync=' + sync + ', indexing=' + indexing);
+                const after = folderBox();
+                if (before.x !== after.x || before.y !== after.y) throw Error('Sync moved the Jazz breadcrumb');
+            }
+            tree.setSelectMode(true, new Set());
+            if (document.querySelector('.app-root .sync-spinner') || !document.querySelector('.app-root .offline-badge.partial'))
+                throw Error('Selection should reveal the underlying arrow');
+            tree.setSelectMode(false, new Set());
+            tree.setSyncing(false);
+            tree.setAccount(account.key, account.folder, account.info);
+        });
+        await home.locator('.row-name').click();
+        await page.waitForFunction(() => document.querySelector('#children').style.overflow === '');
+        await page.locator('#children').evaluate(el => { el.scrollTop = 160; });
+        await page.waitForFunction(() => JSON.parse(localStorage.oneplay_music_scroll ?? '{}')['["OnePlay Music","drive"]']?.top === 160);
+        await page.getByRole('button', {name:'Search music'}).click();
+        await page.locator('.search-input').fill('Song 39');
+        await child('Song 39.wav').waitFor();
+        await page.locator('.search-close').click();
+        assert.equal(await page.locator('#children').evaluate(el => el.scrollTop), 160);
+        // Navigation can beat the scroll event. It must capture the outgoing list synchronously.
+        await child('Books').evaluate(row => {
+            row.parentElement.scrollTop = 192;
+            row.click();
+        });
+        assert.equal(await names.count(), 2);
+        assert.equal(await names.last().textContent(), 'Books');
+        assert.equal(await home.locator('.offline-badge').count(), 0);
+        await home.locator('.row-name').click();
+        assert.equal(await page.locator('#children').evaluate(el => el.scrollTop), 192);
+        await page.reload();
+        await child('Books').waitFor();
+        assert.equal(await page.locator('#children').evaluate(el => el.scrollTop), 192);
+        // The previous UI could save the bare drive as the selected folder.
+        await page.evaluate(() => { localStorage.oneplay_music_view = JSON.stringify({path:['OnePlay Music','drive']}); });
+        await page.reload();
+        await child('Books').waitFor();
+        assert.equal(await home.getAttribute('aria-current'), 'location');
+        assert.equal(await page.locator('#children').evaluate(el => el.scrollTop), 192);
+        await child('Books').click({button:'right'});
+        await page.locator('.share-btn').click();
+        await page.getByRole('button', {name:/Add as Shortcut/}).click();
+        await page.locator('.modal-confirm').click();
+        await child('OneDrive').waitFor();
+        await page.waitForFunction(() => !document.body.classList.contains('select-mode') && !document.querySelector('#tree-container').style.opacity);
+        assert.equal(await names.count(), 1);
+        assert.equal(await child('Books').locator('.fav-icon').count(), 1);
+    },
+
+    async 'folders: share and first playlist expand the trail in place'(page) {
+        const {child} = await seedFolderDevice(page, {soleAccount:true});
+        const trail = page.locator('.crumb .row-name');
+        await child('Books').click();
+        const folded = await trail.allTextContents();
+        assert.equal(folded.length, 2);
+        await page.evaluate(() => window._testTree.setShareRoots([{key:'share:new', connectionId:'connection',
+            driveId:'remote', name:'Shared', reindexing:false}]));
+        assert.deepEqual(await trail.allTextContents(), [folded[0],'OneDrive','Books']);
+        await page.evaluate(() => window._testTree.setShareRoots([]));
+        assert.deepEqual(await trail.allTextContents(), folded);
+        await child('Dune').click({button:'right'});
+        await page.locator('.share-btn').click();
+        await page.getByRole('button', {name:/Put in new playlist/}).click();
+        await page.locator('.modal input[type=text]').fill('Reading');
+        await page.locator('.modal-confirm').click();
+        await page.waitForFunction(() => !document.body.classList.contains('select-mode') && !document.querySelector('#tree-container').style.opacity);
+        assert.deepEqual(await trail.allTextContents(), [folded[0],'OneDrive','Books']);
+        await page.reload();
+        await child('Dune').waitFor();
+        assert.deepEqual(await trail.allTextContents(), [folded[0],'OneDrive','Books']);
+        await child('Dune').click({button:'right'});
+        await page.locator('.share-btn').click();
+        await page.getByRole('button', {name:/Add as Shortcut/}).click();
+        await page.locator('.modal-confirm').click();
+        await page.locator('.crumb.selected .fav-icon').waitFor();
+        assert.deepEqual(await trail.allTextContents(), [folded[0],'Dune']);
+    },
+
     async 'folders: unreadable indexed bytes remain offline and playback skips to the next song'(page) {
         const device = await seedFolderDevice(page);
         await page.route('**/fixture-second.wav', r => r.fulfill({contentType:'audio/wav', body:Buffer.from([1,2,3])}));

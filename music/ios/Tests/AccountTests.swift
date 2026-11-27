@@ -479,7 +479,12 @@ private final class TestAudioCDN: URLProtocol {
         page = try await readyPage(in:controller, excluding:page)
         _ = try await account.media(driveID:"library",itemID:"probe")
         let commit = try await page.callAsyncJavaScript("""
-            window._testTree.setSelectedPath(['OnePlay Music','library','Collection']);
+            // This bundled page has a single account and no favorites. Open Collection from home.
+            const root = document.querySelector('.crumb.app-root[aria-current="location"]');
+            const collection = [...document.querySelectorAll('#children .row-name')].find(el => el.textContent === 'Collection');
+            if (!root || !collection) throw Error('Expected a folded account at home');
+            collection.click();
+            if (document.querySelectorAll('.crumb').length !== 2) throw Error('Expected OnePlay › Collection');
             const pin = album => window._testFavorites.setFolderPinned({driveId:'library',sourceRootKey:'library',
                 itemId:'album-'+album,path:['Collection','Artist '+Math.floor(album/5),'Album '+album],isFolder:true},true);
             for (let n=0; n<49; n++) await pin(n);
@@ -532,6 +537,9 @@ private final class TestAudioCDN: URLProtocol {
             const favorites = window._testFavorites;
             await favorites.add({kind:'playlist',id:'survivor',name:'Survivor',hasPrivatePlayback:false,members:[
                 {driveId:'library',sourceRootKey:'library',itemId:'song-0',isFolder:false,path:['Collection','Artist 0','Album 0','Song 0.mp3']}]});
+            const trail = [...document.querySelectorAll('.crumb .row-name')].map(el => el.textContent);
+            if (trail.length !== 3 || trail[1] !== 'OneDrive' || trail[2] !== 'Collection')
+                throw Error('First playlist moved the open folder: '+JSON.stringify(trail));
             await favorites.setOfflinePin('survivor',{paused:false});
             window._testTree.setSelectedPath(['OnePlay Music','library']);
             """, arguments:[:], in:nil, contentWorld:.page)

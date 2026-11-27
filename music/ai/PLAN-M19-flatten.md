@@ -52,7 +52,7 @@ If the user asks you to execute on a plan, these are the steps to take.
 
 ## Better engineering insights and backlog additions
 
-The roots map, the selected path and the existing folder-icon lookup supply the inputs. Keep the layout decision in the shared tree. A second navigation model, persisted layout flag or separate native implementation would duplicate those inputs.
+The implementation keeps the existing OnePlay breadcrumb and its navigation path in both layouts. A sole account supplies its indicators and home listing. The tree uses the last displayed folder to restore scrolling and reveal tracks. Opening Search hands the viewport to the results list. Both Create dialogs share the same save-and-exit action. Switching between the source list and the account contents follows the existing scroll policy for navigating between different lists. The membership transition preserves the selected location. Favorites storage and cloud recovery retain their existing write policy. The two players ship the same Create handlers. Browser tests exercise both dialogs, and bundled WebKit checks the native-backed membership publication.
 
 ## AI validation plan
 
@@ -63,7 +63,13 @@ The roots map, the selected path and the existing folder-icon lookup supply the 
 
 ## AI validation results
 
-Pending milestone execution.
+The 34 shell assets on production build 351 match signed iOS build 67 after accounting for the platform build label and source-map annotations. All 177 unit tests passed. All 117 Playwright cases passed on localhost (156.7 s) and production (285.8 s). Both M19 Playwright cases passed in Chromium and in persistent WebKit against production. Each used a disposable library. They exercised first and later Create, loose-track reveal, first and last share, indicator priority, Search, and scroll restoration from both home path forms. Mobile WebKit screenshots show the folded and expanded trails.
+
+LuPhone13 received build 67 in place. Device inventory confirmed version 1.0 (67) under the existing bundle identifier. The bundled WebKit test opened a folder directly from home, pinned 500 tracks in a 30,000-track library and verified that adding the first playlist expanded the breadcrumb in place. Two folder taps during these downloads took 5 ms on the simulator. The iOS suite passed 61 tests and skipped the opt-in live-account test. No personal playlists or accounts were used as test fixtures.
+
+Five rounds of GPT Sol 6.2 High specialist review each included a dedicated KISS reviewer. The final round retained the shared roots lookup, existing OnePlay navigation path and common Create action. If root membership changes while Search owns the viewport, closing Search restores the newly visible list using its own saved offset. M19 specifies the selected location across membership changes.
+
+A separate cold-reload check saved the bottom of the same 43-track library in both layouts. With playback restored, each reopened at 1,228 px from a saved 1,294 px. Startup lays out the tree before the footer reappears. Coordinating those two restorations is a pre-existing player-wide issue.
 
 ## User validation suggestions
 

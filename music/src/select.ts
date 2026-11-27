@@ -25,11 +25,11 @@
  */
 
 import { setOfflineBadge, type FolderPath, type TreeView } from './tree.js';
-import { type Favorites, type RootsMap, type PlaylistMember, type FolderPin } from './favorites.js';
+import { type Favorite, type Favorites, type RootsMap, type PlaylistMember, type FolderPin } from './favorites.js';
 import { walkFolder } from './indexer.js';
 import { log, logError } from './logger.js';
 import { type DownloadControls, QUOTA_OPTIONS_GB, classifyOfflineBadgeState } from './downloads.js';
-import { isWalkableRoot } from './roots.js';
+import { isWalkableRoot, soleAccountKey } from './roots.js';
 import { buildMembersFromSelection as buildMembersFromSelectionFromState } from './select-dialogs.js';
 import {
     showModal,
@@ -64,7 +64,7 @@ export interface Select {
     onEnterSelect: () => void;
     onExitSelect: () => void;
     /** Called after a favorites action to navigate the tree to the target favorite. */
-    onNavigateToFav: (favId: string) => void;
+    onNavigateToFav: (favId: string) => Promise<void>;
     /** Set the downloads module reference for offline menu items and modal. */
     setDownloads(downloads: DownloadControls): void;
     /** Updates the offline modal DOM if it's currently open. Called on download state changes. */
@@ -294,6 +294,18 @@ export function createSelect(
 
     // -- Modals ---------------------------------------------------------------
 
+    /** The first favorite unfolds home in place. Later creations open the new favorite. */
+    const saveFavoriteAndExitSelect = async (favorite: Favorite, modal: HTMLElement, close: () => void): Promise<void> => {
+        const wasFolded = soleAccountKey(roots) !== undefined;
+        // favorites.add owns the existing local/cloud write policy. A rejected edit has no destination.
+        const added = await favorites.add(favorite);
+        if (!modal.isConnected) return;
+        if (!added) throw new Error('Could not create this favorite.');
+        close();
+        select.exitSelectMode();
+        if (!wasFolded) await select.onNavigateToFav(favorite.id);
+    };
+
     /** Shortcut creation modal: "Add new shortcut" with name and hasPrivatePlayback. */
     const showShortcutModal = (folder: FolderPin): void => {
         const folderName = folder.path.at(-1)!;
@@ -312,20 +324,16 @@ export function createSelect(
             modal.appendChild(label);
 
             addModalActions(modal, close, 'Create', async () => {
-                const id = crypto.randomUUID();
-                await favorites.add({
+                await saveFavoriteAndExitSelect({
                     kind: 'shortcut',
-                    id,
+                    id: crypto.randomUUID(),
                     name: folderName,
                     target: {
                         driveId: folder.driveId, path: folder.path, itemId: folder.itemId, isFolder: true,
                         sourceRootKey: folder.connectionId ? folder.sourceRootKey : undefined,
                     },
                     hasPrivatePlayback,
-                });
-                close();
-                select.exitSelectMode();
-                select.onNavigateToFav(id);
+                }, modal, close);
             });
         });
     };
@@ -403,17 +411,13 @@ export function createSelect(
             const confirmBtn = addModalActions(modal, close, 'Create', async () => {
                 const name = input.value.trim();
                 if (!isPlaylistNameUnique(name)) return;
-                const id = crypto.randomUUID();
-                await favorites.add({
+                await saveFavoriteAndExitSelect({
                     kind: 'playlist',
-                    id,
+                    id: crypto.randomUUID(),
                     name,
                     members,
                     hasPrivatePlayback,
-                });
-                close();
-                select.exitSelectMode();
-                select.onNavigateToFav(id);
+                }, modal, close);
             });
 
             const syncConfirmEnabled = (): void => {
@@ -951,7 +955,7 @@ export function createSelect(
 
         onEnterSelect: () => {},
         onExitSelect: () => {},
-        onNavigateToFav: () => {},
+        onNavigateToFav: async () => {},
         setDownloads(dl) { downloadsRef = dl; },
         updateOfflineModal() { refreshOfflineModal?.(); },
         refreshFolderActions() { if (active) syncActionBar(); },

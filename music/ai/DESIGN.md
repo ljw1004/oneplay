@@ -57,6 +57,8 @@ And I'll click on Sgt Pepper:
 
 The pattern is (1) there's a breadcrumb view from the top level down to the currently selected folder, (2) we see all immediate children of the current folder, (3) the currently-selected folder has a "play" button which will set the "currently-playing" to be the recursive descendents of that.
 
+When OneDrive is the only root, **OnePlay** lists its folders and tracks directly. Opening Jazz shows **OnePlay › Jazz**. The merged breadcrumb shows one spinner during sync or account indexing, otherwise it can show the account’s dotted download arrow. The first favorite or share restores the root list at home and expands the trail in an open folder. Creating a favorite from this folded view keeps the listener in place. Creating one from an expanded library opens the new favorite. Folder pins do not affect this layout.
+
 The header uses white text on Outlook blue, with a muted navy header above the darker player in the dark theme. The background change marks the start of the song list. Settings and the tappable OnePlay root start the left-aligned trail, with Search at the far right of its first line. The current folder is bold. A separator stays with the end of each ancestor name. The gap immediately before a folder name accepts taps for that folder. Wrapped rows are 40px apart at the default text size, with 8px of banner color below the final line. Settings and Search have the same header height as a single breadcrumb line including its outer padding. OnePlay, Settings, wrapped folder names and songs share a left text edge. The menu glyph and selection checkmarks share a centerline in the gutter. Debug adds the version number to the root. A read-only icon follows it when OneDrive sign-in is unknown (‽), signed out (🔒), or offline (🚫). Confirmed sign-in leaves the version alone. Settings > Debug shows Logs to the right of Turn off and Expire to the right of Logs. Logs toggles the diagnostic panel. Expire makes OneDrive require a reconnect. Each separator reserves space for a checkbox or sync spinner so folder text stays in place. In Select, tap a name or its checkbox to toggle that folder. Child folders are bold and tracks use regular type.
 
 Icons/buttons:
@@ -76,11 +78,7 @@ Children share a left margin at every depth. Their full names wrap across as man
 
 Navigating the hierarchy (clicking a folder, clicking a breadcrumb) must be animated. Rows that persist across the transition slide from their old position to their new position; new children fade in. This uses the FLIP technique (First, Last, Invert, Play). Without animation, navigation feels disorienting — the user loses spatial context.
 
-In the initial state of the app, there won't be any favorites. We'll display it like this, with a placeholder.
-
-- ☰ OnePlay Music 🔍
-  - [favorites will go here]
-  - OneDrive
+When there are several roots and no favorites, the home list starts with “press and hold on a folder to add it to favorites”. A folded home starts directly with the library contents.
 
 
 ## Playback controls
@@ -347,7 +345,7 @@ I believe we can do an optimization for the 90% case where the user is typing a 
 You can scroll through the search results.
 
 When you tap an item in the search results, it exits search mode, jumps to that item in the real tree, scrolling into view if necessary.
-- If you tapped a song, then we scroll that song into view (selecting its parent as currently-selected-folder), and start playing it.
+- If you tapped a song, the intended behavior is to scroll that song into view, select its parent, and start playing it. The current player opens the parent and starts playback. Tap the footer chevron to scroll to the playing row. M19 preserves this interaction in both home layouts.
 - If you tapped a folder, then we set that folder as currently-selected-folder, with all that entails.
 - If you tapped a favorite, then we set that favorite as currently-selected-folder.
 

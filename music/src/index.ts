@@ -691,6 +691,7 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
         tree.onSearchResultClick = (result: SearchResult) => {
             tree!.closeSearchMode();
             if (result.kind === 'track') {
+                // Search opens the parent at its normal offset. The footer chevron explicitly reveals the row.
                 tree!.setSelectedPath(result.path.slice(0, -1));
                 tree!.onTrackClick(result.path);
                 return;

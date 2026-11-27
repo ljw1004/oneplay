@@ -1,24 +1,26 @@
 # OnePlay TODO
 
-## Show OneDrive’s contents at home in Music
-
-When the listener has only their OneDrive account, with no shares or favorites, show its folders and tracks directly under **OnePlay**. Tapping **OnePlay** returns to that list, and breadcrumbs read **OnePlay › Jazz**. This is a display change only. Folders marked for offline use still qualify.
-
-Show one spinner after **OnePlay** whenever either breadcrumb would show one. Otherwise, show OneDrive’s dotted download arrow whenever it would normally appear.
-
-When the first share or favorite is added, show the new top-level list if the listener is at home. If they are inside a folder, keep it open and expand the trail to **OnePlay › OneDrive › Jazz**. Removing the last share or favorite folds the trail back when OneDrive is again the only entry.
-
 ## Google Drive support for Music
 
-**Decision pending.** Defer implementation until we have guidance on whether Google would approve public use of `drive.readonly` for OnePlay. The feature would let a listener choose an existing Drive folder, play its music, and pin folders or playlists for offline listening. The narrower `drive.file` scope does not grant recursive access to existing tracks when the user selects their parent folder. Google lists local file sync as an eligible use for restricted scopes. The uncertainty is whether optional offline sync qualifies when music playback is the app’s primary purpose. [Drive scope policy](https://developers.google.com/workspace/drive/api/guides/api-specific-auth)
+We will support Google Drive (and later Dropbox) as a store of music.
 
-**Next action.** Ask in the official Drive developer forum or, if available, through Google Workspace developer support. Formal verification requires a working OAuth flow and a demo of how the app uses the scope. An answer now would help us decide whether to invest in that work. [Developer support channels](https://developers.google.com/workspace/drive/api/support) · [Verification requirements](https://support.google.com/cloud/answer/13461325?hl=en)
+Prototype on an installed iPhone PWA. Try Drive’s `files.download` URI and test seeking, locked-screen advance, and access-token expiry.
 
-> OnePlay is a browser-based music player that currently supports OneDrive. For Google Drive, a listener would choose a folder containing their own music. The browser would index its existing tracks, discover later additions, play tracks directly from Drive, and synchronize user-pinned music to the device for offline playback. The app’s server would receive no filenames, audio, or OAuth credentials.
->
-> Would this use qualify for `drive.readonly` under the local-sync category when playback is the primary purpose and pinning is optional? Is there a narrower scope that supports this existing-folder workflow?
+If prototype passes, address duplicate filenames with ID-based navigation, isolate account storage, and build a resumable folder scan with a Drive changes token committed alongside the local index. 
 
-**If the guidance is encouraging**, prototype two private tracks on an installed iPhone PWA. Try Drive’s `files.download` URI and test seeking, locked-screen advance, and access-token expiry. If playback passes, address duplicate filenames with ID-based navigation, isolate account storage, and build a resumable folder scan with a Drive changes token committed alongside the local index. If eligibility remains unresolved, keep public Google Drive support on hold. [Provider evaluation and technical background](google-dropbox.md) · [Drive download operations](https://developers.google.com/workspace/drive/api/guides/long-running-operations)
+The issue is that `drive.file` scope is available to everyone, but `files.download` requires verification of the app. The fact that our app is simple+local means we might not have to pay for the more expensive server validation. We would do Google validation on the PWA.
+
+Prior to Google Validation, we can let it be used for up to 100 users (lifetime cumulative users). They will see a warning sign when they connect that this is an unvalidated app. We need to do this anyway, because full validation submission is only done for a working app, where we can submit a video showing how it works. There is uncertainty whether they will validate us: their policy is that `files.download` is for only a narrow range of programs, e.g. file sync, not for arbitrary apps; we don't know whether our app (which does indeed have syncing) will pass muster.
+
+## Demo music
+
+For iOS app store submission we have to provide a demo signin. The problem is that OneDrive doesn't have demo signin that we can share with reviewers (it always has some kind of MFA, e.g. an SMS to our number, or an email to our primary address, or a passkey). So we'll need some kind of demo account.
+
+Also a demo account is just good practice, so users can try our app without a lengthy sync of their own music collection.
+
+My idea is that the app's primary signin will be with one of the proper providers (OneDrive, Google Drive, Dropbox, Demo). That's where index files will be stored. And then they can afterwards do "add additional account" which offers readonly access to other signins: full signin into any of OneDrive, Google, Dropbox, or a share link from OneDrive.
+
+The Demo will provider can be implemented under the hood with (1) a share link from my onedrive account `oneplay-test@outlook.com` which has 2gb of free music, and index files can be pregenerated there, (2) favorites and other things can be stored locally. By backing the actual files with a onedrive share, we'll be able to re-use a lot of our MS Graph implementation.
 
 
 ## OnePlay Video

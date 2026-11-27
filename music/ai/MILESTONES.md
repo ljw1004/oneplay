@@ -1,68 +1,48 @@
 # Project Milestones and Validation
 
-OnePlay Music is a mobile-first single-page PWAs: music/ indexes a user's OneDrive music folder and plays it back with full offline support.
+OnePlay Music is a mobile-first single-page PWA that indexes a user's OneDrive music folder and plays it back with full offline support.
 
 ## HOW TO PLAN A MILESTONE
 
 If the user asks you to plan a milestone, these are the steps to take.
 
-1. Read all of PLAN.md (the current document) to learn about the milestone, in the context of past and future milestones. This document lists only the bare essential deliverables and validation steps for each milestone.
-2. Read all prior PLAN_M{n}.md milestone documents as well
-3. Ask any important initial clarifying questions about the milestone you might have.
-  - If you're not asking any questions at all for the entire planning, something's wrong! I know that this file isn't fully specified. There must be important things for you to clarify.
-  - It's better to eliminate unknowns in the milestone by discovering facts, not by asking the user. Do not ask questions that can be answered from the repo or system (for example, "where is this struct?" or "which UI component should we use?" when exploration can make it clear). Only ask once you have exhausted reasonable research.
-     - **Discoverable facts** (repo/system truth): explore first: Before asking, run targeted searches and check likely sources of truth (configs/manifests/entrypoints/schemas/types/constants). Ask only if: multiple plausible candidates; nothing found but you need a missing identifier/context; or ambiguity is actually product intent. If asking, present concrete candidates (paths/service names) + recommend one.Never ask questions you can answer from your environment (e.g., "where is this struct").
-    - **Preferences/tradeoffs** (not discoverable): ask early. These are intent or implementation preferences that cannot be derived from exploration. Provide 2–4 mutually exclusive options + a recommended default. If unanswered, proceed with the recommended option and record it as an assumption in the final plan.
-  - When you ask a question, the user doesn't have your context. You must phrase your questions so as to include FULL context, tradeoffs, background, explanation of terms. Don't use jargon. A good question is typically 2-5 sentences long.
-  - Questions should where possible offer multiple choices, and your recommendation.
-  - Questions should be meaningful; don't include filler choices that are obviously wrong or irrelevant.
-  - You SHOULD ask many questions, but each question must: materially change the spec/plan, OR confirm/lock an assumption, OR choose between meaningful tradeoffs. And it must not be answerable by research.
-  - Keep asking until you can clearly state: goal + success criteria, audience, in/out of scope, constraints, current state, and the key preferences/tradeoffs.
-  - Bias toward questions over guessing: if any high-impact ambiguity remains, do NOT plan yet—ask.
-  - Once intent is stable, proceed with implementation planning...
-  - Once intent is stable, keep asking until the spec is decision complete: approach, interfaces (APIs/schemas/I/O), data flow, edge cases/failure modes, testing + acceptance criteria, rollout/monitoring, and any migrations/compat constraints.
-4. Research milestone-relevant aspects of how `codex app-server` works and how to use it. These are your resources:
-   - Read the official documentation for `codex app-server` at fbsource/third-party/codex/main/codex-rs/app-server/README.md
-   - Read the official client at fbsource/third-party/codex/main/codex-rs/app-server-test-client/README.md
-   - Read as needed the source code implementation of `codex app-server` should we have questions about how it works, at fbsource/third-party/codex/main/codex-rs/app-server
-   - Reverse-engineer as needed OpenAI's Codex extension for VSCode, should we have questions about how they use `codex app-server`. The extension is stored in vsix/vsix.extension.js (for their extension) and vsix/vsix.index.js (for their webview). A user can download a fresh version by running scripts/fetch_vsix.sh (but an AI can't due to sandbox internet restructions).
-5. Research milestone-relevant aspects of how ClaudeMode does the work, starting from xplat/vscode/modules/dvsc-core/src/extension-host/casdk/ClaudeAgent.ts
-6. Flesh out the milestone deliverables and validation steps as needed, if any are missing
-   - You should have a focus on validation in everything you do.
-   - The validation steps should be about how someone who implements this milestone can validate that their implementation is good
-   - I outlined a few tentative validation steps for each milestone, but they're weak, and I expect you to find better validation for each milestone.
-   - Make sure to include the basics: typechecker clean and `arc lint` clean
-7. Develop your plan for the milestone and write it to a new PLAN_M{n}.md file.
-   - A great plan is very detailed—intent- and implementation-wise—so that it can be handed to another engineer or agent to be implemented right away. It must be **decision complete**, where the implementer does not need to make any decisions. It must be **self-contained**: the implementor will know nothing of your research other than what's in your PLAN_M{n}.md file.
-   - The plan must include validation steps, i.e. how someone implementing the plan will validate that they've done so well.
-8. Are there better-engineering blockers? If so, bail!
+1. Read this document to understand the milestone in the context of past and future milestones. The deliverables and validation steps here are a starting point.
+2. Research the milestone using three sources of evidence.
+   - **Existing project docs and code.** Read [AGENTS.md](../../AGENTS.md), [LEARNINGS.md](../../LEARNINGS.md), [ARCHITECTURE.md](ARCHITECTURE.md), [DESIGN.md](DESIGN.md), and prior `PLAN-M*.md` files. Check the relevant implementation and tests to confirm current behavior, invariants, and accepted trade-offs.
+   - **Online research.** Consult primary sources for the platform or API behavior the plan depends on, such as Apple or Microsoft documentation. Record links and note which claims still need to be tested in OnePlay's environment.
+   - **Quick prototypes.** Build the smallest experiment that answers a consequential feasibility, behavior, or performance question. Run it on the relevant browser, device, or service. Record what you tried, what happened, and how the result affected the plan. Keep exploratory work separate from the app implementation.
+3. Resolve any important questions that remain after research.
+   - Ask early when a decision about goals, scope, or product behavior would materially change the plan and the available evidence leaves it open. Give the user enough context to choose, with concrete options, their trade-offs, and your recommendation.
+   - Record reasonable defaults as assumptions and get any required owner approval. Once the intent is clear, specify the approach, interfaces, data flow, supported failure behavior, acceptance criteria, and any applicable rollout or migration requirements.
+4. Flesh out the milestone deliverables and validation steps.
+   - Give the implementer a concrete check and expected outcome for each deliverable. Strengthen the milestone's tentative checks with findings from the research.
+   - Include a clean TypeScript build with `npm run build` from `music/`. Use the Testing and Build and deploy sections of [AGENTS.md](../../AGENTS.md) for the applicable unit, Playwright, and production checks. Specify any device checks needed to establish platform behavior.
+5. Develop your plan for the milestone and write it to a new `PLAN-M{n}.md` file.
+   - Make the plan **decision complete** and **self-contained** so another engineer or agent can implement it without your research context. Include the evidence behind key decisions, accepted trade-offs, and any behavior deliberately left unspecified.
+6. Check for better-engineering prerequisites.
    - The user always wants things done the right way, with clean engineering, good architecture. Never any shortcuts. It's normal that your plan work discovers a structural architectural problem that must be fixed before your plan can proceed.
    - If the architectural problem is small enough to solve, then include that as a phase in your plan. But if it's a major one, worthy of a whole separate plan in its own right, then you should bail, tell the user the problem, and leave them to insert a new milestone specifically for that better engineering.
    - The user is always delighted to hear about better engineering.
-9. Present your PLAN_M{n}.md file to a dedicated Claude KISS reviewer. Run only the specialist roles specified for the plan. Include KISS in every round.
-   - If you couldn't get Claude to run for whatever reason, the user wants you to abort and report what's wrong.
-   - You can trust Claude has already read AGENTS.md, and is able to do its own autonomous research.
-   - If Claude found no problems with your plan, you may proceed.
-   - Otherwise, you must address the issues Claude found: (1) if you agree with the issues, then update your plan, (2) if you disagree with Claude's findings, then update your plan to defend your perspective better.
-   - Keep iterating with Claude until you no longer make changes (either because you've taken on Claude's feedback from past rounds, or because your plan no successfully defends its positions so Claude accepts them). However, if you take more than 10 rounds, then somethig is wrong, so stop and let the user know.
-   - We aren't looking for "blocker vs non-blocker" decisions. Instead for every suggestion from Claude you must evaluate "will this improve my plan? if so then modify your plan, and if not then pre-emptively defend (in the plan) why not". And if you made modifications or defenses, then circle back with Claude again.
-   - Do NOT reference previous rounds when you invoke it: Claude does best if starting from scratch each round, so it can re-examine the whole ask from fundamentals. Note that each time you invoke Claude it has no memory of previous invocations, which is good and will help this goal! Also, avoid asking it something like "please review the updated files" since (1) you should not reference previous rounds implicitly or explicitly, (2) it has no understanding of what the updates were; it only knows about the current state of files+repo on disk.
-10. Ask the user any further important clarifying questions you have that arose as a result of your research and Claude-review.
-   - Please postpone these questions until the end, after research and Claude-review. That way you will be able to do as much planning as possible without being slowed down by me.
+7. Give the plan to a dedicated KISS reviewer using **GPT-6.2 Sol High** (`gpt-6.2-sol`, reasoning effort `high`). Use that model and effort for any other specialist roles specified for the plan. Use only named specialists and include KISS in every round.
+   - Give each specialist the same plan revision, the milestone goals, relevant research and project guidance, and the owner's accepted trade-offs. Start each round fresh and ask reviewers to assess the current plan on its own.
+   - Give KISS the highest priority when weighing scope and design decisions. Ask the reviewer to count the concepts a maintainer must understand, including abstractions, states, policies, and guarantees. Have them identify what can be removed, reused, or consolidated and which problems or edge cases are better left unsolved. Ask them to explain the impact of leaving each case alone and whether it affects a behavior the app promises.
+   - Weigh every finding against the milestone's goals and the KISS findings. Revise the plan when feedback improves it. Where a trade-off warrants explanation, record the rationale in the plan. Repeat review after changes. Stop when a round produces no further changes. If required review cannot run or the review still needs changes after 10 rounds, report what remains unresolved before signoff.
+8. Ask the user any further important clarifying questions that arose from research and peer review.
+   - Postpone these questions until after research and review where possible. If an answer changes the plan, review the revised plan again.
    - Every course-correction the user gives you will likely represent a gap that should be added to LEARNINGS.md or ARCHITECTURE.md. And similarly for many clarifying questions. Please update with these learnings. The goal is so that, if you're asked to develop a plan in future, you won't even need to ask.
-   - Please be careful to follow the "learnings decision tree" -- LEARNINGS.md for durable engineering wisdom, ARCHITECTURE.md for things that will apply to CodexAgent.ts in its finished state, PLAN_M{n}.md for milestone-specific notes
-11. Present the plan for user review and signoff.
+   - Follow the scope guidance in `LEARNINGS.md`. Put durable engineering lessons there, OnePlay Music architecture and contracts in `ARCHITECTURE.md`, and milestone-specific findings in the plan.
+9. Present the plan for user review and signoff.
    - First, double-check that it is a completely self-contained handoff document.
 
-Please use the following format for your PLAN_M{n}.md files:
+Use the following format for `PLAN-M{n}.md` files.
 ```
 # M{n} plan: {title}
 
 ## Summary
-{brief summary of deliverables+validation for this milestone from PLAN.md, augmented as you see fit}
+{brief summary of this milestone's deliverables and validation from MILESTONES.md, with any additions}
 
 ## HOW TO EXECUTE A MILESTONE
-{please include verbatim the content of "how to execute" section of PLAN.md, for the benefit of readers who will read PLAN_M{n}.md but won't read PLAN.md itself
+{include the execution instructions from MILESTONES.md verbatim so the plan is self-contained}
 
 ## Locked user decisions
 {write out all the decisions that the user made}
@@ -85,36 +65,24 @@ Please use the following format for your PLAN_M{n}.md files:
 
 ## HOW TO EXECUTE A MILESTONE
 
-[Please include what follows verbatim when you write a PLAN_M{n}.md file. It will be used to guide anyone who executes on your plan.]
+[Include what follows verbatim when you write a `PLAN-M{n}.md` file.]
 
 If the user asks you to execute on a plan, these are the steps to take.
 
-1. Implement the plan
-   - You should check your work with AI autonomous validation and testing.
-   - The hope is that implementation can be done with a minimum of user interaction, preferably none at all.
-   - Once it is complete, fill in the "Validation" section to the bottom of the plan showing how you have validated it and what were the results.
-   - You might have discovered better engineering
-2. Perform your testing and validation
-   - Update the "AI VALIDATION RESULTS" section of your PLAN_M{n}.md file
-3. Review your own code. For peer review, use only the five specialist roles in step 4. Every round, including review after fixes, requires a dedicated KISS reviewer.
-   - You will need to provide it contect: your plan document PLAN_M{n}.md, and tell it which files or functions you've worked on. Ask it also to review your validation steps.
-   - If Claude found no blockers or problems with your work, you may proceed. Do static checking (formatting, eslint, typechecking). If you need any fixes, static check again to make sure it's clean.
-   - If you couldn't get Claude to run for whatever reason, the user wants you to abort and report what's wrong.
-   - Keep iterating with Claude until you no longer make changes (either because you've taken on Claude's feedback from past rounds, or because your plan no successfully defends its positions so Claude accepts them). However, if you take more than 10 rounds, then somethig is wrong, so stop and let the user know.
-   - We aren't looking for "blocker vs non-blocker" decisions. Instead for every suggestion from Claude you must evaluate "will this improve my code? if so then modify your code, and if not then pre-emptively defend (in code comments) why not". And if you made modifications or comments, then circle back with Claude again.
-   - Do NOT reference previous rounds when you invoke it: Claude does best if starting from scratch each round, so it can re-examine the whole ask from fundamentals. Note that each time you invoke Claude it has no memory of previous invocations, which is good and will help this goal! Also, avoid asking it something like "please review the updated files" since (1) you should not reference previous rounds implicitly or explicitly, (2) it has no understanding of what the updates were; it only knows about the current state of files+repo on disk.
-4. After implementation, do a "better engineering" phase
-   - Clean up LEARNINGS.md and ARCHITECTURE.md. If any information there is just restating information from other files then delete it. If it would belong better elsewhere, move it. Please be careful to follow the "learnings decision tree" -- LEARNINGS.md for durable engineering wisdom, ARCHITECTURE.md for things that will apply to CodexAgent.ts in its finished state, PLAN_M{n}.md for milestone-specific notes
-   - Launch the five Claude specialists below in parallel on the same revision. Read the KISS findings alongside the other reports before deciding which suggestions warrant a change. Give the KISS reviewer the accepted product trade-offs and ask which proposed guarantees or existing machinery can be dropped.
-   - (1) Review the code for correctness. Also ask Claude to evaluate this.
-   - (2) Validate whether work obeys the codebase style guidelines in AGENTS.md. Also ask Claude to evaluate this. The user is INSISTENT that they must be obeyed.
-   - (3) Validate whether the work obeys each learning you gathered in LEARNINGS.md. Also ask Claude to evaluate this. (A separate instance of Claude; it can't do too much in one go).
-   - (4) Validate whether the work has satisfied the milestone's goals. Also ask Claude to evaluate this.
-   - (5) Check if there is KISS, or consolidation, or refactoring that would improve quality of codebase. Also ask Claude the same question.
-   - If you make changes, they'll need a pass of static checking (formatting, eslint, typechecking), and again to make sure it's clean.
-   - You might decide to do better engineering yourself. If not, write notes about whats needed in the "BETTER ENGINEERING INSIGHTS" section of the plan.
-   - Tell the user how you have done code cleanup. The user is passionate about clean code and will be delighted to hear how you have improved it.
-5. Upon completion, ask for user review. Tell the user what to test, what commands to use, what gestures to try out, what to look for
+1. Implement the plan and validate the work autonomously. When implementation exposes an unknown that could change the design, consult the project docs and relevant primary online sources, and use a quick prototype to test the assumption. Record findings that affect the milestone in the plan.
+2. Run the plan's validation. Run `npm run build` from `music/` to typecheck. Follow the repo's Testing and Build and deploy instructions in `AGENTS.md`, including deployment before Playwright integration tests and production verification. Record the checks, results, and evidence in the plan's **AI VALIDATION RESULTS** section.
+3. Review your own work, then assign the five specialist roles below to separate **GPT-6.2 Sol High** reviewers (`gpt-6.2-sol`, reasoning effort `high`). Use only these roles. Run them in parallel where possible, with all five reviewing the same revision in every round, including rounds after fixes.
+   - Give each reviewer the milestone plan, changed files or functions, validation evidence, relevant invariants, and accepted product trade-offs. Start each round fresh and ask reviewers to assess the current work on its own.
+   - **Correctness.** Check that the implementation preserves the relevant invariants and delivers the promised behavior on supported paths. Evaluate whether the validation would catch regressions in those paths.
+   - **Codebase style.** Check the changed code against the engineering and style guidance in `AGENTS.md`.
+   - **Project learnings.** Check the work against the applicable lessons in `LEARNINGS.md`.
+   - **Milestone goals.** Check that the implementation and validation cover every deliverable and acceptance criterion in the plan.
+   - **KISS.** Count the concepts introduced or retained. Look for needless abstractions, state, persistence, special cases, and test assertions that turn incidental behavior into a promise. Identify what can be removed, reused, or consolidated. For each proposed fix or edge case, ask which promised behavior it protects, what happens if it is left alone, and whether that impact justifies the added complexity.
+4. Resolve findings and finish the better-engineering work.
+   - Give the dedicated KISS review the highest priority when weighing scope and design decisions. Read it alongside every other report before acting. A reproducible edge case warrants a fix when its impact on promised behavior justifies the cost. Preserve the owner's accepted trade-offs.
+   - Make changes that improve the work. Explain consequential trade-offs in the plan or beside the relevant code. Keep durable engineering lessons in `LEARNINGS.md`, app contracts in `ARCHITECTURE.md`, and milestone-specific findings or deferred engineering in the plan's **BETTER ENGINEERING INSIGHTS + BACKLOG ADDITIONS** section.
+   - After changes, repeat the applicable validation and convene a fresh specialist round, including KISS. Stop when a round produces no further changes. If required review cannot run or the review still needs changes after 10 rounds, report what remains unresolved before handoff.
+5. Present the validated result for user review. Include the walkthrough from **USER VALIDATION SUGGESTIONS**, with commands or gestures to try and the expected behavior.
 
 
 ## Milestone 1: Development infrastructure

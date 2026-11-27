@@ -48,12 +48,7 @@ function isSignInGateFailure(error) {
 
 /** Standalone fixtures seed an isolated origin before opening the app. */
 function usesStandaloneFixture(name) {
-    return name.startsWith('wheel:') || name.startsWith('folders:');
-}
-
-/** Startup faults and standalone fixtures each need a clean origin. */
-function usesIsolatedProfile(name) {
-    return name.startsWith('startup:') || usesStandaloneFixture(name);
+    return name.startsWith('wheel:') || name.startsWith('folders:') || name.startsWith('startup:');
 }
 
 /** Capture full localStorage snapshot for the current page origin. */
@@ -127,13 +122,11 @@ async function restoreLocalStorageSnapshot(page, snapshot) {
     for (const [name, fn] of entries) {
         let tempCtx = null;
         let tempProfileDir = null;
-        const isolated = usesIsolatedProfile(name);
+        const isolated = usesStandaloneFixture(name);
         if (signInRequired && !isolated) continue;
-        const standalone = usesStandaloneFixture(name);
         if (isolated) {
             tempProfileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oneplay-music-it-'));
-            tempCtx = await chromium.launchPersistentContext(tempProfileDir, { headless: true,
-                serviceWorkers: standalone ? 'block' : 'allow' });
+            tempCtx = await chromium.launchPersistentContext(tempProfileDir, { headless: true, serviceWorkers: 'block' });
         }
         const activeCtx = tempCtx || ctx;
         const page = await activeCtx.newPage();
@@ -141,14 +134,10 @@ async function restoreLocalStorageSnapshot(page, snapshot) {
         let perTestStorageSnapshot = {};
         try {
             // Standalone fixtures install their seed route before their first navigation.
-            if (!standalone) {
+            if (!isolated) {
                 await page.goto(URL, { waitUntil: 'domcontentloaded' });
-                if (isolated) {
-                    await restoreLocalStorageSnapshot(page, originStorageSnapshot).catch(() => {});
-                } else {
-                    perTestStorageSnapshot = await snapshotLocalStorage(page);
-                    await setup(page);
-                }
+                perTestStorageSnapshot = await snapshotLocalStorage(page);
+                await setup(page);
             }
             await fn(page);
             emit(`  ✓ ${name}  (${((Date.now() - t0) / 1000).toFixed(1)}s)`);

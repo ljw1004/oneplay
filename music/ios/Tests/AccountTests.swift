@@ -1635,7 +1635,8 @@ private final class TestAudioCDN: URLProtocol {
         await fulfillment(of: [signOut.cancelled], timeout: 3)
         // This page also waits for WebKit to clear the 30k-track store. On the simulator that
         // cleanup alone can take 20 seconds; keep the regular cold-shell deadline for other callers.
-        let signedOut = try await readyPage(in: controller, excluding: replacement, timeout: .seconds(60))
+        let signedOut = try await readyPage(in: controller, excluding: replacement,
+                                            timeout: .seconds(60), allowEmptyOffline: true)
         for retained in [page, replacement] {
             let retired = try await retained.evaluateJavaScript("location.href === 'about:blank' && typeof window.fixtureWriter === 'undefined'")
             XCTAssertEqual(retired as? Bool, true, "The old document is still alive after sign-out")

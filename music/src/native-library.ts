@@ -129,15 +129,18 @@ export function createNativeLibrary(handler: ReplyHandler) {
         /** Native is the sole evidence writer. This page projects changes into the library UI. */
         applyEvidence(next: EvidenceState) {
             const prev = state.evidence;
-            if (next === prev) return;
+            // A repeated value can still be newer than an account reply in flight.
             state = { ...state, evidence: next };
-            library.onEvidenceChange(next, prev);
+            if (next !== prev) library.onEvidenceChange(next, prev);
         },
         async loadAccountState(op: 'state' | 'signIn') {
+            const requestedFrom = state;
             const next = await post({ op }) as NativeAccountState;
-            const prev = state.evidence;
-            state = next;
-            if (next.evidence !== prev) library.onEvidenceChange(next.evidence, prev);
+            const previous = state;
+            // Pairing can await native store setup after capturing its snapshot.
+            // An evidence event observed during that wait owns reachability.
+            state = requestedFrom === previous ? next : {...next, evidence: previous.evidence};
+            if (state.evidence !== previous.evidence) library.onEvidenceChange(state.evidence, previous.evidence);
         },
         requireInteractiveReconnectForDebug: () => post({ op: 'debugRequireInteractiveReconnect' }),
         signOut: (theme: string) => post({ op: 'signOut', theme }),

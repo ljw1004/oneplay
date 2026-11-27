@@ -230,6 +230,9 @@ export function createTree(
         initialScrollMap ? Object.entries(initialScrollMap) : [],
     );
     let scrollRafPending = false;
+    // A restored bottom offset can be temporarily above the current maximum
+    // while the native player is still preparing its first footer.
+    let clampedInitialScroll: { readonly top: number; readonly applied: number } | undefined;
     /** Physical or logical folder whose children were last drawn and own the scroll offset. */
     let previousPath: FolderPath | undefined;
     /** Timeout id that clears temporary inline overflow used during FLIP. */
@@ -237,7 +240,10 @@ export function createTree(
     /** Capture the list while it still owns the viewport, including navigation before the next scroll frame. */
     function rememberListScroll(): void {
         if (!previousPath || container.hidden || !childrenEl.childElementCount) return;
-        scrollMap.set(JSON.stringify(previousPath), {top: childrenEl.scrollTop});
+        const top = childrenEl.scrollTop;
+        if (clampedInitialScroll?.applied === top) return;
+        clampedInitialScroll = undefined;
+        scrollMap.set(JSON.stringify(previousPath), {top});
         if (scrollMap.size > 100) scrollMap.delete(scrollMap.keys().next().value!);
     }
 
@@ -1080,13 +1086,17 @@ export function createTree(
         const pathKey = JSON.stringify(displayedPath);
         const isUpOrSame = !previous || displayedPath.every((s, i) => s === previous[i]);
         const savedScroll = scrollMap.get(pathKey);
-        if (isSamePath && hadChildrenRows) {
-            childrenEl.scrollTop = liveScrollBeforeRender;
-        } else if (isUpOrSame && savedScroll !== undefined) {
-            childrenEl.scrollTop = savedScroll.top;
-        } else {
-            childrenEl.scrollTop = 0;
-        }
+        const stillClamped = isSamePath && clampedInitialScroll?.applied === liveScrollBeforeRender
+            ? clampedInitialScroll : undefined;
+        const scrollTop = isSamePath && hadChildrenRows
+            ? stillClamped?.top ?? liveScrollBeforeRender
+            : isUpOrSame ? savedScroll?.top ?? 0 : 0;
+        childrenEl.scrollTop = scrollTop;
+        // A viewport redraw can restore the rest. Navigation or a changed live
+        // offset cancels the retry so the listener's current scroll wins.
+        clampedInitialScroll = (!previous || stillClamped) && childrenEl.scrollTop < scrollTop
+            ? {top: scrollTop, applied: childrenEl.scrollTop}
+            : undefined;
         previousPath = displayedPath;
 
         // Empty-favorites placeholder: when at app root and user has no favorites,

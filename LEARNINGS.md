@@ -24,6 +24,7 @@
 - **Keep a narrow fix local.** When two existing calls need the same request option, add it at both call sites. Extract a helper when the fix requires shared logic or the user asks for the refactor.
 - **Reviewers can turn accepted behavior into a requirement.** A reviewer can reproduce an edge case accurately and still recommend the wrong fix. In M18, changing folder pins could cause another download. We accept repeat downloads as routine. We also leave the outcome of re-pinning during deletion unspecified. Adding persistent state to preserve the bytes, then testing for zero repeat downloads, made an invented promise look like a regression test.
 - **Give every review round its own dedicated KISS reviewer.** Use only the prescribed specialist roles. A general reviewer prompted to consider simplicity loses the independent judgment that KISS is there to supply. Give all specialists the same revision and the owner's accepted trade-offs. Before acting on a finding, identify the promised behavior it affects and weigh it alongside the KISS findings. When fixes change the code, the KISS reviewer must see that revision too. [Peer review instructions](AGENTS.md#agent-peer-review)
+- **Review recovery behavior as part of the UX.** OnePlay's startup timer displayed a reload screen even though local cache loading later succeeded. The timer logged a real delay, while the terminal UI prevented recovery. Review what listeners see and can do when routine lifecycle interruptions delay otherwise successful work. [UX review requirements](AGENTS.md#agent-peer-review)
 - **Preserve the reasoning in existing comments.** Explanations of invariants, propagation, and recovery are part of the design record. If a sentence needs correction for the task, edit that sentence and preserve the surrounding rationale.
 - **Give surprising options a brief reason at each use.** One line beside each `cache: 'no-store'` explains what a future maintainer could otherwise miss: the folder ETag can stay the same while its recursive size changes.
 
@@ -41,11 +42,12 @@
 - **Cancelable async work needs real cancellation plumbing.** Pass the `AbortSignal` through I/O and check it before publishing the result. A body can finish decoding after the native bridge has completed the request and detached its cancellation listener.
 - **User cancel and timeout are different contracts.** User cancel is control flow (`AbortError`); timeout is an operational failure path.
 - **Cancel a waiter separately from a shared operation.** A cancelled reader should release its worker even when another caller still needs the same token refresh. Account cleanup must wait for the underlying SDK callback if it can still write credentials.
-- **Protect startup from hangs with a terminal-state latch.** Define structural terminal states and ensure only the first terminal render wins.
+- **Use a terminal latch only for irreversible startup outcomes.** A timer says work took longer than expected. Keep valid late results admissible and offer recovery while work is pending. Fence a partial initialization that cannot safely be reused, and distinguish a rejected cache read from cache absence.
 - **Use single-flight coordinators for shared refresh/init paths.** UI disable states alone do not prevent race conditions.
 - **For idempotent async init, guard with an in-flight promise.** `if (ready)` checks alone are unsafe under concurrent callers.
 - **Invalidate orphaned background tasks with a generation counter.** `abort()` alone is not enough once work has passed its last abort check.
 - **Idempotent setters prevent callback feedback loops.** No-op when effective value is unchanged.
+- **Record newer observations before deduplicating their notifications.** An unchanged connectivity value can still supersede the state captured for an asynchronous bridge reply.
 - **If fire-and-forget is truly required, encode it in the callee contract.** The callee owns all errors and returns `void`.
 
 ## Network and reliability
@@ -90,6 +92,7 @@
 - **Any server 4xx is still connectivity evidence.** The server responded even if auth failed; 5xx/timeouts/network exceptions are different.
 - **Gate background work and UI affordances on evidence state.** This keeps behavior explicit under flaky networks and auth loss.
 - **Use `online`/`offline` plus `visibilitychange` reconciliation.** Lifecycle events are imperfect and need a backstop.
+- **Keep a rejected browser session distinct from transport evidence.** With an empty library, restore the known sign-in action as soon as connectivity allows, even while independent responses are pending. Test both orders of reconnect and credential invalidation. Preserve access to a valid cached tree.
 - **Suppress periodic work in terminal states.** Signed-out and definite-offline states should stop retry churn until recovery signals arrive.
 
 ## Data modeling

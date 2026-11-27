@@ -4,9 +4,11 @@ import WebKit
 
 /// A cold WebContent process can start after XCTest. Check the rendered page
 /// and report its actual terminal state if WebKit or application startup fails.
-@MainActor func readyPage(in controller: LibraryController, excluding old: WKWebView? = nil, timeout: Duration = .seconds(20)) async throws -> WKWebView {
+@MainActor func readyPage(in controller: LibraryController, excluding old: WKWebView? = nil,
+                          timeout: Duration = .seconds(20), allowEmptyOffline: Bool = false) async throws -> WKWebView {
     let deadline = ContinuousClock.now + timeout
     let ready = "!!document.querySelector('.signin-btn') || document.getElementById('tree-container')?.hidden === false"
+        + (allowEmptyOffline ? " || !!document.querySelector('.startup-error[data-offline]')" : "")
     while ContinuousClock.now < deadline {
         if let page = controller.webView, page !== old,
            (try? await page.evaluateJavaScript(ready)) as? Bool == true { return page }
@@ -23,12 +25,10 @@ import WebKit
 @MainActor final class BundledShellTests: XCTestCase {
     func testInstalledShellAndStores() async throws {
         let app = try XCTUnwrap(UIApplication.shared.delegate as? AppDelegate)
-        let page = try await readyPage(in: app.library)
+        let page = try await readyPage(in: app.library, allowEmptyOffline: true)
         XCTAssertEqual(page.url, BundledShell.page)
         let modules = BundledShell().files.keys.filter { $0.pathExtension == "js" }.map(\.absoluteString)
         let result = try await page.callAsyncJavaScript("""
-            if (!document.querySelector('.signin-btn') && document.getElementById('tree-container')?.hidden !== false)
-                throw Error("Startup did not render: " + document.getElementById('status')?.innerText);
             await Promise.all(modules.map(url => import(url)));
             const bridge = window.webkit.messageHandlers.oneplay;
             const state = await bridge.postMessage({op:'state'});
@@ -73,9 +73,9 @@ import WebKit
     /// Same-URL reload must release page-owned requests and file handles along with the old document.
     func testReloadReplacesTheAdmittedView() async throws {
         let controller = try XCTUnwrap((UIApplication.shared.delegate as? AppDelegate)?.library)
-        let old = try await readyPage(in: controller)
+        let old = try await readyPage(in: controller, allowEmptyOffline: true)
         old.reload()
-        _ = try await readyPage(in: controller, excluding: old)
+        _ = try await readyPage(in: controller, excluding: old, allowEmptyOffline: true)
     }
 
     func testManifestExcludesUntrustedURLs() {

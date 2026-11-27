@@ -11,6 +11,7 @@
 
 import { log, logError, errorDetail } from './logger.js';
 import { readGraphJson, waitForMsWithAbort, type AuthFetch } from './auth.js';
+import { ProviderHttpError } from './provider.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -321,7 +322,7 @@ async function buildIndexSingleAttempt(
                     : undefined;
                 const status = throttled?.status ?? r.status;
                 if (status !== 429 && status !== 503) {
-                    if (!r.ok) throw new Error(`batch POST failed status=${status}`);
+                    if (!r.ok) throw new ProviderHttpError(status, `batch POST failed status=${status}`);
                     await postprocessBatchResponse(page, followContent, signal);
                     signal.throwIfAborted();
                     return page;
@@ -356,7 +357,8 @@ async function buildIndexSingleAttempt(
             const childrenResult = item.responses[`children-${item.data.folder.id}`];
 
             if (childrenResult.status !== 200 || !Array.isArray(childrenResult.body?.value)) {
-                throw new Error(`children listing failed id=${childrenResult.id} status=${childrenResult.status}`);
+                throw new ProviderHttpError(childrenResult.status,
+                    `children listing failed id=${childrenResult.id} status=${childrenResult.status}`);
             }
 
             if (cacheResult?.status === 200 && isCurrentIndex(cacheResult.body, item.driveItem)) {

@@ -9,7 +9,7 @@ import { dbGet, dbPut, dbClear, dbDelete, dbKeysWithPrefix } from './db.js';
 import { log, logError, logCatch } from './logger.js';
 import { initWebLogger } from './logger-web.js';
 import {
-    type MusicData, type AccountInfo, type IndexProgress, sortedFolderChildren,
+    type MusicData, type AccountInfo, sortedFolderChildren,
 } from './indexer.js';
 import { createTree, type TreeView } from './tree.js';
 import { createPlayback, type Playback, isValidMode } from './playback.js';
@@ -40,9 +40,6 @@ const displayNativeLog = initWebLogger();
 const SW_DEBUG = true;
 const TIMER_VALUES: readonly TimerDuration[] = ['15m', '30m', '45m', '60m', 'end-of-track'];
 const FAVORITE_CUSTOMIZE_TOAST_KEY = 'oneplay_music_tip_customize_favorite_shown';
-const STARTUP_DEADLINE_MS = 5000;
-const STARTUP_DEADLINE_WITH_OAUTH_CODE_MS = 13000;
-const STARTUP_ERROR_MESSAGE = 'Could not finish startup. Please reload.';
 
 /** Deploy counter — replaced by sed during `npm run deploy`.
  *  On localhost (watch mode), this stays as the placeholder string. */
@@ -57,7 +54,7 @@ const statusEl = (): HTMLElement => document.getElementById('status')!;
 
 /** Loads cached MusicData from IndexedDB, returning undefined if absent or schema mismatch. */
 const loadCachedData = async (driveId: string): Promise<MusicData | undefined> => {
-    const data = await dbGet<MusicData>(indexKey(driveId)).catch(() => undefined);
+    const data = await dbGet<MusicData>(indexKey(driveId));
     return (data && typeof data === 'object' && data.kind === 'MusicData') ? data : undefined;
 };
 
@@ -115,6 +112,9 @@ let favoriteCustomizeToastShownInSession = false;
 let activeToastEl: HTMLElement | undefined;
 let activeToastTimer: ReturnType<typeof setTimeout> | undefined;
 let appResumeLogArmed = false;
+// Pulls require a successful first tree install or a completed local cache miss.
+// A partial installation closes admission again until explicit document retry.
+let localBootstrapComplete = false;
 
 /** Shows a short-lived toast above the bottom controls. */
 function showToastMessage(message: string): void {
@@ -161,9 +161,16 @@ const auth = native ?? browserAuth!;
 const oneDrive = createOneDriveProvider(auth.fetch, native?.followContent);
 auth.onEvidenceChange = (newState, prevState) => {
     log(`evidence: ${prevState} → ${newState}`);
-    if (native && tree) {
+    if (native && startup.hasInstalledTree()) {
         if (newState === 'evidence:not-online' || newState === 'evidence:signed-out') sync.cancelScheduledPull();
         else if (prevState === 'evidence:not-online') sync.requestPullFromOneDrive('online').catch(logCatch('native online pull'));
+    }
+    if (localBootstrapComplete) {
+        if (newState === 'evidence:not-online' || (browserAuth && !navigator.onLine)) {
+            startup.showOfflineIfAwaitingRecovery();
+        } else if (newState === 'evidence:signed-out') {
+            startup.showSignInIfAwaitingRecovery(!!browserAuth);
+        }
     }
     downloads?.handleEvidenceTransition();
     if (native && offlinePins) { renderOfflineProgress(true); offlinePins.refresh().catch(logCatch('offline evidence')); }
@@ -208,7 +215,7 @@ interface TestHooksWindow extends Record<string, unknown> {
     _testSettingsReconnect?: () => Promise<void> | void;
     _testSettingsRefreshNow?: () => Promise<void> | void;
     _testSetLatestIndexFailure?: (failure?: { label?: string; message?: string }) => void;
-    _testStartupDeadlineMs?: unknown;
+    _testStartupOpeningWaitMs?: unknown;
 }
 
 const getTestHooksWindow = (): TestHooksWindow => window as unknown as TestHooksWindow;
@@ -218,21 +225,18 @@ type SearchReason = 'open' | 'query-change' | 'show-tree' | 'share-roots' | 'off
 const startup = createIndexStartup({
     swDebug: SW_DEBUG,
     appVersionLabel: DEPLOY_COUNTER,
-    startupDeadlineMsDefault: STARTUP_DEADLINE_MS,
-    startupDeadlineWithOauthCodeMs: STARTUP_DEADLINE_WITH_OAUTH_CODE_MS,
-    startupErrorMessage: STARTUP_ERROR_MESSAGE,
     getDebugEnabled: () => debugEnabled,
-    getTestStartupDeadlineMs: () => getTestHooksWindow()._testStartupDeadlineMs,
+    getTestOpeningWaitMs: () => getTestHooksWindow()._testStartupOpeningWaitMs,
     onSignIn: () => {
         signInAndRefreshLibrary().catch(logCatch('sign-in button'));
     },
-    renderIndexing: (progress) => renderIndexing(progress),
 });
 
 const sync = createIndexSync({
     auth,
     oneDrive,
-    startupErrorMessage: STARTUP_ERROR_MESSAGE,
+    canPull: () => localBootstrapComplete,
+    hasInstalledTree: startup.hasInstalledTree,
     accountData,
     getTree: () => tree,
     getPlayback: () => playback,
@@ -252,12 +256,11 @@ const sync = createIndexSync({
     ensureFavorites: () => ensureFavorites(),
     ensureShares: () => ensureShares(),
     showTree: (info, data, reindexing = false) => showTree(info, data, reindexing),
-    showError: (message) => startup.showError(message),
-    renderSignInButtonIntoStatus: startup.renderSignInButtonIntoStatus,
-    renderStartupErrorIntoStatusAndWireReload: (message) => startup.renderStartupErrorIntoStatusAndWireReload(message),
-    markStartupTerminalState: (state) => startup.markStartupTerminalState(state),
-    enterFirstTimeIndexingAndBypassStartupDeadline: () => startup.enterFirstTimeIndexingAndBypassStartupDeadline(),
-    renderIndexing: (progress) => renderIndexing(progress),
+    showOpening: startup.showOpening,
+    showSignIn: startup.showSignIn,
+    showOpeningFailure: startup.showFailure,
+    finishOpening: startup.showFailureIfUnresolved,
+    showIndexProgress: startup.showIndexProgress,
     computeAndPushOfflineState: () => computeAndPushOfflineState(),
     invalidateSearchData: () => invalidateSearchData(),
     runSearchAndPushIntoTree: (reason) => runSearchAndPushIntoTree(reason),
@@ -393,12 +396,12 @@ async function signInAndRefreshLibrary(): Promise<void> {
     if (button) button.disabled = true;
     try {
         await native.loadAccountState('signIn');
-        if (!tree) renderIndexing({ fraction: 0, message: 'Opening your OneDrive library...' });
         await sync.requestPullFromOneDrive('settings-refresh');
-        if (!tree && !startup.isStartupTerminalUiRendered()) startup.renderStartupErrorIntoStatusAndWireReload(STARTUP_ERROR_MESSAGE);
+        startup.showFailureIfUnresolved(localBootstrapComplete && auth.getEvidence() === 'evidence:not-online');
     } catch (error) {
         const outcome = error instanceof Error ? error.message : String(error);
-        if (!tree) startup.renderSignInButtonIntoStatus();
+        if (auth.getEvidence() === 'evidence:not-online') startup.showFailure(true);
+        else startup.showSignIn();
         if (outcome !== 'cancelled') showToastMessage(outcome === 'wrongAccount'
             ? 'Reconnect with the OneDrive account used for this library.'
             : 'OneDrive sign-in failed. Please try again.');
@@ -531,23 +534,40 @@ function closeSettingsPage(): void {
  * Creates the tree and playback components on first call; updates data on subsequent calls.
  */
 function showTree(info: AccountInfo, data: MusicData, reindexing = false): void {
-    if (startup.hasReachedDeadline()) return;
+    const firstInstall = !startup.hasInstalledTree();
     const status = statusEl();
-    const treeEl = document.getElementById('tree-container')!;
-    const settingsEl = document.getElementById('settings-container')!;
-    status.hidden = true;
+    const moveFocus = status.contains(document.activeElement);
     const settingsOpen = settings?.isOpen() ?? false;
-    treeEl.hidden = settingsOpen;
-    settingsEl.hidden = !settingsOpen;
-    startup.markStartupTerminalState('tree');
+    status.hidden = true;
+    // Breadcrumb measurement and scroll restoration require a layout-visible tree.
+    document.getElementById('tree-container')!.hidden = settingsOpen;
+    document.getElementById('settings-container')!.hidden = !settingsOpen;
+    try {
+        wireAndRenderTree(info, data, reindexing);
+    } catch (error) {
+        if (firstInstall) {
+            localBootstrapComplete = false;
+            startup.showFailure(false, moveFocus);
+        }
+        throw error;
+    }
+    if (firstInstall) {
+        document.getElementById('footer')!.hidden = false;
+        startup.recordTreeInstalled(moveFocus);
+        nativePlayer?.refreshLibraryQueue().catch(logCatch('initial native library projection'));
+    }
+}
 
+/** Wire the tree once, then install the primary account and the cached projection. */
+function wireAndRenderTree(info: AccountInfo, data: MusicData, reindexing: boolean): void {
+    let attachNativePlayer: (() => void) | undefined;
     // Update root-folder references for playback path resolution.
     accountData.set(info.driveId, { folder: data.folder, driveId: info.driveId });
 
     if (!tree) {
-        tree = createTree(treeEl, restoredView?.path, restoredScroll,
+        tree = createTree(document.getElementById('tree-container')!, restoredView?.path, restoredScroll,
             SW_DEBUG ? DEPLOY_COUNTER : '');
-        settings = createSettings(settingsEl);
+        settings = createSettings(document.getElementById('settings-container')!);
         if (browserAuth) {
             playback = createPlayback(
                 document.getElementById('player') as HTMLAudioElement,
@@ -611,22 +631,24 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
                     } catch (error) { logCatch('playback:legacy favorite')(error); }
                 }
             };
-            nativePlayer = attachNativePlayback(native, document.getElementById('footer')!,
-                tree.setPlaybackInfo, path => {
-                    if (settings?.isOpen()) closeSettingsPage();
-                    tree!.revealTrack(path);
-                }, showToastMessage, describe, () => shares?.hasLoadedMembership?.() ? shares.getAll().map(s => s.rootKey) : undefined, async (folder, mode) => {
-                    const favorite = favorites?.getAll().find(f => folder[1] === 'fav:' + f.id);
-                    if (favorite) await favorites!.setMode(favorite.id, mode);
-                }, favoriteSettings, migratePrivateSpots, () => restoredPlayback && Array.isArray(restoredPlayback.folder)
-                    && Array.isArray(restoredPlayback.track) ? {folder: restoredPlayback.folder, track: restoredPlayback.track,
-                        seconds: Number.isFinite(restoredTime) && restoredTime! > 0 ? restoredTime! : 0,
-                        mode: isValidMode(restoredPlayback.mode) ? restoredPlayback.mode : 'all', timer: timerDuration,
-                        consume: () => {
-                            restoredPlayback = undefined;
-                            localStorage.removeItem('oneplay_music_playback');
-                            localStorage.removeItem('oneplay_music_time');
-                        }} : undefined);
+            attachNativePlayer = () => {
+                nativePlayer = attachNativePlayback(native, document.getElementById('footer')!,
+                    tree!.setPlaybackInfo, path => {
+                        if (settings?.isOpen()) closeSettingsPage();
+                        tree!.revealTrack(path);
+                    }, showToastMessage, describe, () => shares?.hasLoadedMembership?.() ? shares.getAll().map(s => s.rootKey) : undefined, async (folder, mode) => {
+                        const favorite = favorites?.getAll().find(f => folder[1] === 'fav:' + f.id);
+                        if (favorite) await favorites!.setMode(favorite.id, mode);
+                    }, favoriteSettings, migratePrivateSpots, () => restoredPlayback && Array.isArray(restoredPlayback.folder)
+                        && Array.isArray(restoredPlayback.track) ? {folder: restoredPlayback.folder, track: restoredPlayback.track,
+                            seconds: Number.isFinite(restoredTime) && restoredTime! > 0 ? restoredTime! : 0,
+                            mode: isValidMode(restoredPlayback.mode) ? restoredPlayback.mode : 'all', timer: timerDuration,
+                            consume: () => {
+                                restoredPlayback = undefined;
+                                localStorage.removeItem('oneplay_music_playback');
+                                localStorage.removeItem('oneplay_music_time');
+                            }} : undefined);
+            };
             let selection = 0;
             const playAlbum = async (folderPath: readonly string[], trackPath?: readonly string[]) => {
                 const intent = ++selection;
@@ -719,7 +741,6 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
     }
     tree.setIndexFailureWarning(sync.hasLatestIndexFailure());
     tree.setDebugEnabled(SW_DEBUG && debugEnabled);
-    nativePlayer?.setDebugEnabled(debugEnabled);
     playback?.setTimerDuration(timerDuration);
     tree.setAccount(info.driveId, data.folder, info, reindexing);
     sync.syncShareRootsIntoTreeAndPlayback();
@@ -730,6 +751,10 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
     computeAndPushOfflineState();
     invalidateSearchData();
     runSearchAndPushIntoTree('show-tree');
+    // The first playback snapshot can revise the live queue. Attach only once
+    // the account, share and favorite projection has rendered and controls work.
+    attachNativePlayer?.();
+    nativePlayer?.setDebugEnabled(debugEnabled);
 }
 
 // Offline state orchestration
@@ -798,7 +823,7 @@ async function ensureFavorites(): Promise<void> {
     ensureFavoritesPromise = (async () => {
         const publishFavorites = async () => {
             // onChange: sync favorite roots into tree and re-render
-            if (tree) {
+            if (tree && startup.hasInstalledTree()) {
                 ++nativeLibraryGeneration;
                 tree.setFavorites(favorites!);
                 select?.setRoots(tree.getRoots());
@@ -811,6 +836,7 @@ async function ensureFavorites(): Promise<void> {
             }
         };
         favorites = createFavorites({documents: oneDrive.documents, dbGet, dbPut, fenceQueueEdit: async () => {
+            if (!startup.hasInstalledTree()) return;
             ++nativeLibraryGeneration;
             return playback ? playback.fenceQueueEdit() : nativePlayer?.fenceQueueEdit();
         }}, origin => {
@@ -818,7 +844,7 @@ async function ensureFavorites(): Promise<void> {
             // has no effect on queue membership, folder badges or a live playback session.
             if (origin === 'mode') return;
             // Pin membership can commit while playback is waiting for an unrelated source index.
-            if (origin === 'pins') return computeAndPushOfflineState();
+            if (origin === 'pins') return startup.hasInstalledTree() ? computeAndPushOfflineState() : undefined;
             const published = publishFavorites();
             // A remote edit may reference a share whose index this same sync still has to load.
             // Keep its tree publication pending while the sync proceeds with that prerequisite.
@@ -915,30 +941,6 @@ function wireFavoritesUi(): void {
         select.setDownloads(offlinePins);
         if (native) offlinePins.refresh().catch(logCatch('offline inventory'));
     }
-}
-
-// Rendering (indexing progress — shown in #status, not in tree)
-
-/**
- * Renders the prominent progress display for first-time indexing.
- * Called repeatedly as progress updates arrive.
- */
-function renderIndexing(progress: IndexProgress): void {
-    if (startup.hasReachedDeadline()) return;
-    const el = statusEl();
-    const pct = Math.round(progress.fraction * 100);
-
-    // Create structure on first call
-    if (!el.querySelector('.index-progress')) {
-        el.innerHTML = `<div class="index-progress">`
-            + `<div>Indexing your music...</div>`
-            + `<div class="progress-bar"><div class="progress-fill"></div></div>`
-            + `<div class="status-line"></div>`
-            + `</div>`;
-    }
-
-    el.querySelector<HTMLElement>('.progress-fill')!.style.width = `${pct}%`;
-    el.querySelector('.status-line')!.textContent = `${pct}% — ${progress.message}`;
 }
 
 // M10: Restore playback visual state
@@ -1078,20 +1080,15 @@ async function startupInner(): Promise<void> {
             }
             const before = auth.getEvidence();
             const after = browserAuth?.reconcileEvidenceFromNavigator('document:visibilitychange');
-            if (after && before === 'evidence:not-online' && after !== 'evidence:not-online') {
+            if (after && after !== 'evidence:not-online'
+                && (before === 'evidence:not-online' || startup.isShowingOfflineRetry())) {
                 sync.requestPullFromOneDrive('online').catch(logCatch('visible pull'));
             }
         }
     });
     // If the app starts with stale evidence while hidden lifecycle events were missed,
     // reconcile once more at first visible opportunity before any startup pull gate.
-    if (document.visibilityState === 'visible') {
-        const before = auth.getEvidence();
-        const after = browserAuth?.reconcileEvidenceFromNavigator('startup:visible');
-        if (after && before === 'evidence:not-online' && after !== 'evidence:not-online') {
-            sync.requestPullFromOneDrive('online').catch(logCatch('visible pull'));
-        }
-    }
+    if (document.visibilityState === 'visible') browserAuth?.reconcileEvidenceFromNavigator('startup:visible');
     // Re-apply theme when OS preference changes (only matters when themePreference === 'auto')
     matchMedia('(prefers-color-scheme:dark)').addEventListener('change', () => applyTheme());
 
@@ -1123,7 +1120,7 @@ async function startupInner(): Promise<void> {
         } catch { return undefined; }
     })();
     if (native && savedInfo && savedInfo.driveId !== native.state.driveID) {
-        startup.showError('This cached library belongs to a different OneDrive account.');
+        startup.showCacheAccountMismatch();
         return;
     }
     sync.setSavedInfoRef(savedInfo);
@@ -1134,50 +1131,26 @@ async function startupInner(): Promise<void> {
     await ensureFavorites();
     await ensureShares();
 
-    // M12: set initial startup flag so the first pull can consider auto-redirect.
-    // Consumed (set false) in pullMusicFolderFromOneDriveInner after the check.
-    sync.setInitialStartup(true);
-
-    // 3. Not signed in — show cached tree if available, else sign-in button.
-    //    If cached data exists, fire off background sync (non-blocking) to
-    //    attempt token refresh so playback works if we're actually online.
-    if (!auth.isSignedIn()) {
-        if (savedInfo) {
-            const cached = await loadCachedData(savedInfo.driveId);
-            if (cached) {
-                sync.setCachedDataRef(cached);
-                showTree(savedInfo, cached);
-                log('showing cached index (offline)');
-                await Promise.all([restorePlaybackState(), migrateBrowserFavoriteBookmarks().catch(logCatch('browser bookmark migration'))]);
-                await sync.requestStartupPullIfEvidenceAllows();
-                return;
-            }
-        }
-        startup.renderSignInButtonIntoStatus();
-        log('showing sign-in');
-        return;
-    }
-
-    // 4. Signed in — show cached tree immediately, then sync with server
-    log('signed in, loading data');
+    // A failed read propagates to opening recovery. Only a confirmed miss admits first indexing.
     const cachedData = savedInfo ? await loadCachedData(savedInfo.driveId) : undefined;
-    sync.setCachedDataRef(cachedData);
-    if (cachedData) {
-        showTree(savedInfo!, cachedData);
+    if (savedInfo && cachedData) {
+        showTree(savedInfo, cachedData);
+        sync.setCachedDataRef(cachedData);
         log(`showing cached: ${cachedData.count} tracks`);
+    }
+    localBootstrapComplete = true;
+    if (cachedData) {
         await Promise.all([restorePlaybackState(), migrateBrowserFavoriteBookmarks().catch(logCatch('browser bookmark migration'))]);
-    } else if ((browserAuth?.reconcileEvidenceFromNavigator('startup:signed-in-no-cache-check') ?? auth.getEvidence()) === 'evidence:not-online') {
-        log('startup: signed-in with no cache while evidence is not-online');
-        startup.markStartupTerminalState('error');
-        startup.renderStartupErrorIntoStatusAndWireReload(STARTUP_ERROR_MESSAGE);
-        return;
     }
 
-    await sync.requestStartupPullIfEvidenceAllows();
-    if (!cachedData && !startup.isStartupTerminalUiRendered()) {
-        log('startup: startup pull returned without terminal UI');
-        startup.markStartupTerminalState('error');
-        startup.renderStartupErrorIntoStatusAndWireReload(STARTUP_ERROR_MESSAGE);
+    const evidence = browserAuth?.reconcileEvidenceFromNavigator('startup:pull-gate', { logUnchanged: true }) ?? auth.getEvidence();
+    if (evidence === 'evidence:not-online') {
+        log('skipping pull: evidence is not-online');
+        if (!cachedData) startup.showFailure(true);
+    } else if (!cachedData && !auth.isSignedIn()) {
+        startup.showSignIn();
+    } else {
+        await sync.requestPullFromOneDrive('startup');
     }
 }
 

@@ -45,6 +45,8 @@ I am adamant about clean engineering. What I look for:
 ## Agent peer review
 
 Use only the reviewer roles named in the instructions. Every review round requires a dedicated KISS reviewer, including rounds after fixes. Never launch a general reviewer.
+- For a change with user-visible UX implications, include an independent UX reviewer alongside the KISS reviewer before implementing the design. Show the reviewer the actual screens, copy, actions and recovery behavior the listener would encounter, including on lock, wake, interrupted startup and unreliable connectivity where relevant. Bring new blocking states or requests for manual recovery to the owner explicitly and get their approval before implementing them.
+- During normal use, the app owns recovery from transient internal failures. Keep available playback and cached browsing usable, recover automatically and log technical details for diagnosis. Ask the listener to act only when their action is genuinely needed. Explain the impact and offer a concrete action the listener can take.
 - Claude is invoked by writing your request for claude to a file, then asking the user to ask claude on your behalf and give the user the prompt to use in triple backticks, "Please read XYZ.md and write your response in ABC.md". The user will let you know when it's done.
 - Codex can be invoked `codex exec "prompt goes here"`
 - A great prompt is "Please read instructions in /tmp/instr.txt and write your answers in markdown to /tmp/result.md"

@@ -13,7 +13,7 @@ all logic lives in TypeScript modules compiled to `dist/`.
 
 The code falls into five layers:
 
-1. **Entry / orchestration** — `src/index.ts`, `src/index-startup.ts`, `src/index-sync.ts`: composition root, startup terminal/deadline flow, and sync scheduling/orchestration.
+1. **Entry / orchestration** — `src/index.ts`, `src/index-startup.ts`, `src/index-sync.ts`: composition root, recoverable startup status, and sync scheduling/orchestration.
 2. **Domain modules** — `src/auth.ts`, `src/indexer.ts`, `src/favorites.ts`, `src/downloads.ts`, `src/tracks.ts`: testable logic with injected deps, no DOM access.
 3. **UI components** — `src/tree.ts`, `src/playback.ts`, `src/playback-ui.ts`, `src/select.ts`, `src/modal.ts`: own DOM subtrees/primitives and expose callbacks for wiring.
 4. **Persistence primitives** — `src/db.ts` (IndexedDB), localStorage, OneDrive App folder.
@@ -63,7 +63,7 @@ Swift schedules two pin transfers in a background URLSession. Each task has an a
 
 - **index.html** — All HTML + CSS. Single `<script type="module">` loads `dist/index.js`. DOM elements: `#status`, `#tree-container` (`#breadcrumbs`, `#children`), `#settings-container`, `#player` (audio), `#footer`, `#action-bar`, `#select-cancel`, `#log-panel`.
 - **src/index.ts** — Composition root orchestrator. Wires modules together, manages view/offline projection.
-  - **src/index-startup.ts** — Startup terminal/deadline controller. Owns startup race/latch and startup terminal rendering helpers (sign-in/error/deadline).
+  - **src/index-startup.ts** — Owns opening, visible-wait retry, indexing, sign-in and failure rendering.
   - **src/index-sync.ts** — Sync orchestrator. Owns pull single-flight, periodic/online scheduling, account/share probe/index refresh, and settings sync status projection.
 - **src/auth.ts** — OAuth2 PKCE against Microsoft Entra. The browser fetch wrapper owns authenticated requests, token renewal, and network evidence.
 - **src/provider.ts** — Text document and browser media contracts. A missing document is distinct from failure. Browser downloads return complete Blobs. Returned status errors preserve the caller's evidence and retry policy.
@@ -114,13 +114,13 @@ Three types form the "language" of the app — every module speaks them:
 
 1. **`initWebLogger()`** — Install browser logging.
 2. **Restore M10 state** — Read `oneplay_music_view`, `oneplay_music_scroll`, `oneplay_music_playback`, `oneplay_music_time` from localStorage (synchronous, no flash).
-3. **`handleOauthRedirect()`** — Process `?code=` if returning from Entra.
+3. **Admit the account** from the native pairing or finish the browser’s `handleOauthRedirect()` exchange when returning from Entra.
 4. **Service worker registration** — Register `sw.js` early (before any early returns, so offline shell caching works for signed-out/first-time users too). `SW_DEBUG` mode auto-reloads on SW update.
-5. **`ensureFavorites()`** — Create favorites data module and load from IndexedDB cache. No tree dependency — safe to call before tree or account data exists. Concurrency-safe via in-flight promise.
-6. **`loadCachedData(driveId)`** — Read MusicData from IndexedDB.
+5. **Load favorites and shares** and their cached indexes. The data modules have no tree dependency and coalesce concurrent initialization.
+6. **`loadCachedData(driveId)`** — Read the primary index from IndexedDB. A confirmed miss permits first indexing. A rejected read keeps pulls closed and offers document retry.
 7. **`showTree(data)`** — Create tree + playback + wire callbacks. Calls `wireFavoritesUi()` at the end, which attaches favorites to tree and creates select + downloads modules (once).
 8. **`restorePlaybackState()`** — Apply `oneplay_music_playback`/`oneplay_music_time` to playback module.
-9. **`pullMusicFolderFromOneDrive()`** — Awaited after cached UI is rendered: calls `ensureFavorites()` again (belt-and-suspenders), syncs favorites from OneDrive, checks index staleness, re-indexes if needed, heals favorites, pushes offline state. Suppressed when `navigator.onLine` is false.
+9. **`requestPullFromOneDrive()`** — Once local bootstrap installs the tree or confirms a miss, startup and browser recovery can request a single-flight pull. The coordinator syncs intents, checks indexes, heals confirmed references and updates offline state. Definite offline evidence skips the startup pull.
 
 The key design split is `ensureFavorites()` (data module, no tree dependency)
 vs `wireFavoritesUi()` (wires to tree, creates select + downloads). This
@@ -128,10 +128,14 @@ ensures the favorites module exists before any network pull, fixing the
 sign-out → sign-back-in path where `pullFavoritesFromOneDrive` was previously
 skipped because favorites hadn't been created yet.
 
-The key principle is **offline-first**: steps 2–8 render from local data
-immediately. Step 9 is awaited but runs after the cached UI is already visible.
-The user sees content instantly; network is never blocking.
-
+A cached tree becomes usable before the OneDrive pull. It keeps its layout
+during synchronous setup so breadcrumb measurement and scroll restoration work.
+The page connects native playback after the first tree and its controls are
+ready. The native footer then takes its position from the live player. A partial
+first installation closes pull admission and keeps queue updates out of Swift.
+Document retry restores the tree. If the footer changes the viewport before the
+first saved scroll offset fits, its redraw can complete the restore while the
+listener leaves that offset alone.
 
 ## Module communication
 
@@ -439,12 +443,20 @@ pulls are suppressed in signed-out/not-online states.
   auth), not sign-out.
 - Refresh-token sentinel invalidation is only for 4xx client failures. 5xx and
   transient network failures do not force token invalidation.
-- Startup deadline logic has explicit exceptions:
-  - OAuth code-exchange path gets extra budget.
-  - First-time indexing bypasses deadline once progress UI is entered.
-  - Abnormal startup terminals are logged at error level.
-- Startup must always terminate into one structural UI state: visible tree,
-  sign-in CTA, or explicit error UI.
+- Opening offers an optional **Try again** after 15 seconds of observed
+  visibility. Hiding before the offer resets the interval. Progress or a
+  concrete outcome ends the timer. A valid late result still renders.
+- A settled opening yields an installed tree, sign-in or a concrete failure.
+  Try again uses document reload and the native bridge's existing retirement.
+  Retrying a pending OAuth response can require a fresh sign-in after the
+  one-use verifier was consumed.
+- An empty library offers retry when definitely offline. The browser can
+  resume opening on an online event. An overlapping browser reconnect or
+  native sign-in can queue a fresh pull when the old attempt settles. Browser
+  reconnect restores a known sign-in action even while an independent response
+  is pending. A native empty library uses explicit retry after reconnect.
+  Cached browsing and playback stay available. The remaining browser evidence
+  timing gaps are recorded in [M21 review findings](PLAN-M21-lock.md#execution-reviews).
 
 ### OneDrive/Graph indexing contracts
 

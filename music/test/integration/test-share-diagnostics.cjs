@@ -42,6 +42,7 @@ async function checkNativeAccountIsolation(page) {
         await shares.loadFromCache();
         const sync = createIndexSync({
             auth: native, oneDrive, accountData: new Map(), getShares: () => shares,
+            canPull: () => true, hasInstalledTree: () => true, showOpeningFailure() {},
             getTree: () => undefined, getFavorites: () => undefined, getSettings: () => undefined,
             ensureFavorites: async () => {}, ensureShares: async () => {}, showTree() {}, computeAndPushOfflineState() {},
         });

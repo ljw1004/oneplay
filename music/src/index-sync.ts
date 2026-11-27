@@ -7,12 +7,13 @@
  * - Coordinates share index cache lifecycle and share add/remove side effects.
  *
  * Non-scope:
- * - Startup terminal UI/deadline policy (owned by index-startup.ts).
+ * - Startup status rendering (owned by index-startup.ts).
  * - App composition/tree-playback-select wiring (owned by index.ts).
  */
 import { readGraphJson, type Auth, type EvidenceState } from './auth.js';
 import type { NativeLibrary } from './native-library.js';
 import type { OneDriveProvider } from './onedrive-provider.js';
+import { ProviderHttpError } from './provider.js';
 import { dbGet, dbPut, dbDelete, dbClear } from './db.js';
 import { log, logError, logCatch, errorMessage, errorDetail } from './logger.js';
 import {
@@ -49,7 +50,8 @@ export interface IndexSyncDeps {
     readonly auth: Auth | NativeLibrary;
     readonly oneDrive: Pick<OneDriveProvider,
         'fetchAccountInfo' | 'probeMusicFolder' | 'probeShareRoot' | 'buildAndCacheIndex' | 'deleteShareCache'>;
-    readonly startupErrorMessage: string;
+    readonly canPull: () => boolean;
+    readonly hasInstalledTree: () => boolean;
     readonly accountData: Map<string, { folder: MusicFolder; driveId: string }>;
     readonly getTree: () => TreeView | undefined;
     readonly onPlaybackRootsChange?: () => void;
@@ -61,12 +63,11 @@ export interface IndexSyncDeps {
     readonly ensureFavorites: () => Promise<void>;
     readonly ensureShares: () => Promise<void>;
     readonly showTree: (info: AccountInfo, data: MusicData, reindexing?: boolean) => void;
-    readonly showError: (message: string) => void;
-    readonly renderSignInButtonIntoStatus: () => void;
-    readonly renderStartupErrorIntoStatusAndWireReload: (message: string) => void;
-    readonly markStartupTerminalState: (state: 'error') => void;
-    readonly enterFirstTimeIndexingAndBypassStartupDeadline: () => void;
-    readonly renderIndexing: (progress: IndexProgress) => void;
+    readonly showOpening: () => void;
+    readonly showSignIn: () => void;
+    readonly showOpeningFailure: (offline: boolean) => void;
+    readonly finishOpening: (offline: boolean) => void;
+    readonly showIndexProgress: (progress: IndexProgress) => void;
     readonly computeAndPushOfflineState: () => void;
     readonly invalidateSearchData: () => void;
     readonly runSearchAndPushIntoTree: (reason: SearchReason) => void;
@@ -77,7 +78,6 @@ export interface IndexSyncController {
     getSavedInfoRef(): AccountInfo | undefined;
     setCachedDataRef(value: MusicData | undefined): void;
     getCachedDataRef(): MusicData | undefined;
-    setInitialStartup(value: boolean): void;
     setLastIndexUpdatedAt(value: number | undefined): void;
     getLastIndexUpdatedAt(): number | undefined;
     hasLatestIndexFailure(): boolean;
@@ -89,7 +89,6 @@ export interface IndexSyncController {
     updateSettingsIndexSection(): void;
     cancelScheduledPull(): void;
     requestPullFromOneDrive(source: PullSource): Promise<void>;
-    requestStartupPullIfEvidenceAllows(): Promise<void>;
     onShareAdded(record: ShareRecordPersisted): void;
     onShareRemoved(record: ShareRecordPersisted): Promise<void>;
 }
@@ -175,7 +174,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
     const browserAuth = 'handleOauthRedirect' in deps.auth ? deps.auth : undefined;
     let savedInfoRef: AccountInfo | undefined;
     let cachedDataRef: MusicData | undefined;
-    let isInitialStartup = false;
+    let isInitialStartup = true;
     const currentFolders = new Map<string, MusicFolder>();
     let lastIndexUpdatedAt: number | undefined;
     let latestIndexProgress: IndexProgress | undefined;
@@ -194,6 +193,11 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
 
     let pullTimer: ReturnType<typeof setTimeout> | undefined;
     let pullInFlightPromise: Promise<void> | undefined;
+    let openingRecoveryPending: PullSource | undefined;
+    // The account probe or primary index can reject saved credentials.
+    // Browser sign-in replaces the document. Later transport evidence
+    // cannot reopen admission for that rejected session.
+    let browserPrimaryRequiresSignIn = false;
     let settingsCheckingForUpdatesInFlight = false;
 
     const getTree = (): TreeView | undefined => deps.getTree();
@@ -336,20 +340,29 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         }));
     };
 
-    const fetchFreshAccountInfoOrHandleAuthFailures = async (
-        wasInitialStartup: boolean,
-        cachedData: MusicData | undefined,
-    ): Promise<AccountInfo | undefined> => {
+    /** Browser evidence can change during a failed request or a missed lifecycle event. */
+    const reconcileEvidenceAndCheckOffline = (): boolean =>
+        (browserAuth?.reconcileEvidenceFromNavigator('index-sync:opening') ?? deps.auth.getEvidence()) === 'evidence:not-online';
+
+    /** A stale transport response can replace evidence without restoring expired browser credentials. */
+    const requiresSignIn = (): boolean =>
+        browserPrimaryRequiresSignIn || deps.auth.getEvidence() === 'evidence:signed-out' || browserAuth?.isSignedIn() === false;
+
+    /** A failed primary probe or build can establish that sign-in is the recovery. */
+    const showPrimaryOpeningFailure = (needsSignIn = false): void => {
+        if (deps.hasInstalledTree()) return;
+        if (browserAuth && needsSignIn) browserPrimaryRequiresSignIn = true;
+        const offline = reconcileEvidenceAndCheckOffline();
+        if (!offline && (needsSignIn || requiresSignIn())) deps.showSignIn();
+        else deps.showOpeningFailure(offline);
+    };
+
+    const fetchFreshAccountInfoOrHandleAuthFailures = async (wasInitialStartup: boolean): Promise<AccountInfo | undefined> => {
         const freshInfo = await deps.oneDrive.fetchAccountInfo();
         if (freshInfo === 'network') {
             logError('failed to fetch account info (network)');
             browserAuth?.transition('no-evidence');
             if (wasInitialStartup) log('auto-redirect: skipped (no connectivity)');
-            if (wasInitialStartup && !cachedData) {
-                log('startup: account info fetch returned network with no cache');
-                deps.markStartupTerminalState('error');
-                deps.renderStartupErrorIntoStatusAndWireReload(deps.startupErrorMessage);
-            }
             return undefined;
         }
         if (freshInfo === 'auth') {
@@ -361,7 +374,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
                 await browserAuth.attemptSilentRedirect();
                 return undefined;
             }
-            if (!cachedData) deps.renderSignInButtonIntoStatus();
+            showPrimaryOpeningFailure(true);
             return undefined;
         }
         // Native owns the drive pairing. No web account update, cache deletion, or
@@ -369,7 +382,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         if (native && native.state.driveID !== freshInfo.driveId) {
             logError('account details: rejected a different OneDrive account');
             setLatestIndexFailureFromMessageAndPushUi('OneDrive', 'Reconnect with the account used for this library.');
-            if (!cachedData) deps.renderSignInButtonIntoStatus();
+            if (!deps.hasInstalledTree() && !reconcileEvidenceAndCheckOffline()) deps.showSignIn();
             return undefined;
         }
         return freshInfo;
@@ -403,13 +416,11 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         cachedDataRef = cachedData;
     };
 
-    const fetchMusicFolderMetadataOrShowError = async (
-        cachedData: MusicData | undefined,
-    ): Promise<MusicDriveItem | undefined> => {
+    const fetchMusicFolderMetadata = async (): Promise<MusicDriveItem | undefined> => {
         const musicR = await deps.oneDrive.probeMusicFolder();
         if (!musicR.ok) {
             logError(`music folder fetch failed: ${musicR.status}`);
-            if (!cachedData) deps.showError(`Cannot access Music folder: ${musicR.status}`);
+            showPrimaryOpeningFailure(musicR.status === 401);
             return undefined;
         }
         return readGraphJson(musicR, 'music folder');
@@ -435,43 +446,48 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
             deps.showTree(freshInfo, cachedData!, true);
             log('re-indexing in background');
         } else {
-            deps.enterFirstTimeIndexingAndBypassStartupDeadline();
+            deps.showIndexProgress({ fraction: 0, message: 'Starting index...' });
             log('first-time indexing');
         }
         const indexStartedAt = Date.now();
         log(`index start: primary mode=${isReindex ? 'reindex' : 'first-time'} driveId=${freshInfo.driveId}`);
 
+        let data: MusicData;
         try {
-            const data = await deps.oneDrive.buildAndCacheIndex(
+            data = await deps.oneDrive.buildAndCacheIndex(
                 musicDriveItem,
                 (p) => {
                     latestIndexProgress = p;
                     updateSettingsIndexSection();
-                    if (!isReindex) deps.renderIndexing(p);
+                    if (!isReindex) deps.showIndexProgress(p);
                 },
                 freshInfo.driveId,
             );
             // Only publish membership that can survive an offline reopen.
             await dbPut(indexKey(freshInfo.driveId), data);
-            currentFolders.set(freshInfo.driveId, data.folder);
             deps.showTree(freshInfo, data);
-            cachedDataRef = data;
-            latestIndexProgress = undefined;
-            log(`index end: primary status=ok driveId=${freshInfo.driveId} tracks=${data.count} durationMs=${Date.now() - indexStartedAt}`);
-            writeIndexLastUpdatedNow();
-            deps.computeAndPushOfflineState();
-            browserAuth?.transition('evidence:signed-in');
-            return;
         } catch (e) {
+            // A partial first installation already closed admission. Leave its
+            // retry screen in place and stop all remaining tree-dependent work.
+            if (!deps.canPull()) throw e;
             latestIndexProgress = undefined;
             updateSettingsIndexSection();
             logError(`index end: primary status=failed driveId=${freshInfo.driveId} durationMs=${Date.now() - indexStartedAt}`);
             logError(`indexing failed: ${errorDetail(e)}`);
-            setLatestIndexFailureFromErrorAndPushUi('OneDrive', e);
+            // Restoring the previous root before projecting the warning keeps
+            // the warning redraw from retrying the rejected render.
             if (isReindex && cachedData) deps.showTree(freshInfo, cachedData, false);
-            if (!cachedData) deps.showError('Indexing failed. Please try again.');
-            return undefined;
+            setLatestIndexFailureFromErrorAndPushUi('OneDrive', e);
+            if (!isReindex) showPrimaryOpeningFailure(e instanceof ProviderHttpError && e.status === 401);
+            return;
         }
+        currentFolders.set(freshInfo.driveId, data.folder);
+        cachedDataRef = data;
+        latestIndexProgress = undefined;
+        log(`index end: primary status=ok driveId=${freshInfo.driveId} tracks=${data.count} durationMs=${Date.now() - indexStartedAt}`);
+        writeIndexLastUpdatedNow();
+        deps.computeAndPushOfflineState();
+        browserAuth?.transition('evidence:signed-in');
     };
 
     const probeShareRootsConcurrently = async (): Promise<Map<string, ShareProbeResult>> => {
@@ -615,7 +631,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         currentFolders.clear();
         await deps.ensureFavorites();
         await deps.ensureShares();
-        const freshInfo = await fetchFreshAccountInfoOrHandleAuthFailures(wasInitialStartup, cachedData);
+        const freshInfo = await fetchFreshAccountInfoOrHandleAuthFailures(wasInitialStartup);
         if (!freshInfo) return;
         writeFreshAccountInfoIntoStateAndSetSignedIn(freshInfo);
 
@@ -631,17 +647,22 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
             : cachedData;
         showTreeFromCachedDataIfPresent(freshInfo, cacheForThisAccount);
         const favorites = getFavorites();
-        const favoritesRead = favorites?.pullFavoritesFromOneDrive();
+        const favoritesRead = favorites?.pullFavoritesFromOneDrive().then(checked => {
+            // Favorites and shares open independently. Invalidated browser
+            // credentials can establish recovery before the shares read returns.
+            if (browserAuth?.isSignedIn() === false) showPrimaryOpeningFailure();
+            return checked;
+        });
         const sharesChecked = await getShares()?.pullFromOneDrive();
         await loadShareIndexesFromCacheIntoState();
         syncShareRootsIntoTreeAndPlayback();
         browserAuth?.transition('evidence:signed-in');
 
         const [musicDriveItem, shareProbes] = await Promise.all([
-            fetchMusicFolderMetadataOrShowError(cacheForThisAccount).catch(error => {
+            fetchMusicFolderMetadata().catch(error => {
                 logCatch('music folder probe')(error);
                 setLatestIndexFailureFromErrorAndPushUi('OneDrive', error);
-                if (!cacheForThisAccount) deps.showError('Cannot access the Music folder.');
+                showPrimaryOpeningFailure();
                 return undefined;
             }),
             probeShareRootsConcurrently(),
@@ -672,7 +693,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         try {
             await pullMusicFolderFromOneDriveInner(savedInfo, cachedData);
         } finally {
-            getTree()?.setSyncing(false);
+            if (deps.hasInstalledTree()) getTree()?.setSyncing(false);
             latestIndexProgress = undefined;
             updateSettingsIndexSection();
         }
@@ -680,7 +701,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
 
     const scheduleNextPull = (delayMs = PULL_INTERVAL_MS): void => {
         clearTimeout(pullTimer);
-        if (pullInFlightPromise) return;
+        if (pullInFlightPromise || !deps.hasInstalledTree()) return;
         const ev = deps.auth.getEvidence();
         if (ev === 'evidence:not-online' || ev === 'evidence:signed-out') return;
         pullTimer = setTimeout(() => {
@@ -695,14 +716,32 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
     };
 
     const requestPullFromOneDrive = async (source: PullSource): Promise<void> => {
+        if (!deps.canPull()) return;
         log(`pull: requested (${source})`);
         if (source === 'settings-refresh') {
             clearTimeout(pullTimer);
             pullTimer = undefined;
         }
+        // Connectivity can update the visible action immediately, even while
+        // the rejected attempt still waits for an unrelated response.
+        if (browserAuth && !deps.hasInstalledTree() && requiresSignIn()) {
+            showPrimaryOpeningFailure();
+            return;
+        }
         if (pullInFlightPromise) {
+            // The old attempt can settle after the listener reconnects or
+            // signs in. An empty library then needs a fresh pull.
+            if (!deps.hasInstalledTree() && ((browserAuth && source === 'online')
+                || (native && source === 'settings-refresh'))) openingRecoveryPending = source;
             log(`pull: coalesced (${source})`);
             return pullInFlightPromise;
+        }
+        if (!deps.hasInstalledTree()) {
+            if (reconcileEvidenceAndCheckOffline()) {
+                deps.showOpeningFailure(true);
+                return;
+            }
+            deps.showOpening();
         }
         clearLatestIndexFailureIntoRuntimeStateAndPushUi();
         const startedAt = Date.now();
@@ -714,25 +753,27 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
             } catch (e) {
                 logError(`pull failed (${source}): ${errorDetail(e)}`);
             } finally {
+                const opening = deps.canPull() && !deps.hasInstalledTree();
+                const offline = opening && reconcileEvidenceAndCheckOffline();
+                const recovery = opening && !offline
+                    && (openingRecoveryPending === 'settings-refresh' || !requiresSignIn())
+                    ? openingRecoveryPending : undefined;
+                openingRecoveryPending = undefined;
+                if (opening && !recovery) {
+                    if (!offline && requiresSignIn()) deps.showSignIn();
+                    else deps.finishOpening(offline);
+                }
                 const elapsedMs = Date.now() - startedAt;
                 log(`pull: complete (${source}; ${elapsedMs}ms)`);
                 setSettingsCheckingForUpdatesInFlight(false);
                 pullInFlightPromise = undefined;
                 updateSettingsIndexSection();
-                scheduleNextPull();
+                if (recovery) await requestPullFromOneDrive(recovery);
+                else scheduleNextPull();
             }
         })();
         updateSettingsIndexSection();
         return pullInFlightPromise;
-    };
-
-    const requestStartupPullIfEvidenceAllows = async (): Promise<void> => {
-        const evidence = browserAuth?.reconcileEvidenceFromNavigator('index-sync:startup-pull-gate', { logUnchanged: true }) ?? deps.auth.getEvidence();
-        if (evidence === 'evidence:not-online') {
-            log('skipping pull: evidence is not-online');
-            return;
-        }
-        await requestPullFromOneDrive('startup');
     };
 
     const onShareAdded = (record: ShareRecordPersisted): void => {
@@ -775,7 +816,6 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         getSavedInfoRef() { return savedInfoRef; },
         setCachedDataRef(value) { cachedDataRef = value; },
         getCachedDataRef() { return cachedDataRef; },
-        setInitialStartup(value) { isInitialStartup = value; },
         setLastIndexUpdatedAt(value) { lastIndexUpdatedAt = value; },
         getLastIndexUpdatedAt() { return lastIndexUpdatedAt; },
         hasLatestIndexFailure() { return latestIndexFailure !== undefined; },
@@ -787,7 +827,6 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         updateSettingsIndexSection,
         cancelScheduledPull,
         requestPullFromOneDrive,
-        requestStartupPullIfEvidenceAllows,
         onShareAdded,
         onShareRemoved,
     };

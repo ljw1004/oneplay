@@ -45,14 +45,14 @@
 
 <body>
     <div id="status-bar-color" aria-hidden="true"></div>
-    <div id="status">Loading...</div>
-    <div id="tree-container" hidden>
+    <div id="status" tabindex="-1">Opening your library…</div>
+    <div id="tree-container" tabindex="-1" role="region" aria-label="Music library" hidden>
         <div id="breadcrumbs"></div>
         <div id="children"></div>
     </div>
     <div id="settings-container" hidden></div>
     <audio id="player" hidden></audio>
-    <div id="footer"></div>
+    <div id="footer" hidden></div>
     <div id="action-bar"><button id="select-cancel">Cancel</button></div>
     <div id="log-panel"><details id="native-log" hidden><summary>Swift · auth and playback</summary><div></div></details><div id="js-log"></div></div>
 </body>

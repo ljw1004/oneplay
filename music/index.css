@@ -125,7 +125,12 @@ body{background:var(--bg-header);height:100%;display:flex;flex-direction:column;
 .signin-btn{background:var(--accent-ms-blue);color:#fff;border:none;border-radius:6px;padding:12px 32px;font-size:1.1rem;cursor:pointer;margin:16px 0;}
 .signin-btn:active{background:var(--accent-ms-blue-active);}
 .error-msg{color:var(--color-error-msg);}
-.startup-error{color:var(--color-startup-error);width:min(520px,100% - 32px);margin:0 auto;}
+.startup-message{margin:0;padding:0 16px;}
+.startup-retry{background:var(--accent-ms-blue);color:#fff;border:0;border-radius:6px;padding:12px 32px;min-height:44px;font-size:1.1rem;cursor:pointer;margin-top:34px;}
+[data-theme="dark"] :is(.startup-retry,.signin-btn){color:#18191c;}
+.startup-retry:active{background:var(--accent-ms-blue-active);}
+:is(.startup-retry,.signin-btn):focus{outline:2px solid var(--text-primary);outline-offset:3px;}
+.startup-retry:disabled{opacity:.65;cursor:default;}
 .index-progress{text-align:center;width:min(500px,100% - 32px);margin:0 auto;}
 .progress-bar{width:100%;height:3px;background:var(--progress-track);border-radius:2px;overflow:hidden;margin:16px 0 8px;}
 .progress-fill{height:100%;background:var(--accent-ms-blue);width:0%;transition:width 0.3s ease;}
@@ -142,7 +147,7 @@ body{background:var(--bg-header);height:100%;display:flex;flex-direction:column;
 to{transform:rotate(360deg);}
 }
 #footer{display:none;flex-direction:column;width:100%;background:var(--bg-footer);border-top:1px solid var(--border-footer);flex-shrink:0;position:relative;z-index:1;}
-#footer.visible{display:flex;}
+#footer.visible:not([hidden]){display:flex;}
 #footer.expanded{background:linear-gradient(to right,var(--footer-edge-highlight),rgba(255,255,255,0)) 10px 0/24px 100% no-repeat,linear-gradient(to right,var(--footer-edge-shadow),rgba(0,0,0,0)) 0/10px 100% no-repeat,linear-gradient(to left,var(--footer-edge-shadow),rgba(0,0,0,0)) 100%/10px 100% no-repeat,var(--bg-footer);}
 /* Cast the shadow onto the list, including the screen edges outside the landscape safe area. */
 #footer.expanded::before{

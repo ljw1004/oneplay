@@ -13,8 +13,8 @@ export interface BrowserMedia {
 
 /** Preserve the transport status for the caller's retry and evidence policy. */
 export class ProviderHttpError extends Error {
-    constructor(readonly status: number) {
-        super('HTTP ' + status);
+    constructor(readonly status: number, message = 'HTTP ' + status) {
+        super(message);
     }
 }
 

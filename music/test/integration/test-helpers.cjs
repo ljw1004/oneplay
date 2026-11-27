@@ -431,15 +431,19 @@ async function setup(page) {
         .catch(() => { throw new Error(TREE_NOT_VISIBLE_ERROR); });
 }
 
-/** Configures pre-navigation startup state for terminal-UI tests. */
+/** Configures pre-navigation startup state for opening and first-index tests. */
 async function configureStartupScenario(page, options) {
     await page.addInitScript((opts) => {
-        Object.keys(localStorage).filter((k) => k.startsWith("oneplay_music_") || k === "account_info")
-            .forEach((k) => localStorage.removeItem(k));
-        sessionStorage.removeItem("code_verifier");
+        if (!sessionStorage.startupFixtureConfigured) {
+            Object.keys(localStorage).filter((k) => k.startsWith("oneplay_music_") || k === "account_info")
+                .forEach((k) => localStorage.removeItem(k));
+            sessionStorage.removeItem("code_verifier");
+            sessionStorage.startupFixtureConfigured = "1";
+        }
         if (opts.signedIn) {
             localStorage.setItem("access_token", "startup-test-access-token");
-            localStorage.setItem("refresh_token", "startup-test-refresh-token");
+            if (opts.noRefreshToken) localStorage.removeItem("refresh_token");
+            else localStorage.setItem("refresh_token", "startup-test-refresh-token");
         } else {
             localStorage.setItem("access_token", "null: startup test signed-out");
             localStorage.setItem("refresh_token", "null: startup test signed-out");
@@ -447,39 +451,86 @@ async function configureStartupScenario(page, options) {
         if (navigator.serviceWorker) {
             navigator.serviceWorker.register = () => Promise.resolve(/** @type {any} */ ({}));
         }
-        if (opts.forceOffline) {
-            Object.defineProperty(window.navigator, "onLine", {
-                configurable: true,
-                get: () => false,
-            });
-        }
-        if (typeof opts.startupDeadlineMs === "number"
-            && Number.isFinite(opts.startupDeadlineMs)
-            && opts.startupDeadlineMs > 0) {
-            window._testStartupDeadlineMs = opts.startupDeadlineMs;
-        } else {
-            delete window._testStartupDeadlineMs;
-        }
-        if (opts.hangFirstTimeIndexBatch) {
+        let online = !opts.forceOffline;
+        Object.defineProperty(navigator, "onLine", { configurable: true, get: () => online });
+        window._testSetOnline = (value, notify = true) => {
+            online = value;
+            if (notify) window.dispatchEvent(new Event(online ? "online" : "offline"));
+        };
+        window._testStartupOpeningWaitMs = opts.openingWaitMs;
+        if (opts.mockGraph) {
             const nativeFetch = window.fetch.bind(window);
             window.fetch = (input, init) => {
                 const url = typeof input === "string"
                     ? input
                     : (input instanceof URL ? input.href
                         : (input instanceof Request ? input.url : String(input)));
+                if ((opts.musicRequiresAuth || opts.holdFavoritesAuth) && url.includes("login.microsoftonline.com") && url.endsWith("/token")) {
+                    return Promise.resolve(new Response(null, {status: 400}));
+                }
                 if (!url.includes("graph.microsoft.com/v1.0")) return nativeFetch(input, init);
                 if (url.includes("/v1.0/me/drive?")
                     && url.includes("$select=id,owner")) {
+                    window._testAccountProbes = (window._testAccountProbes ?? 0) + 1;
+                    if (opts.accountStatus) return Promise.resolve(new Response(null, { status: opts.accountStatus }));
                     const reply = new Response(JSON.stringify({
                         id: "startup-test-drive-id",
                         owner: { user: { displayName: "Startup Test Drive" } },
                     }), { status: 200, headers: { "Content-Type": "application/json" } });
-                    if (opts.holdAccountDetails) return new Promise(resolve => { window._testReleaseDetails = () => resolve(reply); });
+                    if (opts.holdAccountDetails && !window._testReleaseDetails) {
+                        return new Promise(resolve => {
+                            window._testReleaseDetails = (status = 200) =>
+                                resolve(status === 200 ? reply : new Response(null, {status}));
+                        });
+                    }
                     return Promise.resolve(reply);
+                }
+                if (opts.holdFavoritesUntilWake && !window._testDeliverFavoritesHeaders && url.includes("/favorites.json:/content")) {
+                    return new Promise(resolve => {
+                        window._testDeliverFavoritesHeaders = () => resolve(new Response(new ReadableStream({
+                            start(controller) {
+                                window._testReleaseFavorites = () => {
+                                    controller.enqueue(new TextEncoder().encode(JSON.stringify({version: 1, favorites: []})));
+                                    controller.close();
+                                };
+                            },
+                        })));
+                    });
+                }
+                if (opts.holdFavoritesAuth && url.includes("/favorites.json:/content")) {
+                    return new Promise(resolve => {
+                        window._testRejectFavoritesAuth = () => resolve(new Response(null, {status: 401}));
+                    });
+                }
+                if (opts.holdSharesDocument && url.includes("/shares.json:/content")) {
+                    return Promise.resolve(new Response(new ReadableStream({
+                        start(controller) {
+                            window._testReleaseShares = () => {
+                                controller.enqueue(new TextEncoder().encode(JSON.stringify({version: 1, shares: []})));
+                                controller.close();
+                            };
+                        },
+                    })));
+                }
+                if (opts.holdShareProbe && url.includes("/shares.json:/content")) {
+                    return Promise.resolve(Response.json({version: 1, updatedAt: 1, shares: [{
+                        id: "row", name: "Shared Music", rootKey: "share:abc", shareId: "abc",
+                        driveId: "shared", rootItemId: "folder", addedAt: 1, updatedAt: 1,
+                    }]}));
+                }
+                if (opts.holdShareProbe && url.includes("/drives/shared/items/folder?")) {
+                    return new Promise(resolve => {
+                        window._testFailShareProbe = () => resolve(new Response(null, {status: 503}));
+                    });
                 }
                 if (url.includes("/v1.0/me/drive/special/music?")
                     && url.includes("$select=name,id,cTag,eTag,size,lastModifiedDateTime,folder")) {
                     window._testMusicRootRequestCache = new Request(input, init).cache;
+                    if (opts.musicRequiresAuth) return Promise.resolve(new Response(null, {status: 401}));
+                    if (opts.holdMusicProbe && !window._testFailMusicProbe) return new Promise(resolve => {
+                        window._testFailMusicProbe = () => resolve(new Response(null, {status: 503}));
+                    });
+                    if (opts.holdFavoritesAuth) return Promise.resolve(new Response(null, {status: 503}));
                     return Promise.resolve(new Response(JSON.stringify({
                         id: "startup-test-music-root-id",
                         name: "Music",
@@ -492,13 +543,36 @@ async function configureStartupScenario(page, options) {
                 }
                 if (url.includes("/v1.0/$batch")) {
                     window._testStartedBatch = true;
-                    return new Promise(() => {});
+                    if (opts.batchRequiresAuth === "children") {
+                        const {requests} = JSON.parse(init.body);
+                        const response = Response.json({responses: requests.map(({id}) => ({
+                            id, status: id.startsWith("children-") ? 401 : 404,
+                        }))});
+                        if (opts.holdChildrenAuth && !window._testReleaseChildrenAuth) {
+                            return new Promise(resolve => {
+                                window._testReleaseChildrenAuth = () => resolve(response);
+                            });
+                        }
+                        return Promise.resolve(response);
+                    }
+                    if (opts.batchRequiresAuth) return Promise.resolve(new Response(null, {status: 401}));
+                    if (opts.completeFirstIndex) {
+                        const {requests} = JSON.parse(init.body);
+                        return Promise.resolve(Response.json({
+                            responses: requests.map(({id, method}) => {
+                                if (method === "PUT") return {id, status: 200};
+                                if (id.startsWith("cache-")) return {id, status: 404};
+                                return {id, status: 200, body: {value: [{id: "track", name: "Fixture.mp3", size: 12345, file: {}}]}};
+                            }),
+                        }));
+                    }
+                    return new Promise(resolve => {
+                        window._testFailBatch = () => resolve(new Response(null, {status: 400}));
+                        if (window._testFailSubsequentBatches) window._testFailBatch();
+                    });
                 }
                 return Promise.resolve(new Response("", { status: 404 }));
             };
-        }
-        if (opts.hangFetch) {
-            window.fetch = () => new Promise(() => {});
         }
     }, options);
 }

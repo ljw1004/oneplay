@@ -8,6 +8,7 @@ async function checkNativeAccountIsolation(page) {
         const { createNativeLibrary } = await import('./dist/native-library.js');
         const { createIndexSync } = await import('./dist/index-sync.js');
         const { createShares } = await import('./dist/shares.js');
+        const { createOneDriveProvider } = await import('./dist/onedrive-provider.js');
         const { dbGet } = await import('./dist/db.js');
         let detailsDrive = 'wrong-drive';
         const calls = [];
@@ -31,15 +32,16 @@ async function checkNativeAccountIsolation(page) {
             return reply(404);
         } });
         await native.loadAccountState('state');
+        const oneDrive = createOneDriveProvider(native.fetch, native.followContent);
         const shares = createShares({
-            authFetch: native.fetch, dbPut: async () => {},
+            oneDrive, documents: oneDrive.documents, dbPut: async () => {},
             dbGet: async () => ({ shares: ['available', 'renewing', 'revoked'].map(id => ({
                 id, shareId: id, name: id, rootKey: 'share:' + id, rootItemId: id, driveId: 'shared',
             })) }),
         }, () => {});
         await shares.loadFromCache();
         const sync = createIndexSync({
-            auth: native, accountData: new Map(), getShares: () => shares,
+            auth: native, oneDrive, accountData: new Map(), getShares: () => shares,
             getTree: () => undefined, getFavorites: () => undefined, getSettings: () => undefined,
             ensureFavorites: async () => {}, ensureShares: async () => {}, showTree() {}, computeAndPushOfflineState() {},
         });
@@ -81,7 +83,13 @@ async function checkShareDiagnostics(browser, url) {
         const headers = [];
         let failFollow = false;
         let holdWrite = false;
+        let heldWriteReleased = false;
+        let cacheDeletedWhileWriteHeld = false;
         let failShareListing = false;
+        let failLocalShareCommit = false;
+        let failPrimaryProbe = false;
+        let shareSize;
+        let newTrack;
         let favoriteWrites = 0;
         let lastSavedFavorites;
         const enteredWrite = Promise.withResolvers();
@@ -92,8 +100,9 @@ async function checkShareDiagnostics(browser, url) {
             const path = new URL(req.url()).pathname.replace('/v1.0', '');
             const json = body => route.fulfill({ json: body });
             if (path === '/me/drive') return json({ id: 'fixture-drive', owner: { user: { displayName: 'Listener' } } });
-            if (path === '/me/drive/special/music') return json(folder('primary', 'Music'));
-            if (path === '/drives/shared/items/album') return json(folder('album', 'Shared album'));
+            if (path === '/me/drive/special/music') return failPrimaryProbe
+                ? route.fulfill({ status: 500, body: '' }) : json(folder('primary', 'Music'));
+            if (path === '/drives/shared/items/album') return json({ ...folder('album', 'Shared album'), ...(shareSize && { size: shareSize }) });
             if (path.startsWith('/shares/')) {
                 headers.push(req.headers().prefer);
                 // The missing Graph share ID exercises the token-bearing legacy root key.
@@ -102,7 +111,7 @@ async function checkShareDiagnostics(browser, url) {
                     : {});
             }
             if (req.method() === 'PUT' && path.endsWith('favorites.json:/content')) lastSavedFavorites = req.postDataJSON();
-            if (failShareListing && path.endsWith('favorites.json:/content')) {
+            if ((failShareListing || failLocalShareCommit) && path.endsWith('favorites.json:/content')) {
                 if (req.method() === 'PUT') favoriteWrites++;
                 else return json({ updatedAt: Date.now(), favorites: [{
                     kind: 'shortcut', id: 'cloud-favorite', name: 'New album', target: {
@@ -117,12 +126,18 @@ async function checkShareDiagnostics(browser, url) {
             if (holdWrite && path === '/$batch' && req.postDataJSON().requests.some(r => r.id === 'write-album')) {
                 enteredWrite.resolve();
                 await finishWrite.promise;
+                heldWriteReleased = true;
             }
+            if (req.method() === 'DELETE' && path === '/me/drive/special/approot:/share-' + encodeURIComponent(encoded)
+                && holdWrite && !heldWriteReleased) cacheDeletedWhileWriteHeld = true;
             if (path === '/$batch') return json({ responses: req.postDataJSON().requests.map(r => {
                 if (failShareListing && r.id === 'children-album') return { id: r.id, status: 500 };
                 if (r.id.startsWith('children-')) return { id: r.id, status: 200, body: { value: [
                     { name: 'Test.mp3', id: 'track', file: {}, size: 1 },
-                    ...(r.id === 'children-album' ? [folder('disc', 'Disc')] : []),
+                    ...(r.id === 'children-album' ? [
+                        folder('disc', 'Disc'),
+                        ...(newTrack ? [{ name: newTrack, id: newTrack, file: {}, size: 1 }] : []),
+                    ] : []),
                 ] } };
                 if (r.id === 'cache-album') return { id: r.id, status: 302,
                     headers: { Location: 'https://cdn.example/cache?sig=' + marker } };
@@ -140,8 +155,15 @@ async function checkShareDiagnostics(browser, url) {
         await page.locator('.modal-confirm').click();
         await page.waitForFunction(() => window._testSettings.isOpen() && [...window._testTree.getRoots().values()].some(r =>
             r.type === 'share' && r.folder?.children['Test.mp3']));
+        await page.locator('.settings-share-rename').click();
+        await page.locator('.modal input').fill('Renamed album');
+        const renamed = page.waitForResponse(response => response.request().method() === 'PUT'
+            && response.url().includes('shares.json:/content')
+            && response.request().postDataJSON().shares.some(share => share.name === 'Renamed album'));
+        await page.locator('.modal-confirm').click();
+        assert((await renamed).ok());
         await page.locator('.settings-close').click();
-        await page.getByText('Shared album', { exact: true }).first().click();
+        await page.getByText('Renamed album', { exact: true }).first().click();
         await page.locator('#children').getByText('Test.mp3').waitFor();
         failFollow = true;
         await page.getByRole('button', { name: 'Open settings' }).click();
@@ -173,6 +195,45 @@ async function checkShareDiagnostics(browser, url) {
         assert.equal(favoriteWrites, 0);
         failShareListing = false;
 
+        // A cached primary tree remains usable if its probe fails while the share refresh succeeds.
+        failPrimaryProbe = true;
+        shareSize = 5;
+        newTrack = 'Shared refresh.mp3';
+        await page.locator('.settings-pill-refresh').click();
+        await page.waitForFunction(() => [...window._testTree.getRoots().values()].some(root =>
+            root.type === 'share' && root.folder?.children['Shared refresh.mp3']));
+        await page.waitForFunction(() => !document.querySelector('.settings-pill-refresh')?.disabled);
+
+        // Reject the next share snapshot only, after Graph successfully delivered its listing.
+        const snapshotWrites = await page.evaluate(() => {
+            const put = IDBObjectStore.prototype.put;
+            const before = window.__ONEPLAY_MUSIC_LOGS.filter(e => e.message.includes('pull: complete')).length;
+            IDBObjectStore.prototype.put = function(value, key) {
+                if (this.name === 'data' && String(key).startsWith('index-share:')) {
+                    IDBObjectStore.prototype.put = put;
+                    throw Error('Injected share index storage failure');
+                }
+                return put.apply(this, arguments);
+            };
+            return before;
+        });
+        failPrimaryProbe = false;
+        failLocalShareCommit = true;
+        shareSize = 6;
+        newTrack = 'Uncommitted.mp3';
+        await page.locator('.settings-pill-refresh').click();
+        await page.waitForFunction(before => window.__ONEPLAY_MUSIC_LOGS.filter(e =>
+            e.message.includes('pull: complete')).length > before, snapshotWrites);
+        assert(await page.evaluate(() => {
+            const share = [...window._testTree.getRoots().values()].find(root => root.type === 'share');
+            return share.folder.children['Shared refresh.mp3'] && !share.folder.children['Uncommitted.mp3'];
+        }));
+        assert(await page.evaluate(() => window._testFavorites.getAll().some(f => f.id === 'cloud-favorite')));
+        assert.equal(favoriteWrites, 0);
+        failLocalShareCommit = false;
+        shareSize = undefined;
+        newTrack = undefined;
+
         const oldConnection = await page.evaluate(async () => {
             const share = window._testShares.getAll()[0];
             await window._testFavorites.setFolderPinned({ sourceRootKey: share.rootKey, connectionId: share.id,
@@ -185,6 +246,8 @@ async function checkShareDiagnostics(browser, url) {
         holdWrite = true;
         await page.locator('.settings-pill-refresh').click();
         await enteredWrite.promise;
+        const deleted = page.waitForResponse(r => r.request().method() === 'DELETE'
+            && r.url().endsWith('/share-' + encodeURIComponent(encoded)));
         await page.locator('.settings-share-trash').click();
         await page.locator('.modal-danger').click();
         await page.waitForFunction(() => window._testShares.getAll().length === 0);
@@ -200,9 +263,9 @@ async function checkShareDiagnostics(browser, url) {
         }, shareURL);
         assert.notEqual(replacement.id, oldConnection);
         assert.deepEqual(replacement.pins, []);
-        const deleted = page.waitForResponse(r => r.request().method() === 'DELETE');
         finishWrite.resolve();
         await deleted;
+        assert.equal(cacheDeletedWhileWriteHeld, false);
         await page.waitForFunction(() => !document.querySelector('.modal-backdrop'));
         await page.locator('.settings-pill-refresh').click();
         await page.waitForFunction(old => {
@@ -263,6 +326,6 @@ if (require.main === module) (async () => {
         const browser = await engine.launch();
         try { await checkShareDiagnostics(browser, url); }
         finally { await browser.close(); }
-        console.log(`${engine.name()} passed share redemption, browsing, redaction, native account isolation, favorite preservation after a failed share listing and retryable local pin removal before remote cleanup`);
+        console.log(`${engine.name()} passed share redemption, rename, browsing, redaction, native account isolation, favorite preservation after failed refresh and disconnect cleanup ordering`);
     }
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -5,7 +5,8 @@ import { type FolderPath } from './tree.js';
 import { log, logError, logCatch } from './logger.js';
 import { type Favorites, type RootsMap } from './favorites.js';
 import { dbGet, dbPut } from './db.js';
-import { type EvidenceState, type AuthFetch } from './auth.js';
+import type { EvidenceState } from './auth.js';
+import type { BrowserMedia } from './provider.js';
 import { type TimerDuration } from './settings.js';
 import {
     type PlaybackUiController,
@@ -122,7 +123,7 @@ const pathStartsWith = (path: FolderPath, prefix: FolderPath): boolean =>
 export function createPlayback(
     audioEl: HTMLAudioElement,
     footerEl: HTMLElement,
-    authFetch: AuthFetch,
+    playbackUrl: BrowserMedia['playbackUrl'],
     migrateLegacyFavorite?: (id: string) => Promise<void>,
 ): Playback {
     // -----------------------------------------------------------------------
@@ -193,7 +194,7 @@ export function createPlayback(
     let isTrackBlockedFn: (path: FolderPath) => boolean = () => false;
 
     // -- URL / prefetch subsystem --------------------------------------------
-    const urlEngine = new PlaybackUrlEngine(authFetch);
+    const urlEngine = new PlaybackUrlEngine(playbackUrl);
 
     let isEntryCachedFn: ((entry: QueueEntry) => boolean) | undefined;
     const unreadable = new Set<string>();

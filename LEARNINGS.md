@@ -38,7 +38,7 @@
 
 ## Async, cancellation, and concurrency
 
-- **Cancelable async work needs real cancellation plumbing.** A visible Cancel button is honest only when it can abort in-flight work via `AbortSignal`.
+- **Cancelable async work needs real cancellation plumbing.** Pass the `AbortSignal` through I/O and check it before publishing the result. A body can finish decoding after the native bridge has completed the request and detached its cancellation listener.
 - **User cancel and timeout are different contracts.** User cancel is control flow (`AbortError`); timeout is an operational failure path.
 - **Cancel a waiter separately from a shared operation.** A cancelled reader should release its worker even when another caller still needs the same token refresh. Account cleanup must wait for the underlying SDK callback if it can still write credentials.
 - **Protect startup from hangs with a terminal-state latch.** Define structural terminal states and ensure only the first terminal render wins.

@@ -12,6 +12,7 @@
  */
 import { readGraphJson, type Auth, type EvidenceState } from './auth.js';
 import type { NativeLibrary } from './native-library.js';
+import type { OneDriveProvider } from './onedrive-provider.js';
 import { dbGet, dbPut, dbDelete, dbClear } from './db.js';
 import { log, logError, logCatch, errorMessage, errorDetail } from './logger.js';
 import {
@@ -21,8 +22,6 @@ import {
     type IndexProgress,
     type MusicFolder,
     isCurrentIndex,
-    fetchAccountInfo,
-    buildIndex,
 } from './indexer.js';
 import type { TreeView } from './tree.js';
 import type { Playback } from './playback.js';
@@ -48,6 +47,8 @@ interface ShareProbeResult {
 
 export interface IndexSyncDeps {
     readonly auth: Auth | NativeLibrary;
+    readonly oneDrive: Pick<OneDriveProvider,
+        'fetchAccountInfo' | 'probeMusicFolder' | 'probeShareRoot' | 'buildAndCacheIndex' | 'deleteShareCache'>;
     readonly startupErrorMessage: string;
     readonly accountData: Map<string, { folder: MusicFolder; driveId: string }>;
     readonly getTree: () => TreeView | undefined;
@@ -93,7 +94,6 @@ export interface IndexSyncController {
     onShareRemoved(record: ShareRecordPersisted): Promise<void>;
 }
 
-const shareCacheNamespace = (shareId: string): string => `share-${encodeURIComponent(shareId)}`;
 const indexShareKey = (shareId: string): string => `index-share:${shareId}`;
 const indexKey = (driveId: string): string => `index:${driveId}`;
 const PULL_INTERVAL_MS = 5 * 60 * 1000;
@@ -336,20 +336,11 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         }));
     };
 
-    const removeShareRemoteCacheBestEffort = async (shareId: string): Promise<void> => {
-        const namespace = shareCacheNamespace(shareId);
-        await deps.auth.fetch(
-            `https://graph.microsoft.com/v1.0/me/drive/special/approot:/${namespace}`,
-            false,
-            { method: 'DELETE', timeoutMs: 30_000 },
-        ).catch(logCatch('remove share remote cache'));
-    };
-
     const fetchFreshAccountInfoOrHandleAuthFailures = async (
         wasInitialStartup: boolean,
         cachedData: MusicData | undefined,
     ): Promise<AccountInfo | undefined> => {
-        const freshInfo = await fetchAccountInfo(deps.auth.fetch);
+        const freshInfo = await deps.oneDrive.fetchAccountInfo();
         if (freshInfo === 'network') {
             logError('failed to fetch account info (network)');
             browserAuth?.transition('no-evidence');
@@ -415,11 +406,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
     const fetchMusicFolderMetadataOrShowError = async (
         cachedData: MusicData | undefined,
     ): Promise<MusicDriveItem | undefined> => {
-        const musicR = await deps.auth.fetch(
-            'https://graph.microsoft.com/v1.0/me/drive/special/music?$select=name,id,cTag,eTag,size,lastModifiedDateTime,folder',
-            false,
-            { cache: 'no-store' }, // Recursive size can change without a new folder ETag.
-        );
+        const musicR = await deps.oneDrive.probeMusicFolder();
         if (!musicR.ok) {
             logError(`music folder fetch failed: ${musicR.status}`);
             if (!cachedData) deps.showError(`Cannot access Music folder: ${musicR.status}`);
@@ -455,17 +442,14 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         log(`index start: primary mode=${isReindex ? 'reindex' : 'first-time'} driveId=${freshInfo.driveId}`);
 
         try {
-            const data = await buildIndex(
+            const data = await deps.oneDrive.buildAndCacheIndex(
                 musicDriveItem,
                 (p) => {
                     latestIndexProgress = p;
                     updateSettingsIndexSection();
                     if (!isReindex) deps.renderIndexing(p);
                 },
-                deps.auth.fetch,
                 freshInfo.driveId,
-                'primary',
-                native?.followContent,
             );
             // Only publish membership that can survive an offline reopen.
             await dbPut(indexKey(freshInfo.driveId), data);
@@ -498,11 +482,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
             const startedAt = Date.now();
             const applyAccess = native?.beginSourceProbe(share.rootKey);
             try {
-                const r = await deps.auth.fetch(
-                    `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(share.driveId)}/items/${encodeURIComponent(share.rootItemId)}?$select=name,id,cTag,eTag,size,lastModifiedDateTime,folder`,
-                    false,
-                    { cache: 'no-store' }, // Recursive size can change without a new folder ETag.
-                );
+                const r = await deps.oneDrive.probeShareRoot(share.driveId, share.rootItemId);
                 const durationMs = Date.now() - startedAt;
                 if (!stillConnected(share)) return { share, status: 'skipped' };
                 if (!r.ok) {
@@ -581,16 +561,14 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
             log(`index start: share share=${share.name}`);
             const cancel = new AbortController();
             const done = (async () => {
-                const data = await buildIndex(
+                const data = await deps.oneDrive.buildAndCacheIndex(
                     driveItem,
                     (p) => {
                         shareIndexProgressByShareId.set(share.shareId, p);
                         updateSettingsIndexSection();
                     },
-                    deps.auth.fetch,
                     share.driveId,
-                    shareCacheNamespace(share.shareId),
-                    native?.followContent,
+                    share.shareId,
                     cancel.signal,
                 );
                 if (!stillConnected(share)) return;
@@ -777,7 +755,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
             shareReindexingByShareId.delete(record.shareId);
             shareIndexProgressByShareId.delete(record.shareId);
             await dbDelete(indexShareKey(record.shareId)).catch(logCatch('share index delete'));
-            await removeShareRemoteCacheBestEffort(record.shareId);
+            await deps.oneDrive.deleteShareCache(record.shareId).catch(logCatch('remove share remote cache'));
         })();
         deletingShareCaches.set(record.shareId, deletion);
         try { await deletion; }

@@ -31,6 +31,7 @@ import {
 } from './settings.js';
 import { createShares, type Shares } from './shares.js';
 import { createIndexSync } from './index-sync.js';
+import { createOneDriveProvider } from './onedrive-provider.js';
 import { createIndexStartup } from './index-startup.js';
 
 const displayNativeLog = initWebLogger();
@@ -157,6 +158,7 @@ function showFavoriteCustomizeToastOnce(): void {
 const native = connectBundledLibrary(displayNativeLog);
 const browserAuth = native ? undefined : createAuth();
 const auth = native ?? browserAuth!;
+const oneDrive = createOneDriveProvider(auth.fetch, native?.followContent);
 auth.onEvidenceChange = (newState, prevState) => {
     log(`evidence: ${prevState} → ${newState}`);
     if (native && tree) {
@@ -229,6 +231,7 @@ const startup = createIndexStartup({
 
 const sync = createIndexSync({
     auth,
+    oneDrive,
     startupErrorMessage: STARTUP_ERROR_MESSAGE,
     accountData,
     getTree: () => tree,
@@ -549,7 +552,7 @@ function showTree(info: AccountInfo, data: MusicData, reindexing = false): void 
             playback = createPlayback(
                 document.getElementById('player') as HTMLAudioElement,
                 document.getElementById('footer')!,
-                auth.fetch,
+                oneDrive.media.playbackUrl,
                 migrateBrowserFavoriteBookmarks,
             );
             playback.setTimerDuration(timerDuration);
@@ -807,7 +810,7 @@ async function ensureFavorites(): Promise<void> {
                 ]);
             }
         };
-        favorites = createFavorites({authFetch: auth.fetch, dbGet, dbPut, fenceQueueEdit: async () => {
+        favorites = createFavorites({documents: oneDrive.documents, dbGet, dbPut, fenceQueueEdit: async () => {
             ++nativeLibraryGeneration;
             return playback ? playback.fenceQueueEdit() : nativePlayer?.fenceQueueEdit();
         }}, origin => {
@@ -834,7 +837,7 @@ async function ensureShares(): Promise<void> {
     if (ensureSharesPromise) return ensureSharesPromise;
 
     ensureSharesPromise = (async () => {
-        shares = createShares({ authFetch: auth.fetch, dbGet, dbPut,
+        shares = createShares({ documents: oneDrive.documents, oneDrive, dbGet, dbPut,
             onDisconnect: native?.syncPlaybackMembership, beginSourceProbe: native?.beginSourceProbe,
             readPlaybackDenials: native?.readPlaybackDenials }, () => {
             sync.syncShareRootsIntoTreeAndPlayback();
@@ -898,7 +901,7 @@ function wireFavoritesUi(): void {
     // Initialize downloads module (once, after favorites + tree + playback + select)
     if (!downloads && browserAuth) {
         downloads = createDownloads({
-            authFetch: auth.fetch,
+            download: oneDrive.media.download,
             getEvidence: () => auth.getEvidence(),
             provideEvidenceFromHttpStatus: (status, reason) => browserAuth.provideEvidenceFromHttpStatus(status, reason),
             provideEvidenceFromError: (error, reason) => browserAuth.provideEvidenceFromError(error, reason),

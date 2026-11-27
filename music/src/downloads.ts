@@ -30,7 +30,8 @@ import {
     audioGet, audioPut, audioDeleteBatch, audioFileSizes, audioClear,
 } from './db.js';
 import type { FolderPin } from './favorites.js';
-import { readGraphJson, type EvidenceState, type AuthFetch } from './auth.js';
+import type { EvidenceState } from './auth.js';
+import { MediaUnavailableError, ProviderHttpError, type BrowserMedia } from './provider.js';
 import { log, logError, logCatch, errorMessage, errorDetail } from './logger.js';
 
 // ---------------------------------------------------------------------------
@@ -110,8 +111,7 @@ export interface Downloads {
 }
 
 export interface DownloadsDeps {
-    authFetch: AuthFetch;
-    fetcher: (url: string, options?: RequestInit) => Promise<Response>;
+    download: BrowserMedia['download'];
     audioPut: typeof audioPut;
     audioGet: typeof audioGet;
     audioDeleteBatch: typeof audioDeleteBatch;
@@ -132,7 +132,6 @@ export interface DownloadsDeps {
 // ---------------------------------------------------------------------------
 
 const defaultDeps = {
-    fetcher: (url: string, options?: RequestInit) => fetch(url, options),
     audioPut, audioGet, audioDeleteBatch, audioFileSizes, audioClear,
     loadQuotaBytes: () => {
         const raw = localStorage.getItem(QUOTA_LS_KEY);
@@ -148,13 +147,13 @@ const defaultDeps = {
 // ---------------------------------------------------------------------------
 
 /**
- * Creates the download engine. Auth-related deps (authFetch, evidence helpers)
+ * Creates the download engine. The media operation and evidence helpers
  * must be provided; I/O deps default to production implementations.
  * The engine has no knowledge of favorites — it operates purely on track key
  * sets pushed in by the caller.
  */
 export function createDownloads(
-    deps: Partial<DownloadsDeps> & Pick<DownloadsDeps, 'authFetch' | 'getEvidence' | 'provideEvidenceFromHttpStatus' | 'provideEvidenceFromError'>,
+    deps: Partial<DownloadsDeps> & Pick<DownloadsDeps, 'download' | 'getEvidence' | 'provideEvidenceFromHttpStatus' | 'provideEvidenceFromError'>,
 ): Downloads {
     const d: DownloadsDeps = { ...defaultDeps, ...deps } as DownloadsDeps;
 
@@ -271,37 +270,7 @@ export function createDownloads(
 
         (async () => {
             try {
-                // 1. Fetch download URL via Graph API
-                const metaR = await d.authFetch(
-                    `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(item.driveId)}/items/${encodeURIComponent(item.itemId)}?$select=@microsoft.graph.downloadUrl`,
-                    false,
-                    { signal },
-                );
-                if (signal.aborted) return;
-
-                if (!metaR.ok) {
-                    result = classifyHttpError(metaR.status, item);
-                    return;
-                }
-
-                const meta = await readGraphJson(metaR, 'download URL');
-                const downloadUrl: string | undefined = meta['@microsoft.graph.downloadUrl'];
-                if (!downloadUrl) {
-                    result = {unavailable: key};
-                    logError(`download: no URL for ${key}`);
-                    return; // remove from queue (don't re-add)
-                }
-
-                // 2. Fetch the audio data (plain fetch, SAS-token URL)
-                const audioR = await d.fetcher(downloadUrl, { signal });
-                if (signal.aborted) return;
-
-                if (!audioR.ok) {
-                    result = classifyHttpError(audioR.status, item);
-                    return;
-                }
-
-                const blob = await audioR.blob();
+                const blob = await d.download(item.driveId, item.itemId, signal);
                 if (signal.aborted) return;
 
                 const save = d.audioPut(key, blob);
@@ -314,6 +283,15 @@ export function createDownloads(
 
             } catch (e) {
                 if (signal.aborted) return;
+                if (e instanceof ProviderHttpError) {
+                    result = handleDownloadHttpError(e.status, item);
+                    return;
+                }
+                if (e instanceof MediaUnavailableError) {
+                    result = {unavailable: key};
+                    logError(`download: no URL for ${key}`);
+                    return;
+                }
                 const msg = errorMessage(e);
                 if (msg.includes('timeout') || msg.includes('abort')) {
                     lastError = msg;
@@ -352,12 +330,10 @@ export function createDownloads(
         })();
     }
 
-    /** Classifies an HTTP error status and takes action on the queue item.
-     * For auth-wrapped fetches (metadata), auth.fetch already reconciles evidence.
-     * For plain fetches (SAS-token audio), evidence classification is delegated
-     * to auth via deps.provideEvidenceFromHttpStatus.
-     * Queue management: 404 → remove, 429/5xx → retry, timeout → pause. */
-    function classifyHttpError(status: number, item: QueueItem): {unavailable: string} | undefined {
+    /** Process statuses from metadata and signed content with the same queue policy.
+     * The auth wrapper also reconciles Graph evidence before returning its response.
+     * Timeout and 401 handling updates evidence for either request. */
+    function handleDownloadHttpError(status: number, item: QueueItem): {unavailable: string} | undefined {
         if (status === 429 || status === 500 || status === 502 || status === 503) {
             // Transient: push to back of queue for retry
             queue.push(item);

@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createShares, type SharesDeps } from '../../src/shares.js';
+import { createOneDriveProvider } from '../../src/onedrive-provider.js';
 
 interface MockResponse {
     readonly status: number;
@@ -15,11 +16,12 @@ function makeResponse(status: number, body?: unknown): Response {
 }
 
 function makeDeps(handler: (url: string) => MockResponse): SharesDeps {
+    const oneDrive = createOneDriveProvider(async url => {
+        const next = handler(url);
+        return makeResponse(next.status, next.body);
+    });
     return {
-        authFetch(url) {
-            const next = handler(url);
-            return Promise.resolve(makeResponse(next.status, next.body));
-        },
+        oneDrive, documents: oneDrive.documents,
         dbGet() { return Promise.resolve(undefined); },
         dbPut() { return Promise.resolve(); },
     };
@@ -89,6 +91,31 @@ describe('shares:addFromUrl', () => {
         assert.equal(record.rootItemId, 'root-item-1');
         assert.equal(record.rootKey, 'share:sid-1');
         assert.equal(shares.getAll().length, 1);
+    });
+
+    it('does not publish a folder whose response finishes decoding after cancellation', async () => {
+        const controller = new AbortController();
+        const oneDrive = createOneDriveProvider(async url => {
+            if (!url.includes('/driveItem')) return Response.json({ id: 'sid' });
+            const item = new Response();
+            // The native bridge has already fulfilled its request with an in-memory body.
+            item.text = async () => {
+                controller.abort();
+                return JSON.stringify({ id: 'album', name: 'Shared', folder: {}, parentReference: { driveId: 'drive' } });
+            };
+            return item;
+        });
+        const effects: string[] = [];
+        const shares = createShares({
+            ...makeDeps(() => ({ status: 404 })),
+            oneDrive,
+            documents: { ...oneDrive.documents, async write() { effects.push('upload'); } },
+            async dbPut() { effects.push('save'); },
+            beginSourceProbe: () => async () => { effects.push('proof'); return true; },
+        }, () => effects.push('publish'));
+        await assert.rejects(shares.addFromUrl('https://example.com/share', controller.signal), { name: 'AbortError' });
+        assert.deepEqual(shares.getAll(), []);
+        assert.deepEqual(effects, []);
     });
 
     it('rejects duplicate shareId', async () => {
@@ -178,12 +205,12 @@ it('verifies the resolved share on reconnect and withdraws it before local cache
     let pendingSave: Promise<void> | undefined;
     const shares = createShares({
         ...makeDeps(() => ({status: 404})),
-        async authFetch(url) {
+        oneDrive: createOneDriveProvider(async url => {
             const item = url.includes('/driveItem');
             return new Response(JSON.stringify(item
                 ? {id:'root', folder:{}, name:'Shared', parentReference:{driveId:'drive'}}
                 : {id:'same'}), {headers:{'X-OnePlay-Account-Proof':item ? 'verified item' : 'metadata'}});
-        },
+        }),
         async dbPut() { await pendingSave; },
         beginSourceProbe(root) {
             return async (r, allowed, connected) => {
@@ -219,7 +246,7 @@ it('renders cached share denials before any probe and counts only connected shar
     } });
     await native.loadAccountState('state');
     const shares = createShares({
-        authFetch: async () => { throw Error('No Graph request is needed to show the cached permissions'); },
+        ...makeDeps(() => { throw Error('No Graph request is needed to show the cached permissions'); }),
         dbGet: async <T>() => ({shares:[{id:'book', shareId:'book', rootKey:'share:book'}]} as T),
         dbPut: async () => {},
         readPlaybackDenials: native.readPlaybackDenials,

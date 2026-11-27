@@ -14,7 +14,8 @@
 import type { QueueEntry } from './tracks.js';
 import { type FolderPath } from './tree.js';
 import { log, logError, errorDetail } from './logger.js';
-import { readGraphJson, type AuthFetch, type EvidenceState } from './auth.js';
+import type { EvidenceState } from './auth.js';
+import { MediaUnavailableError, ProviderHttpError, type BrowserMedia } from './provider.js';
 import { type PlaybackMode } from './playback.js';
 import { type TimerDuration } from './settings.js';
 import { cleanMediaSessionTitle } from './media-title.js';
@@ -358,7 +359,6 @@ interface PrefetchArgs {
 }
 
 export class PlaybackUrlEngine {
-    private static readonly MAX_URL_LIFETIME_MS = 60 * 60_000;
     private static readonly NEAR_EXPIRY_MS = 2 * 60_000;
     private readonly urlCache = new Map<string, UrlCacheEntry>();
     private urlCacheCounter = 0;
@@ -368,7 +368,7 @@ export class PlaybackUrlEngine {
     private prefetchGeneration = 0;
     private currentBlobUrl: string | undefined;
 
-    public constructor(private readonly authFetch: AuthFetch) {}
+    public constructor(private readonly playbackUrl: BrowserMedia['playbackUrl']) {}
 
     /** Natural handoff may synchronously reuse a URL. A miss checks the offline blob before starting a fetch. */
     public getCachedTrackUrl(driveId: string, itemId: string): string | undefined {
@@ -434,57 +434,23 @@ export class PlaybackUrlEngine {
         this.prefetchNextTrackFireAndForget(args, next);
     }
 
-    private decodeTempauth(url: string): number | undefined {
-        try {
-            const tempauth = new URL(url).searchParams.get('tempauth');
-            if (!tempauth) return undefined;
-            for (const part of tempauth.split('.')) {
-                try {
-                    const normalized = part.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((part.length + 3) % 4);
-                    const raw = atob(normalized);
-                    const decoded = decodeURIComponent(raw.split('').map(c => '%' + c.charCodeAt(0).toString(16).padStart(2, '0')).join(''));
-                    const obj = JSON.parse(decoded);
-                    const exp = parseInt(obj?.exp, 10);
-                    if (!isNaN(exp)) return exp * 1000;
-                } catch { continue; }
-            }
-        } catch { /* invalid URL */ }
-        return undefined;
-    }
-
     private kickOffFetch(key: string, driveId: string, itemId: string, entry: UrlCacheEntry): Promise<string | undefined> {
         const counter = this.urlCacheCounter++;
         const promise = (async (): Promise<string | undefined> => {
             try {
-                const r = await this.authFetch(
-                    `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(itemId)}?$select=@microsoft.graph.downloadUrl`,
-                    false,
-                    { timeoutMs: 15_000 },
-                );
-                const entry2 = this.urlCache.get(key) ?? { sync: undefined, async: undefined };
-                if (entry2.async?.counter !== counter) return undefined;
-                entry2.async = undefined;
-                if (!r.ok) {
-                    logError(`getTrackUrl fetch failed: ${r.status}`);
-                    this.urlCache.set(key, entry2);
-                    return undefined;
-                }
-                const data = await readGraphJson(r, 'playback URL');
-                const url: string = data['@microsoft.graph.downloadUrl'];
-                const now = Date.now();
-                const parsedExpiry = this.decodeTempauth(url);
-                const expiration = parsedExpiry !== undefined
-                    ? Math.min(parsedExpiry, now + PlaybackUrlEngine.MAX_URL_LIFETIME_MS)
-                    : now + PlaybackUrlEngine.MAX_URL_LIFETIME_MS;
-                entry2.sync = { expiration, url };
-                this.urlCache.set(key, entry2);
+                // Register the flight before calling the provider, including when it throws synchronously.
+                const { url, expiresAt } = await Promise.resolve().then(() => this.playbackUrl(driveId, itemId));
+                if (entry.async?.counter !== counter) return undefined;
+                entry.sync = { expiration: expiresAt ?? Infinity, url };
                 return url;
-            } catch (e) {
-                const entry2 = this.urlCache.get(key) ?? { sync: undefined, async: undefined };
-                if (entry2.async?.counter === counter) entry2.async = undefined;
-                this.urlCache.set(key, entry2);
-                logError(`getTrackUrl fetch error: ${errorDetail(e)}`);
+            } catch (error) {
+                if (entry.async?.counter !== counter) return undefined;
+                if (error instanceof MediaUnavailableError) entry.sync = undefined;
+                else if (error instanceof ProviderHttpError) logError(`getTrackUrl fetch failed: ${error.status}`);
+                else logError(`getTrackUrl fetch error: ${errorDetail(error)}`);
                 return undefined;
+            } finally {
+                if (entry.async?.counter === counter) entry.async = undefined;
             }
         })();
         entry.async = { counter, promise };

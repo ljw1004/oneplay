@@ -65,7 +65,9 @@ Swift schedules two pin transfers in a background URLSession. Each task has an a
 - **src/index.ts** — Composition root orchestrator. Wires modules together, manages view/offline projection.
   - **src/index-startup.ts** — Startup terminal/deadline controller. Owns startup race/latch and startup terminal rendering helpers (sign-in/error/deadline).
   - **src/index-sync.ts** — Sync orchestrator. Owns pull single-flight, periodic/online scheduling, account/share probe/index refresh, and settings sync status projection.
-- **src/auth.ts** — OAuth2 PKCE against Microsoft Entra. Exports `authFetch()` — the authenticated fetch wrapper used by every module that talks to Graph API.
+- **src/auth.ts** — OAuth2 PKCE against Microsoft Entra. The browser fetch wrapper owns authenticated requests, token renewal, and network evidence.
+- **src/provider.ts** — Text document and browser media contracts. A missing document is distinct from failure. Browser downloads return complete Blobs. Returned status errors preserve the caller's evidence and retry policy.
+- **src/onedrive-provider.ts** — OneDrive adapter for app-folder documents, share redemption, catalog probes, index construction, and browser media. `index.ts` binds the browser or native Graph transport to it. The native share proof stays with its original response.
 - **src/indexer.ts** — Builds the music index by walking OneDrive via batched Graph API. Per-folder cache files on OneDrive enable incremental re-indexing by folder path.
 - **src/db.ts** — Key-value wrapper around IndexedDB. Two stores: "data" (index and favorites cache) and "audio" (offline audio blobs).
 - **src/tree.ts** — Renders the hierarchical folder/file view with breadcrumb navigation. The only module that touches `#breadcrumbs` and `#children` DOM elements.
@@ -174,6 +176,8 @@ contained the file by 3m 34s and the full Music index by 3m 40s. These
 end-to-end timings include polling and rebuilding. The exact propagation time
 and its upper bound are unknown.
 
+The coordinator owns probe order, the decision to rebuild, progress, local snapshot commit, and publication for healing. The OneDrive adapter invokes the existing builder with authenticated Graph batches and the originating host's credential-free content follow. It derives the existing per-folder cache namespace from the share ID and keeps these caches separate from the app document store.
+
 The index is stored in three places:
 1. **IndexedDB** (`index:{driveId}`) — for instant offline startup.
 2. **OneDrive App folder** — per-folder cache files for incremental re-indexing.
@@ -271,8 +275,7 @@ Both players use the same time-sliced projection of offline favorites and explic
 - **Error classification**: 404 → remove from queue; 429/503 → push to back;
   timeout → transition to no-evidence; auth error → transition to signed-out.
 
-Audio blobs are stored in IndexedDB's "audio" store. Playback checks the cache
-via `getOfflineBlob()` before streaming from OneDrive.
+The OneDrive adapter shares one metadata lookup between browser playback and downloads. Playback uses the returned expiry in its synchronous next-track cache. Download workers own queue policy and store complete blobs in IndexedDB's "audio" store. Playback checks that store via `getOfflineBlob()` before streaming. Swift continues using its account-owned media lookup for both native consumers.
 
 
 ## State persistence (M10)

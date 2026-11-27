@@ -27,6 +27,7 @@
     "test/unit/auth.test.ts",
     "test/unit/search.test.ts",
     "test/unit/indexer.test.ts",
+    "test/unit/onedrive-provider.test.ts",
     "test/unit/native-library.test.ts",
     "test/unit/native-pins.test.ts",
     "test/unit/shares.test.ts",

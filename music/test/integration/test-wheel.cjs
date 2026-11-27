@@ -74,7 +74,7 @@ module.exports = {
                 const accounts = new Map([['drive', {driveId: 'drive', folder}]]);
                 const roots = new Map([['drive', {type: 'onedrive', key: 'drive', name: 'Drive', info: {driveId: 'drive'}, folder}]]);
                 const audio = document.querySelector('audio');
-                const p = createPlayback(audio, document.querySelector('#footer'), async () => new Response(null, {status: 503}));
+                const p = createPlayback(audio, document.querySelector('#footer'), async () => { throw new Error('Media unavailable'); });
                 const wav = await (await fetch('edit.wav')).arrayBuffer();
                 p.setDownloads({getOfflineBlob: async (_, id) => {
                     window.lastRead = id;
@@ -85,7 +85,7 @@ module.exports = {
                 const favs = createFavorites({dbGet, dbPut: async (key, value) => {
                     await dbPut(key, value);
                     if (window.holdWrite) await new Promise(resolve => { window.releaseWrite = resolve; });
-                }, authFetch: async () => new Response('{}'), fenceQueueEdit: () => p.fenceQueueEdit()}, async () => {
+                }, documents: {read: async () => null, write: async () => {}}, fenceQueueEdit: () => p.fenceQueueEdit()}, async () => {
                     p.setContext(favs, roots);
                     await p.refreshLibraryQueue(true);
                 });
@@ -236,14 +236,14 @@ module.exports = {
             const roots = new Map([['drive', {type: 'onedrive', key: 'drive', name: 'Album', folder, info: {driveId: 'drive'}}]]);
             const accounts = new Map([['drive', {driveId: 'drive', folder}]]);
             const audio = document.querySelector('audio');
-            const player = createPlayback(audio, document.querySelector('#footer'), async () => new Response(null, {status: 404}));
+            const player = createPlayback(audio, document.querySelector('#footer'), async () => { throw new Error('Media unavailable'); });
             const wav = await (await fetch('mode.wav')).arrayBuffer();
             player.setDownloads({getOfflineBlob: async (_, id) => {
                 const bytes = new Uint8Array(wav.slice(0));
                 bytes[44] = id.charCodeAt(0);
                 return new Blob([bytes], {type: 'audio/wav'});
             }});
-            const favorites = createFavorites({dbPut: async () => {}, authFetch: async () => new Response('{}')}, async () => {
+            const favorites = createFavorites({dbPut: async () => {}, documents: {read: async () => null, write: async () => {}}}, async () => {
                 player.setContext(favorites, roots);
                 await player.refreshLibraryQueue(true);
             });
@@ -397,7 +397,7 @@ module.exports = {
             tree.setFavorites(createFavorites({}, () => {}));
             const media = URL.createObjectURL(await (await fetch('wheel-test.wav')).blob());
             const player = createPlayback(document.querySelector('audio'), document.querySelector('#footer'),
-                async () => Response.json({'@microsoft.graph.downloadUrl': media}));
+                async () => ({url: media}));
             player.onPlaybackChange = tree.setPlaybackInfo;
             const accounts = new Map([['drive', {driveId: 'drive', folder}]]);
             await player.playFolder(root, accounts);
@@ -459,8 +459,7 @@ module.exports = {
             const blob = await (await fetch('wheel-test.wav')).blob();
             const mediaUrl = URL.createObjectURL(blob);
             window.replaceWheelTestSource = () => { audio.src = URL.createObjectURL(blob); };
-            const player = createPlayback(audio, document.querySelector('#footer'), async () =>
-                Response.json({ '@microsoft.graph.downloadUrl': mediaUrl }));
+            const player = createPlayback(audio, document.querySelector('#footer'), async () => ({url: mediaUrl}));
             const folder = { id: 'root', children: { A: { id: 'a' }, B: { id: 'b' } } };
             const accounts = new Map([['drive', { driveId: 'drive', folder }]]);
             document.querySelector('#start').onclick = () => player.playTrack(['OnePlay Music', 'drive', 'A'], accounts);

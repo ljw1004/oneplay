@@ -17,7 +17,7 @@ import { type MusicFolder, type AccountInfo } from '../../src/indexer.js';
 const DRIVE_ID = 'test-drive';
 
 const sinkDeps: FavoritesDeps = {
-    authFetch() { return Promise.reject(new Error('no network')); },
+    documents: { async read() { return null; }, async write() {} },
     dbGet() { throw new Error('unexpected dbGet'); },
     dbPut() { return Promise.resolve(); },
 };

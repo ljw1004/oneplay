@@ -26,6 +26,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createDownloads, classifyOfflineBadgeState, type Downloads, type DownloadsDeps } from '../../src/downloads.js';
 import { classifyEvidence, type EvidenceState } from '../../src/auth.js';
+import { ProviderHttpError } from '../../src/provider.js';
 
 // ---------------------------------------------------------------------------
 // DI stubs: in-memory audio store + mock fetch + evidence state
@@ -34,7 +35,7 @@ import { classifyEvidence, type EvidenceState } from '../../src/auth.js';
 function makeStubDeps(): {
     deps: DownloadsDeps;
     audioStore: Map<string, Blob>;
-    fetchLog: Array<{ url: string }>;
+    fetchLog: string[];
     setOnline: (value: boolean) => void;
     provideEvidenceFromStatusCallCount: () => number;
     provideEvidenceFromErrorCallCount: () => number;
@@ -45,7 +46,7 @@ function makeStubDeps(): {
     getEvidence: () => EvidenceState;
 } {
     const audioStore = new Map<string, Blob>();
-    const fetchLog: Array<{ url: string }> = [];
+    const fetchLog: string[] = [];
     let quotaBytes = 10 * 1024 * 1024 * 1024; // 10 GB (generous for tests)
     let online = true;
     let evidence: EvidenceState = 'no-evidence';
@@ -54,21 +55,9 @@ function makeStubDeps(): {
     let dlRef: Downloads | undefined;
 
     const deps: DownloadsDeps = {
-        authFetch(url, _retryOn429, _options) {
-            fetchLog.push({ url });
-            // Return a mock response with downloadUrl
-            return Promise.resolve(new Response(
-                JSON.stringify({ '@microsoft.graph.downloadUrl': `https://mock-cdn.test/${url}` }),
-                { status: 200, headers: { 'Content-Type': 'application/json' } },
-            ));
-        },
-        fetcher(url, _options) {
-            fetchLog.push({ url });
-            // Return a small mock blob
-            return Promise.resolve(new Response(
-                new Blob(['mock-audio-data'], { type: 'audio/mpeg' }),
-                { status: 200 },
-            ));
+        async download(driveId, itemId) {
+            fetchLog.push(driveId + ':' + itemId);
+            return new Blob(['mock-audio-data'], { type: 'audio/mpeg' });
         },
         async audioPut(key, blob) { audioStore.set(key, blob); },
         async audioGet(key) { return audioStore.get(key); },
@@ -321,7 +310,7 @@ describe('garbage collection', () => {
 describe('error classification', () => {
     it('404 response → item removed from queue (not re-queued)', async () => {
         const stubs = makeStubDeps();
-        stubs.deps.authFetch = () => Promise.resolve(new Response('', { status: 404 }));
+        stubs.deps.download = async () => { throw new ProviderHttpError(404); };
         const dl = createTestDownloads(stubs);
         dl.setPinnedKeys(keySet('f1', 'f2'), keySet('f1', 'f2'));
         stubs.setEvidence('evidence:signed-in');
@@ -334,14 +323,10 @@ describe('error classification', () => {
     it('429 response → item pushed to back of queue, retried', async () => {
         const stubs = makeStubDeps();
         let call = 0;
-        stubs.deps.authFetch = () => {
+        stubs.deps.download = async () => {
             call++;
-            // First 2 calls return 429, subsequent return normal
-            if (call <= 2) return Promise.resolve(new Response('', { status: 429 }));
-            return Promise.resolve(new Response(
-                JSON.stringify({ '@microsoft.graph.downloadUrl': 'https://cdn/test' }),
-                { status: 200, headers: { 'Content-Type': 'application/json' } },
-            ));
+            if (call <= 2) throw new ProviderHttpError(429);
+            return new Blob(['mock-audio-data'], { type: 'audio/mpeg' });
         };
         const dl = createTestDownloads(stubs);
         dl.setPinnedKeys(keySet('f1'), keySet('f1'));
@@ -353,7 +338,7 @@ describe('error classification', () => {
 
     it('408/504 → transitions to no-evidence', async () => {
         const stubs = makeStubDeps();
-        stubs.deps.authFetch = () => Promise.resolve(new Response('', { status: 504 }));
+        stubs.deps.download = async () => { throw new ProviderHttpError(504); };
         const dl = createTestDownloads(stubs);
         dl.setPinnedKeys(keySet('f1'), keySet('f1'));
         stubs.setEvidence('evidence:signed-in');
@@ -367,11 +352,7 @@ describe('error classification', () => {
     it('network exception delegates evidence mapping to auth helper', async () => {
         const stubs = makeStubDeps();
         stubs.setOnline(false);
-        stubs.deps.authFetch = () => Promise.resolve(new Response(
-            JSON.stringify({ '@microsoft.graph.downloadUrl': 'https://cdn/test' }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } },
-        ));
-        stubs.deps.fetcher = () => Promise.reject(new TypeError('Failed to fetch'));
+        stubs.deps.download = async () => { throw new TypeError('Failed to fetch'); };
         const dl = createTestDownloads(stubs);
         dl.setPinnedKeys(keySet('f1'), keySet('f1'));
         stubs.setEvidence('evidence:signed-in');
@@ -383,10 +364,10 @@ describe('error classification', () => {
         const stubs = makeStubDeps();
         let fetchStartedResolve!: () => void;
         const fetchStarted = new Promise<void>((resolve) => { fetchStartedResolve = resolve; });
-        stubs.deps.authFetch = (_url, _retryOn429, options) => {
+        stubs.deps.download = (_driveId, _itemId, signal) => {
             fetchStartedResolve();
-            return new Promise<Response>((_resolve, reject) => {
-                options?.signal?.addEventListener('abort', () => {
+            return new Promise<Blob>((_resolve, reject) => {
+                signal.addEventListener('abort', () => {
                     reject(new DOMException('Aborted', 'AbortError'));
                 }, { once: true });
             });
@@ -499,8 +480,8 @@ describe('evidence:not-online', () => {
 
     it('error classifier uses not-online when navigator.onLine is false', async () => {
         const stubs = makeStubDeps();
-        // Make authFetch return 504 (timeout)
-        stubs.deps.authFetch = () => Promise.resolve(new Response('', { status: 504 }));
+        // Make the provider report 504 (timeout)
+        stubs.deps.download = async () => { throw new ProviderHttpError(504); };
         stubs.setOnline(false); // simulate offline
         const dl = createTestDownloads(stubs);
         dl.setPinnedKeys(keySet('f1'), keySet('f1'));

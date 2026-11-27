@@ -9,7 +9,8 @@ import { type Favorites, type RootsMap, isFavRef, type Favorite } from './favori
 import { type MusicFolder, isMusicFolder, walkFolder } from './indexer.js';
 import { log, logCatch, logError } from './logger.js';
 import { resolveWalkableRootForItemRef } from './roots.js';
-import { readGraphJson, type AuthFetch } from './auth.js';
+import { parsePrimaryDocument, ProviderHttpError, type PrimaryStore } from './provider.js';
+import type { OneDriveProvider } from './onedrive-provider.js';
 import type { NativeLibrary } from './native-library.js';
 
 export interface SharesDeps {
@@ -18,7 +19,8 @@ export interface SharesDeps {
     readonly beginSourceProbe?: NativeLibrary['beginSourceProbe'];
     /** The native player must withdraw the removed root even if deleting its index later stalls. */
     readonly onDisconnect?: (remainingRoots: string[], removedRoot: string) => Promise<void>;
-    authFetch: AuthFetch;
+    documents: PrimaryStore;
+    oneDrive: Pick<OneDriveProvider, 'readShareIdentity' | 'redeemShareFolder'>;
     dbGet<T>(key: string): Promise<T | undefined>;
     dbPut(key: string, value: unknown): Promise<void>;
 }
@@ -63,12 +65,7 @@ export interface Shares {
 }
 
 const IDB_KEY = 'shares';
-const ONEDRIVE_PATH = '/me/drive/special/approot:/shares.json:/content';
-
-function encodeShareUrlToken(url: string): string {
-    const b64 = btoa(url).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-    return `u!${b64}`;
-}
+const DOCUMENT = 'shares.json';
 
 function sortByAddedAt(shares: readonly ShareRecordPersisted[]): ShareRecordPersisted[] {
     return [...shares].sort((a, b) => a.addedAt - b.addedAt);
@@ -95,27 +92,6 @@ function collectTrackKeysFromFolder(
     }
 }
 
-/** Graph responses can contain reusable share links. Only the stage and HTTP status enter diagnostics. */
-function logAddFromUrlResponse(step: string, response: Response): void {
-    const write = response.ok ? log : logError;
-    write(`shares:addFromUrl:${step} status=${response.status}`);
-}
-
-async function extractGraphErrorMessage(
-    response: Response,
-    fallback: string,
-): Promise<string> {
-    try {
-        const parsed = await response.clone().json() as {
-            readonly error?: { readonly message?: unknown };
-        };
-        const message = parsed.error?.message;
-        return typeof message === 'string' && message.trim() ? message : fallback;
-    } catch {
-        return fallback;
-    }
-}
-
 export function createShares(deps: SharesDeps, onChange: () => void): Shares {
     let loadedMembership = false;
     let shares: ShareRecordPersisted[] = [];
@@ -139,19 +115,11 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
             while (uploadDirty) {
                 uploadDirty = false;
                 try {
-                    const r = await deps.authFetch(
-                        `https://graph.microsoft.com/v1.0${ONEDRIVE_PATH}`,
-                        false,
-                        {
-                            method: 'PUT',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify(toData()),
-                        },
-                    );
-                    if (!r.ok) logError(`shares: OneDrive save failed: ${r.status}`);
-                    else log('shares: saved to OneDrive');
+                    await deps.documents.write(DOCUMENT, JSON.stringify(toData()));
+                    log('shares: saved to OneDrive');
                 } catch (e) {
-                    logCatch('shares:onedrive-save')(e);
+                    if (e instanceof ProviderHttpError) logError(`shares: OneDrive save failed: ${e.status}`);
+                    else logCatch('shares:onedrive-save')(e);
                 }
             }
             uploadRunning = false;
@@ -176,13 +144,12 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
 
         async pullFromOneDrive() {
             try {
-                const r = await deps.authFetch(`https://graph.microsoft.com/v1.0${ONEDRIVE_PATH}`, false);
-                if (!r.ok) {
-                    if (r.status === 404) loadedMembership = true;
-                    else logError(`shares: OneDrive load failed: ${r.status}`);
-                    return r.status === 404;
+                const text = await deps.documents.read(DOCUMENT);
+                if (text === null) {
+                    loadedMembership = true;
+                    return true;
                 }
-                const server: SharesData = await readGraphJson(r, 'shares:onedrive-load');
+                const server = parsePrimaryDocument(text, 'shares:onedrive-load') as SharesData;
                 if (!server || !Array.isArray(server.shares)) return false;
                 const serverTime = server.updatedAt || 0;
                 if (loadedMembership && serverTime <= updatedAt) return true;
@@ -196,29 +163,18 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
                 loadedMembership = true;
                 onChange();
                 return true;
-            } catch (error) { logCatch('shares:onedrive-load')(error); return false; }
+            } catch (error) {
+                if (error instanceof ProviderHttpError) logError(`shares: OneDrive load failed: ${error.status}`);
+                else logCatch('shares:onedrive-load')(error);
+                return false;
+            }
         },
 
         async addFromUrl(url, signal) {
             const trimmed = url.trim();
             if (!trimmed) throw new Error('Share URL is required');
             log('shares:addFromUrl start');
-            const token = encodeShareUrlToken(trimmed);
-
-            const metaR = await deps.authFetch(
-                `https://graph.microsoft.com/v1.0/shares/${token}?$select=id`,
-                false,
-                { headers: { Prefer: 'redeemSharingLink' }, signal },
-            );
-            logAddFromUrlResponse('meta', metaR);
-            if (!metaR.ok) {
-                throw new Error(await extractGraphErrorMessage(
-                    metaR,
-                    `Cannot open share URL (${metaR.status})`,
-                ));
-            }
-            const meta = await metaR.json().catch(() => ({} as Record<string, unknown>));
-            const shareId = typeof meta.id === 'string' && meta.id ? meta.id : token;
+            const { shareId, token } = await deps.oneDrive.readShareIdentity(trimmed, signal);
 
             if (shares.some((s) => s.shareId === shareId)) {
                 throw new Error('This share is already connected');
@@ -226,51 +182,8 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
 
             const rootKey = 'share:' + shareId;
             const applyAccess = deps.beginSourceProbe?.(rootKey);
-            const itemR = await deps.authFetch(
-                `https://graph.microsoft.com/v1.0/shares/${token}/driveItem?$select=id,name,folder,root,parentReference,createdBy`,
-                false,
-                { headers: { Prefer: 'redeemSharingLink' }, signal },
-            );
-            logAddFromUrlResponse('driveItem', itemR);
-            if (!itemR.ok) {
-                throw new Error(await extractGraphErrorMessage(
-                    itemR,
-                    `Cannot read shared item (${itemR.status})`,
-                ));
-            }
-            const item = await readGraphJson(itemR, 'share item');
-            if (!item?.folder) throw new Error('Only folder shares are supported');
-
-            const driveIdRaw = item.parentReference?.driveId;
-            if (typeof driveIdRaw !== 'string' || !driveIdRaw) throw new Error('Share missing driveId');
-            const driveId = driveIdRaw;
-
-            let rootItem = item;
-            let rootResponse = itemR;
-            const isWholeDriveShare = item.root !== undefined && item.root !== null;
-            if (isWholeDriveShare) {
-                const musicR = await deps.authFetch(
-                    `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(driveId)}/special/music?$select=id,name,folder,createdBy`,
-                    false,
-                    { signal },
-                );
-                logAddFromUrlResponse('special-music', musicR);
-                if (!musicR.ok) {
-                    throw new Error(await extractGraphErrorMessage(
-                        musicR,
-                        'Whole-drive share must expose Music folder',
-                    ));
-                }
-                rootResponse = musicR;
-                rootItem = await readGraphJson(musicR, 'shared music folder');
-                if (!rootItem?.folder) throw new Error('Music special folder is not accessible');
-            }
-
-            const ownerName = typeof rootItem?.createdBy?.user?.displayName === 'string'
-                ? rootItem.createdBy.user.displayName : undefined;
-            const name = isWholeDriveShare
-                ? (ownerName || rootItem.name || item.name || 'Shared Music')
-                : (item.name || 'Shared Music');
+            const { driveId, rootItemId, name, response } = await deps.oneDrive.redeemShareFolder(token, signal);
+            signal?.throwIfAborted();
             const now = Date.now();
             const record: ShareRecordPersisted = {
                 id: crypto.randomUUID(),
@@ -278,14 +191,14 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
                 name,
                 rootKey,
                 driveId,
-                rootItemId: rootItem.id,
+                rootItemId,
                 addedAt: now,
                 updatedAt: now,
             };
             loadedMembership = true;
             shares = sortByAddedAt([...shares, record]);
             updatedAt = now;
-            const proof = applyAccess?.(rootResponse, true, () => shares.some(s => s.id === record.id));
+            const proof = applyAccess?.(response, true, () => shares.some(s => s.id === record.id));
             const [, granted] = await Promise.all([saveLocal(), proof?.catch(logCatch('shares:confirm playback access'))]);
             if (granted) deniedByRootKey.delete(rootKey);
             onChange();

@@ -26,7 +26,7 @@ import { type MusicFolder, isMusicFolder, walkFolder, sortedFolderChildren } fro
 import { type PlaybackMode, isValidMode } from './playback.js';
 import { log, logError, logCatch } from './logger.js';
 import { folderPinOwnerId, folderPinPathKey, resolveWalkableRootForItemRef } from './roots.js';
-import { readGraphJson, type AuthFetch } from './auth.js';
+import { parsePrimaryDocument, ProviderHttpError, type PrimaryStore } from './provider.js';
 
 // ---------------------------------------------------------------------------
 // Dependency injection (for testability — see LEARNINGS.md "DI over extraction")
@@ -35,7 +35,7 @@ import { readGraphJson, type AuthFetch } from './auth.js';
 /** I/O dependencies injected by the app entrypoint. In unit tests, supply
  *  throwing stubs so accidental I/O paths fail fast. */
 export interface FavoritesDeps {
-    authFetch: AuthFetch;
+    documents: PrimaryStore;
     fenceQueueEdit?: () => Promise<void> | undefined;
     dbGet<T>(key: string): Promise<T | undefined>;
     dbPut(key: string, value: unknown): Promise<void>;
@@ -267,7 +267,7 @@ export interface Favorites {
     setOfflinePin(id: string, pin: { paused: boolean } | undefined): Promise<void>;
 
     /** Suppress persistence (for testing only). When suppressed, dbPut and
-     *  authFetch become no-ops. Mutations still happen in memory and call onChange.
+     *  cloud writes become no-ops. Cloud pulls skip adoption. Mutations still happen in memory and call onChange.
      *  INVARIANT: must only be called from test harnesses via page.evaluate. */
     _testOnlySuppressSave(suppress: boolean): void;
 
@@ -290,8 +290,8 @@ export interface Favorites {
 export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' | 'mode' | 'pins') => void | Promise<void>): Favorites {
     let data: FavoritesData = { version: 1, updatedAt: 0, favorites: [], folderPins: [] };
     let loadedMembership = false;
-    /** Stashed originals for _testOnlySuppressSave restore. */
-    let originalDeps: Pick<FavoritesDeps, 'authFetch' | 'dbPut'> | undefined;
+    // Guard each dispatch so previously dispatched requests can still settle.
+    let suppressSaveForTests = false;
 
     // -- Helpers -------------------------------------------------------------
 
@@ -543,7 +543,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' 
     // -- Persistence ---------------------------------------------------------
 
     const IDB_KEY = 'favorites';
-    const ONEDRIVE_PATH = '/me/drive/special/approot:/favorites.json:/content';
+    const DOCUMENT = 'favorites.json';
 
     let pendingWrite: Promise<void> = Promise.resolve();
 
@@ -577,7 +577,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' 
             const nextData = { ...data, ...next, updatedAt };
             try {
                 if (fenceQueue) await fenceQueue();
-                await deps.dbPut(IDB_KEY, nextData);
+                if (!suppressSaveForTests) await deps.dbPut(IDB_KEY, nextData);
             } catch (error) {
                 if (options.queueEdit || origin === 'pins' || origin === 'mode') throw error;
                 logCatch('favorites:dbPut')(error);
@@ -602,7 +602,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' 
     let uploadRunning = false;
 
     /** Schedule OneDrive sync in background. Never throws; returns void (not Promise).
-     *  INVARIANT: only one authFetch to the favorites path runs at a time.
+     *  INVARIANT: only one cloud document write runs at a time.
      *  Multiple calls while upload is in-flight coalesce into one follow-up upload. */
     function scheduleOneDriveUploadFireAndForget(): void {
         uploadDirty = true;
@@ -611,20 +611,13 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' 
         (async () => {
             while (uploadDirty) {
                 uploadDirty = false;   // clear before upload so mutations during upload re-set it
+                if (suppressSaveForTests) continue;
                 try {
-                    const r = await deps.authFetch(
-                        `https://graph.microsoft.com/v1.0${ONEDRIVE_PATH}`,
-                        false,
-                        {
-                            method: 'PUT',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify(data),
-                        },
-                    );
-                    if (!r.ok) logError(`favorites: OneDrive save failed: ${r.status}`);
-                    else log('favorites: saved to OneDrive');
+                    await deps.documents.write(DOCUMENT, JSON.stringify(data));
+                    log('favorites: saved to OneDrive');
                 } catch (e) {
-                    logCatch('favorites:onedrive-save')(e);
+                    if (e instanceof ProviderHttpError) logError(`favorites: OneDrive save failed: ${e.status}`);
+                    else logCatch('favorites:onedrive-save')(e);
                 }
             }
             uploadRunning = false;
@@ -653,14 +646,14 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' 
      * calls onChange(). 404 means no server-side favorites yet — not an error.
      */
     const pullFavoritesFromOneDrive = async (): Promise<boolean> => {
+        if (suppressSaveForTests) return false;
         try {
-            const r = await deps.authFetch(`https://graph.microsoft.com/v1.0${ONEDRIVE_PATH}`, false);
-            if (!r.ok) {
-                if (r.status === 404) loadedMembership = true;
-                else logError(`favorites: OneDrive load failed: ${r.status}`);
-                return r.status === 404;
+            const text = await deps.documents.read(DOCUMENT);
+            if (text === null) {
+                loadedMembership = true;
+                return true;
             }
-            const server: FavoritesData = await readGraphJson(r, 'favorites:onedrive-load');
+            const server = parsePrimaryDocument(text, 'favorites:onedrive-load') as FavoritesData;
             if (!server || !Array.isArray(server.favorites)) return false;
             const adopted = await commitEdit(() => {
                 if (loadedMembership && (server.updatedAt || 0) <= data.updatedAt) return;
@@ -684,7 +677,11 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' 
             }, { queueEdit: true, origin: 'sync', serverTime: server.updatedAt || 0 });
             if (adopted) log(`favorites: adopted server version (updatedAt=${server.updatedAt})`);
             return true;
-        } catch (error) { logCatch('favorites:onedrive-load')(error); return false; }
+        } catch (error) {
+            if (error instanceof ProviderHttpError) logError(`favorites: OneDrive load failed: ${error.status}`);
+            else logCatch('favorites:onedrive-load')(error);
+            return false;
+        }
     };
 
     // -- Public API ----------------------------------------------------------
@@ -758,7 +755,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' 
         async save() {
             await serializeWrite(async () => {
                 loadedMembership = true;
-                await deps.dbPut(IDB_KEY, data).catch(logCatch('favorites:dbPut'));
+                if (!suppressSaveForTests) await deps.dbPut(IDB_KEY, data).catch(logCatch('favorites:dbPut'));
                 scheduleOneDriveUploadFireAndForget();
             });
         },
@@ -856,19 +853,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' 
         },
 
         _testOnlySuppressSave(suppress) {
-            if (suppress) {
-                // Idempotent: only stash originals on the first suppress call.
-                // Calling suppress(true) twice must not overwrite originals with no-ops.
-                if (!originalDeps) {
-                    originalDeps = { authFetch: deps.authFetch, dbPut: deps.dbPut };
-                }
-                deps.authFetch = () => Promise.resolve(new Response('', { status: 200 }));
-                deps.dbPut = () => Promise.resolve();
-            } else if (originalDeps) {
-                deps.authFetch = originalDeps.authFetch;
-                deps.dbPut = originalDeps.dbPut;
-                originalDeps = undefined;
-            }
+            suppressSaveForTests = suppress;
         },
     };
 

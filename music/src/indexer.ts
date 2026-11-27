@@ -157,31 +157,6 @@ export function isCurrentIndex(data: MusicData | undefined, folder: MusicDriveIt
     return data?.schemaVersion === SCHEMA_VERSION && data.size === folder.size;
 }
 
-/**
- * Fetches driveId + displayName from GET /me/drive.
- * Returns the account info on success, or a failure reason:
- * - 'auth': server responded but auth failed (proves connectivity)
- * - 'network': couldn't reach the server (no connectivity evidence)
- */
-export async function fetchAccountInfo(
-    authFetch: AuthFetch,
-): Promise<AccountInfo | 'auth' | 'network'> {
-    const r = await authFetch(
-        'https://graph.microsoft.com/v1.0/me/drive?$select=id,owner',
-        false
-    );
-    if (!r.ok) {
-        logError(`fetchAccountInfo: ${r.status} ${r.statusText}`);
-        // Any 4xx = server processed our request and rejected it, proving
-        // connectivity. This includes 401/403 (auth expired) and 400
-        // (invalid_grant from token refresh). 5xx and synthetic 503
-        // (from errorResponse wrapping network exceptions) = no evidence.
-        return (r.status >= 400 && r.status < 500) ? 'auth' : 'network';
-    }
-    const data = await readGraphJson(r, 'account details');
-    return { driveId: data.id, displayName: data.owner?.user?.displayName ?? 'OneDrive' };
-}
-
 // ---------------------------------------------------------------------------
 // Work-item constructors
 // ---------------------------------------------------------------------------

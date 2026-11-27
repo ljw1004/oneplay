@@ -54,13 +54,17 @@ export type AuthFetch = (
     options?: AuthFetchOptions,
 ) => Promise<Response>;
 
-/** JSON parsers can quote parts of a signed URL or a token in their exceptions.
- * Retain the request operation and status before the error reaches any caller or log. */
-export async function readGraphJson(response: Response, operation: string): ReturnType<Response['json']> {
-    const text = await response.text().catch((error): never => {
+/** Report body-read failures with the operation and HTTP status. Preserve intentional cancellation. */
+export async function readGraphText(response: Response, operation: string): Promise<string> {
+    return response.text().catch((error): never => {
         if (isAbortError(error)) throw error;
         throw new Error(`${operation}: body unreadable status=${response.status}`);
     });
+}
+
+/** JSON parser errors can quote a signed URL or token. Report only the operation and HTTP status. */
+export async function readGraphJson(response: Response, operation: string): ReturnType<Response['json']> {
+    const text = await readGraphText(response, operation);
     try { return JSON.parse(text); }
     catch { throw new Error(`${operation}: invalid JSON status=${response.status}`); }
 }

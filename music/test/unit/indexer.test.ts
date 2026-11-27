@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildIndex, isCurrentIndex, type MusicDriveItem, type MusicData } from '../../src/indexer.js';
 import { type AuthFetch, type AuthFetchOptions } from '../../src/auth.js';
+import { createOneDriveProvider } from '../../src/onedrive-provider.js';
 
 type Step =
     | 'success'
@@ -217,7 +218,7 @@ it('opens an existing build 251 root without visiting descendants or rewriting t
     const cached: MusicData = {
         kind: 'MusicData', schemaVersion: 1, size: ROOT_DRIVE_ITEM.size,
         lastModifiedDateTime: 'older', cTag: 'older', eTag: 'older',
-        folder: { id: ROOT_DRIVE_ITEM.id, children: { Album: { id: 'album', children: { 'Song.mp3': { id: 'song' } } } } },
+        folder: { id: ROOT_DRIVE_ITEM.id, children: { Album: { id: 'album', children: { 'Café.mp3': { id: 'song' } } } } },
         count: 1,
     };
     let batches = 0;
@@ -234,10 +235,11 @@ it('opens an existing build 251 root without visiting descendants or rewriting t
             { id: 'cache-root-folder', status: 302, headers: { Location: 'https://cdn.example/index' } },
         ] });
     };
-    const result = await buildIndex(ROOT_DRIVE_ITEM, () => {}, fetch, 'drive', 'primary', async () => {
+    const provider = createOneDriveProvider(fetch, async () => {
         follows++;
         return Response.json(cached);
     });
+    const result = await provider.buildAndCacheIndex(ROOT_DRIVE_ITEM, () => {}, 'drive');
     assert.deepEqual(result, cached);
     assert.equal(batches, 1);
     assert.equal(follows, 1);

@@ -20,6 +20,8 @@ $(SRCROOT)/../src/modal.ts
 $(SRCROOT)/../src/native-library.ts
 $(SRCROOT)/../src/native-pins.ts
 $(SRCROOT)/../src/native-playback.ts
+$(SRCROOT)/../src/onedrive-provider.ts
+$(SRCROOT)/../src/provider.ts
 $(SRCROOT)/../src/path-names.ts
 $(SRCROOT)/../src/playback-engine.ts
 $(SRCROOT)/../src/playback-ui.ts

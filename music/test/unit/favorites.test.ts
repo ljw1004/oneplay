@@ -7,7 +7,7 @@
  * mutation methods (rename, addMembers, removeMembers, setHasPrivatePlayback).
  *
  * I/O deps use sink stubs: dbPut is a no-op (since add/heal await save()
- * as a side effect), authFetch rejects (caught by save()'s .catch()),
+ * as a side effect), cloud writes are accepted by a sink,
  * dbGet throws (unexpected in unit tests).
  * See LEARNINGS.md "DI over extraction".
  *
@@ -25,12 +25,12 @@ import { type MusicFolder, type AccountInfo } from '../../src/indexer.js';
 
 // ---------------------------------------------------------------------------
 // DI stubs — dbPut is a sink (save() is a normal side effect of add/heal),
-// authFetch rejects silently (caught by save()'s internal .catch()),
+// cloud writes are accepted by a sink,
 // dbGet throws (never expected in these test paths).
 // ---------------------------------------------------------------------------
 
 const sinkDeps: FavoritesDeps = {
-    authFetch() { return Promise.reject(new Error('no network in unit test')); },
+    documents: { async read() { return null; }, async write() {} },
     dbGet() { throw new Error('unexpected dbGet in unit test'); },
     dbPut() { return Promise.resolve(); },
 };
@@ -666,10 +666,9 @@ describe('playlist edit acknowledgment', () => {
         const favs = createFavorites({...sinkDeps,
             fenceQueueEdit: () => new Promise<void>((_, reject) => { rejectFence = reject; reachedFence(); }),
             dbPut: async (_, data) => { writes.push(data as FavoritesData); },
-            authFetch: async (_, __, options) => {
-                uploads.push(JSON.parse(String(options?.body)) as FavoritesData);
-                return new Response();
-            },
+            documents: { ...sinkDeps.documents, async write(_, text) {
+                uploads.push(JSON.parse(text) as FavoritesData);
+            } },
         }, () => {});
         const a = itemRef(['A'], 'A', false);
         await favs.add(playlist('p', 'Original', [a]));
@@ -783,11 +782,16 @@ describe('physical folder pins', () => {
         const deps: FavoritesDeps = {
             async dbGet<T>() { return structuredClone(disk) as T; },
             async dbPut(_, value) { disk = structuredClone(value); },
-            async authFetch(_, __, options) {
-                if (options?.method === 'PUT') puts++;
-                if (!online) throw new Error('offline');
-                if (options?.method === 'PUT') cloud = JSON.parse(String(options.body));
-                return cloud ? Response.json(cloud) : new Response(null, { status: 404 });
+            documents: {
+                async read() {
+                    if (!online) throw new Error('offline');
+                    return cloud ? JSON.stringify(cloud) : null;
+                },
+                async write(_, text) {
+                    puts++;
+                    if (!online) throw new Error('offline');
+                    cloud = JSON.parse(text);
+                },
             },
         };
         const first = createFavorites(deps, () => {});
@@ -821,7 +825,7 @@ describe('physical folder pins', () => {
         const entered = new Promise<void>(resolve => { started = resolve; });
         const wait = new Promise<void>(resolve => { admit = resolve; });
         const favs = createFavorites({ ...sinkDeps,
-            authFetch: async (_, __, options) => options?.method === 'PUT' ? new Response() : Response.json(remote),
+            documents: { ...sinkDeps.documents, read: async () => JSON.stringify(remote) },
             dbPut: async () => {
                 if (hold) { hold = false; started(); await wait; }
                 if (diskFull) throw new Error('disk full');
@@ -862,9 +866,9 @@ describe('physical folder pins', () => {
         const row = playlist('p', 'Album', [itemRef(['song'], 'song', false)]);
         const events: string[] = [];
         const favs = createFavorites({...sinkDeps,
-            authFetch: async (_, __, options) => options?.method === 'PUT' ? new Response() : Response.json({
+            documents: { ...sinkDeps.documents, read: async () => JSON.stringify({
                 updatedAt: Date.now() + 10_000, favorites: [{...row, mode: 'repeat'}], folderPins: [],
-            }),
+            }) },
             fenceQueueEdit: async () => { events.push('queue'); },
         }, origin => { events.push(origin ?? 'add'); });
         await favs.add(row);
@@ -894,10 +898,9 @@ describe('physical folder pins', () => {
         const persisted = playlist('mix', 'Mix', []);
         const favs = createFavorites({ ...sinkDeps,
             dbPut: async () => { if (full) throw new Error('disk full'); },
-            authFetch: async (_, __, options) => {
-                uploads.push(JSON.parse(String(options?.body)));
-                return new Response();
-            },
+            documents: { ...sinkDeps.documents, async write(_, text) {
+                uploads.push(JSON.parse(text));
+            } },
         }, () => {});
         await favs.add(persisted);
         full = true;
@@ -915,10 +918,9 @@ describe('physical folder pins', () => {
         let diskFull = true;
         const favs = createFavorites({ ...sinkDeps,
             dbPut: async () => { if (diskFull) throw new Error('full'); },
-            authFetch: async (_, __, options) => {
-                uploads.push(JSON.parse(String(options?.body)));
-                return new Response();
-            },
+            documents: { ...sinkDeps.documents, async write(_, text) {
+                uploads.push(JSON.parse(text));
+            } },
         }, () => {});
         await assert.rejects(favs.setFolderPinned(pin(['Books'], 'books'), true), /full/);
         diskFull = false;

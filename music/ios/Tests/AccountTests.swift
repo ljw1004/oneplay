@@ -312,8 +312,9 @@ private final class TestAudioCDN: URLProtocol {
             await window._testTree.onPlayClick(['OnePlay Music','fav:reader']);
             """, arguments: [:], in: nil, contentWorld: .page)
         let play = ContinuousClock.now + .seconds(5)
-        while controller.player?.snapshot["state"] as? String != "playing", .now < play { try await Task.sleep(for: .milliseconds(25)) }
-        XCTAssertEqual(controller.player?.snapshot["state"] as? String, "playing", controller.player?.status ?? "")
+        let player = try XCTUnwrap(controller.player)
+        while player.snapshot["state"] as? String != "playing", .now < play { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertEqual(player.snapshot["state"] as? String, "playing", player.status)
         _ = try await page.evaluateJavaScript("document.querySelector('.footer-gripper').click()")
         let rail = "document.querySelector('.audio-ranges > :nth-child(2) .audio-range-rail.offline')"
         let blue = ContinuousClock.now + .seconds(4)
@@ -328,6 +329,9 @@ private final class TestAudioCDN: URLProtocol {
         ranges.name = "Expanded player with complete offline file"
         ranges.lifetime = .keepAlways
         add(ranges)
+        // Keep the account's pin store bound for the later, independent playback run.
+        let reopenedSession = player.sessionID
+        player.stop()
         // The share cannot enumerate its album without a listing.
         let blocked = try await page.callAsyncJavaScript("""
             window._testTree.setSelectedPath(['OnePlay Music']);
@@ -394,11 +398,11 @@ private final class TestAudioCDN: URLProtocol {
             """, arguments:[:], in:nil, contentWorld:.page)
         try await waitForFiles(["library:a"])
         XCTAssertEqual(Set(try XCTUnwrap(storage.read(Owners.self,"pins")).owners.keys), ["reader"])
-        let player = try XCTUnwrap(controller.player)
         let playing = ContinuousClock.now + .seconds(6)
         while player.snapshot["state"] as? String != "playing", .now < playing { try await Task.sleep(for:.milliseconds(20)) }
         try await openDialog()
         XCTAssertEqual(player.snapshot["state"] as? String,"playing")
+        XCTAssertNotEqual(player.sessionID, reopenedSession)
         XCTAssertTrue(player.holdsPin("library:a"))
         let unmarked = try await page.callAsyncJavaScript("""
             const modal = document.querySelector('.modal');

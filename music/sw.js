@@ -25,6 +25,8 @@ const APP_SHELL = [
     './dist/native-library.js',
     './dist/native-pins.js',
     './dist/native-playback.js',
+    './dist/onedrive-provider.js',
+    './dist/provider.js',
     './dist/db.js',
     './dist/downloads.js',
     './dist/favorites.js',

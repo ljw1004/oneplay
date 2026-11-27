@@ -13,8 +13,11 @@ import {
     pickRestoreCandidate,
     reduceRefreshedTrackList,
     shuffleTrackList,
+    PlaybackUrlEngine,
     type PathEquals,
 } from '../../src/playback-engine.js';
+import { createOneDriveProvider } from '../../src/onedrive-provider.js';
+import type { AuthFetchOptions } from '../../src/auth.js';
 import { cleanMediaSessionTitle } from '../../src/media-title.js';
 import type { FolderPath } from '../../src/tree.js';
 import type { PlaybackMode } from '../../src/playback.js';
@@ -229,5 +232,74 @@ describe('media session helpers', () => {
         });
         assert.equal(getMediaSessionPositionState(NaN, 2, 1), undefined);
         assert.equal(getMediaSessionPositionState(10, 2, 0), undefined);
+    });
+});
+
+function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>(done => { resolve = done; });
+    return { promise, resolve };
+}
+
+describe('browser playback URL renewal', () => {
+    it('shares one lookup through body decoding and returns a ready successor synchronously', async () => {
+        const entered = deferred<void>();
+        const body = deferred<string>();
+        const mediaUrl = 'https://audio.example/next.mp3';
+        const calls: Array<{ retry: boolean; options?: AuthFetchOptions }> = [];
+        const provider = createOneDriveProvider(async (_url, retry, options) => {
+            calls.push({ retry, options });
+            const response = new Response();
+            response.text = () => { entered.resolve(); return body.promise; };
+            return response;
+        });
+        const engine = new PlaybackUrlEngine(provider.media.playbackUrl);
+        const initial = engine.getTrackUrl('drive', 'item');
+        assert.equal(initial.type, 'promise');
+        await entered.promise;
+        assert.deepEqual(engine.getTrackUrl('drive', 'item'), initial);
+        assert.deepEqual(calls, [{ retry: false, options: { timeoutMs: 15_000 } }]);
+        body.resolve(JSON.stringify({ '@microsoft.graph.downloadUrl': mediaUrl }));
+        assert.equal(await initial.promise, mediaUrl);
+        assert.equal(engine.getCachedTrackUrl('drive', 'item'), mediaUrl);
+        assert.deepEqual(engine.getTrackUrl('drive', 'item'), { type: 'value', value: mediaUrl });
+    });
+
+    it('retries after a provider throws before returning a promise', async () => {
+        const mediaUrl = 'https://audio.example/next.mp3';
+        let calls = 0;
+        const engine = new PlaybackUrlEngine(() => {
+            if (++calls === 1) throw new Error('Lookup unavailable');
+            return Promise.resolve({ url: mediaUrl });
+        });
+        const first = engine.getTrackUrl('drive', 'item');
+        assert.equal(first.type, 'promise');
+        assert.equal(await first.promise, undefined);
+        const second = engine.getTrackUrl('drive', 'item');
+        assert.equal(second.type, 'promise');
+        assert.equal(await second.promise, mediaUrl);
+    });
+
+    it('renews a near-expiry URL while preserving it on failure and clearing it on confirmed absence', async () => {
+        const exp = Math.floor((Date.now() + 60_000) / 1000);
+        const mediaUrl = 'https://audio.example/next.mp3?tempauth=' + btoa(JSON.stringify({ exp }));
+        let calls = 0;
+        let renewed = deferred<Response>();
+        const provider = createOneDriveProvider(async () => ++calls === 1
+            ? Response.json({ '@microsoft.graph.downloadUrl': mediaUrl }) : renewed.promise);
+        const engine = new PlaybackUrlEngine(provider.media.playbackUrl);
+        const initial = engine.getTrackUrl('drive', 'item');
+        assert.equal(initial.type, 'promise');
+        assert.equal(await initial.promise, mediaUrl);
+        for (const result of [new Response(null, { status: 503 }), Response.json({})]) {
+            assert.deepEqual(engine.getTrackUrl('drive', 'item'), { type: 'value', value: mediaUrl });
+            assert.deepEqual(engine.getTrackUrl('drive', 'item'), { type: 'value', value: mediaUrl });
+            renewed.resolve(result);
+            // Drain the lookup and Response body microtasks before observing the ready cache.
+            await new Promise<void>(resolve => setImmediate(resolve));
+            assert.equal(engine.getCachedTrackUrl('drive', 'item'), result.ok ? undefined : mediaUrl);
+            renewed = deferred<Response>();
+        }
+        assert.equal(calls, 3);
     });
 });

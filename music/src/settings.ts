@@ -37,6 +37,10 @@ export interface SettingsIndexFailure {
 }
 
 interface OpenOptions {
+    readonly demo?: {
+        readonly creditsHref?: string;
+        readonly openNativeCredits?: () => void;
+    };
     readonly evidence: EvidenceState;
     readonly timerDuration: TimerDuration;
     readonly debugEnabled: boolean;
@@ -70,6 +74,7 @@ export interface SettingsView {
     close(): void;
     isOpen(): boolean;
     updateAuthAction(evidence: EvidenceState): void;
+    updateDemoCredits(href: string): void;
     updateIndexSection(status: IndexStatus): void;
 }
 
@@ -250,139 +255,171 @@ export function createSettings(container: HTMLElement): SettingsView {
                 return s;
             };
 
-            const oneDrive = section('OneDrive');
-            authButton = document.createElement('button');
-            authButton.type = 'button';
-            authButton.className = 'settings-pill';
-            updateAuthAction(initial.evidence);
-            authButton.addEventListener('click', () => {
-                initial.onClose();
-                runMaybeAsyncUiAction(
-                    () => reconnect ? initial.onReconnect() : initial.onSignOut(),
-                    'settings auth action',
-                );
-            });
-            oneDrive.appendChild(authButton);
-            body.appendChild(oneDrive);
+            authButton = undefined;
+            if (initial.demo) {
+                const demo = section('Demo library');
+                const summary = document.createElement('p');
+                summary.className = 'settings-demo-summary';
+                summary.textContent = 'You’re browsing sample music';
+                if (initial.demo.creditsHref) {
+                    const credits = document.createElement('a');
+                    credits.href = initial.demo.creditsHref;
+                    credits.target = '_blank';
+                    credits.rel = 'noopener noreferrer';
+                    credits.textContent = 'credits';
+                    const openNativeCredits = initial.demo.openNativeCredits;
+                    if (openNativeCredits) credits.addEventListener('click', event => {
+                        event.preventDefault();
+                        openNativeCredits();
+                    });
+                    summary.append(' [', credits, ']');
+                }
+                summary.append('. Sign out to choose a provider.');
+                const signOut = document.createElement('button');
+                signOut.type = 'button';
+                signOut.className = 'settings-pill';
+                signOut.textContent = 'Sign out of Demo';
+                signOut.addEventListener('click', () => {
+                    initial.onClose();
+                    runMaybeAsyncUiAction(initial.onSignOut, 'demo sign-out');
+                });
+                demo.append(summary, signOut);
+                body.appendChild(demo);
+            } else {
+                const oneDrive = section('OneDrive');
+                authButton = document.createElement('button');
+                authButton.type = 'button';
+                authButton.className = 'settings-pill';
+                updateAuthAction(initial.evidence);
+                authButton.addEventListener('click', () => {
+                    initial.onClose();
+                    runMaybeAsyncUiAction(
+                        () => reconnect ? initial.onReconnect() : initial.onSignOut(),
+                        'settings auth action',
+                    );
+                });
+                oneDrive.appendChild(authButton);
+                body.appendChild(oneDrive);
 
-            const shared = section('Shared with you');
-            const shareList = document.createElement('div');
-            shareList.className = 'settings-share-list';
-            for (const share of initial.shareRows ?? []) {
-                const row = document.createElement('div');
-                row.className = 'settings-share-item settings-share-row';
+                const shared = section('Shared with you');
+                const shareList = document.createElement('div');
+                shareList.className = 'settings-share-list';
+                for (const share of initial.shareRows ?? []) {
+                    const row = document.createElement('div');
+                    row.className = 'settings-share-item settings-share-row';
 
-                const textWrap = document.createElement('div');
-                textWrap.className = 'settings-share-text';
+                    const textWrap = document.createElement('div');
+                    textWrap.className = 'settings-share-text';
 
-                const name = document.createElement('span');
-                name.className = 'settings-share-name';
-                name.textContent = share.label;
-                textWrap.appendChild(name);
+                    const name = document.createElement('span');
+                    name.className = 'settings-share-name';
+                    name.textContent = share.label;
+                    textWrap.appendChild(name);
 
-                if (share.deniedReason) {
-                    const denied = document.createElement('span');
-                    denied.className = 'settings-share-denied';
-                    denied.textContent = share.deniedReason;
-                    textWrap.appendChild(denied);
+                    if (share.deniedReason) {
+                        const denied = document.createElement('span');
+                        denied.className = 'settings-share-denied';
+                        denied.textContent = share.deniedReason;
+                        textWrap.appendChild(denied);
+                    }
+
+                    const actions = document.createElement('div');
+                    actions.className = 'settings-share-actions';
+
+                    const renameBtn = document.createElement('button');
+                    renameBtn.type = 'button';
+                    renameBtn.className = 'settings-share-icon-btn settings-share-rename';
+                    renameBtn.textContent = '\u270E';
+                    renameBtn.addEventListener('click', () => {
+                        showModal('Rename share', (modal, close) => {
+                            const input = document.createElement('input');
+                            input.type = 'text';
+                            input.value = share.label;
+                            input.placeholder = 'Share name';
+                            modal.appendChild(input);
+                            addModalActions(modal, close, 'Save', async () => {
+                                await initial.onRenameShare(share.id, input.value);
+                            });
+                            input.focus();
+                            input.select();
+                        }, undefined, true);
+                    });
+
+                    const removeBtn = document.createElement('button');
+                    removeBtn.type = 'button';
+                    removeBtn.className = 'settings-share-icon-btn settings-share-trash';
+                    removeBtn.innerHTML = ACTION_DELETE_ICON_SVG;
+                    removeBtn.addEventListener('click', () => {
+                        showModal('Disconnect from share', (modal, close) => {
+                            const { uniqueTrackCount, affectedFavoriteCount, folderPinCount } = share.getRemoveImpact();
+                            if (affectedFavoriteCount > 0) {
+                                const p = document.createElement('p');
+                                p.textContent = `This will remove ${uniqueTrackCount} tracks from ${affectedFavoriteCount} playlists.`;
+                                modal.appendChild(p);
+                            }
+                            if (folderPinCount) {
+                                const p = document.createElement('p');
+                                p.textContent = `This will clear the offline setting for ${folderPinCount} folder${folderPinCount === 1 ? '' : 's'} in this share.`;
+                                modal.appendChild(p);
+                            }
+                            addModalActions(modal, close, 'Disconnect', async () => {
+                                await initial.onRemoveShare(share.id);
+                            }, true);
+                        });
+                    });
+
+                    actions.append(renameBtn, removeBtn);
+                    row.append(textWrap, actions);
+                    shareList.appendChild(row);
                 }
 
-                const actions = document.createElement('div');
-                actions.className = 'settings-share-actions';
-
-                const renameBtn = document.createElement('button');
-                renameBtn.type = 'button';
-                renameBtn.className = 'settings-share-icon-btn settings-share-rename';
-                renameBtn.textContent = '\u270E';
-                renameBtn.addEventListener('click', () => {
-                    showModal('Rename share', (modal, close) => {
+                const addShareBtn = document.createElement('button');
+                addShareBtn.type = 'button';
+                addShareBtn.className = 'settings-share-item settings-share-add';
+                const addShareName = document.createElement('span');
+                addShareName.className = 'settings-share-name';
+                addShareName.textContent = 'Add share URL...';
+                const addShareIcon = document.createElement('span');
+                addShareIcon.className = 'settings-share-icon-btn settings-share-add-icon';
+                addShareIcon.textContent = '+';
+                addShareBtn.append(addShareName, addShareIcon);
+                addShareBtn.addEventListener('click', () => {
+                    showModal('Add share URL', (modal, close) => {
+                        const p = document.createElement('p');
+                        p.textContent = 'Other people can use their OneDrive app to share their music folders with you. Have them message you the URL, and paste it here.';
+                        modal.appendChild(p);
+                        const inputWrap = document.createElement('div');
+                        inputWrap.className = 'modal-url-input-wrap';
                         const input = document.createElement('input');
                         input.type = 'text';
-                        input.value = share.label;
-                        input.placeholder = 'Share name';
-                        modal.appendChild(input);
-                        addModalActions(modal, close, 'Save', async () => {
-                            await initial.onRenameShare(share.id, input.value);
+                        input.placeholder = 'https://...';
+                        const clearBtn = document.createElement('button');
+                        clearBtn.type = 'button';
+                        clearBtn.className = 'modal-url-input-clear';
+                        clearBtn.setAttribute('aria-label', 'Clear URL');
+                        clearBtn.textContent = '\u00D7';
+                        const renderClearButton = (): void => {
+                            clearBtn.hidden = input.value.trim().length === 0;
+                        };
+                        input.addEventListener('input', renderClearButton);
+                        clearBtn.addEventListener('click', () => {
+                            input.value = '';
+                            renderClearButton();
+                            input.focus();
+                        });
+                        inputWrap.append(input, clearBtn);
+                        modal.appendChild(inputWrap);
+                        renderClearButton();
+                        addModalActions(modal, close, 'Add', async (signal) => {
+                            await initial.onAddShare(input.value, signal);
                         });
                         input.focus();
-                        input.select();
                     }, undefined, true);
                 });
-
-                const removeBtn = document.createElement('button');
-                removeBtn.type = 'button';
-                removeBtn.className = 'settings-share-icon-btn settings-share-trash';
-                removeBtn.innerHTML = ACTION_DELETE_ICON_SVG;
-                removeBtn.addEventListener('click', () => {
-                    showModal('Disconnect from share', (modal, close) => {
-                        const { uniqueTrackCount, affectedFavoriteCount, folderPinCount } = share.getRemoveImpact();
-                        if (affectedFavoriteCount > 0) {
-                            const p = document.createElement('p');
-                            p.textContent = `This will remove ${uniqueTrackCount} tracks from ${affectedFavoriteCount} playlists.`;
-                            modal.appendChild(p);
-                        }
-                        if (folderPinCount) {
-                            const p = document.createElement('p');
-                            p.textContent = `This will clear the offline setting for ${folderPinCount} folder${folderPinCount === 1 ? '' : 's'} in this share.`;
-                            modal.appendChild(p);
-                        }
-                        addModalActions(modal, close, 'Disconnect', async () => {
-                            await initial.onRemoveShare(share.id);
-                        }, true);
-                    });
-                });
-
-                actions.append(renameBtn, removeBtn);
-                row.append(textWrap, actions);
-                shareList.appendChild(row);
+                shareList.appendChild(addShareBtn);
+                shared.appendChild(shareList);
+                body.appendChild(shared);
             }
-
-            const addShareBtn = document.createElement('button');
-            addShareBtn.type = 'button';
-            addShareBtn.className = 'settings-share-item settings-share-add';
-            const addShareName = document.createElement('span');
-            addShareName.className = 'settings-share-name';
-            addShareName.textContent = 'Add share URL...';
-            const addShareIcon = document.createElement('span');
-            addShareIcon.className = 'settings-share-icon-btn settings-share-add-icon';
-            addShareIcon.textContent = '+';
-            addShareBtn.append(addShareName, addShareIcon);
-            addShareBtn.addEventListener('click', () => {
-                showModal('Add share URL', (modal, close) => {
-                    const p = document.createElement('p');
-                    p.textContent = 'Other people can use their OneDrive app to share their music folders with you. Have them message you the URL, and paste it here.';
-                    modal.appendChild(p);
-                    const inputWrap = document.createElement('div');
-                    inputWrap.className = 'modal-url-input-wrap';
-                    const input = document.createElement('input');
-                    input.type = 'text';
-                    input.placeholder = 'https://...';
-                    const clearBtn = document.createElement('button');
-                    clearBtn.type = 'button';
-                    clearBtn.className = 'modal-url-input-clear';
-                    clearBtn.setAttribute('aria-label', 'Clear URL');
-                    clearBtn.textContent = '\u00D7';
-                    const renderClearButton = (): void => {
-                        clearBtn.hidden = input.value.trim().length === 0;
-                    };
-                    input.addEventListener('input', renderClearButton);
-                    clearBtn.addEventListener('click', () => {
-                        input.value = '';
-                        renderClearButton();
-                        input.focus();
-                    });
-                    inputWrap.append(input, clearBtn);
-                    modal.appendChild(inputWrap);
-                    renderClearButton();
-                    addModalActions(modal, close, 'Add', async (signal) => {
-                        await initial.onAddShare(input.value, signal);
-                    });
-                    input.focus();
-                }, undefined, true);
-            });
-            shareList.appendChild(addShareBtn);
-            shared.appendChild(shareList);
-            body.appendChild(shared);
 
             const timer = section('Duration of Timer mode');
             const timerSelect = document.createElement('select');
@@ -400,22 +437,24 @@ export function createSettings(container: HTMLElement): SettingsView {
             timer.appendChild(timerSelect);
             body.appendChild(timer);
 
-            const indexing = section('Index');
-            indexHeadingEl = indexing.querySelector('h3')!;
-            indexLinesEl = document.createElement('div');
-            indexLinesEl.className = 'settings-index-line';
-            refreshButton = document.createElement('button');
-            refreshButton.type = 'button';
-            refreshButton.className = 'settings-pill settings-pill-refresh';
-            refreshButton.textContent = 'Refresh now';
-            refreshButton.addEventListener('click', () => {
-                indexStatus = { ...indexStatus, checkingForUpdates: true };
+            if (!initial.demo) {
+                const indexing = section('Index');
+                indexHeadingEl = indexing.querySelector('h3')!;
+                indexLinesEl = document.createElement('div');
+                indexLinesEl.className = 'settings-index-line';
+                refreshButton = document.createElement('button');
+                refreshButton.type = 'button';
+                refreshButton.className = 'settings-pill settings-pill-refresh';
+                refreshButton.textContent = 'Refresh now';
+                refreshButton.addEventListener('click', () => {
+                    indexStatus = { ...indexStatus, checkingForUpdates: true };
+                    renderIndexSection();
+                    runMaybeAsyncUiAction(() => initial.onRefreshNow(), 'settings refresh');
+                });
+                indexing.append(indexLinesEl, refreshButton);
+                body.appendChild(indexing);
                 renderIndexSection();
-                runMaybeAsyncUiAction(() => initial.onRefreshNow(), 'settings refresh');
-            });
-            indexing.append(indexLinesEl, refreshButton);
-            body.appendChild(indexing);
-            renderIndexSection();
+            }
 
             const themeSec = section('Theme');
             const themeSelect = document.createElement('select');
@@ -437,58 +476,60 @@ export function createSettings(container: HTMLElement): SettingsView {
             themeSec.appendChild(themeSelect);
             body.appendChild(themeSec);
 
-            const debug = section('Debug');
-            let debugEnabled = initial.debugEnabled;
-            const debugButton = document.createElement('button');
-            debugButton.type = 'button';
-            debugButton.className = 'settings-pill';
-            const debugLineEl = document.createElement('div');
-            debugLineEl.className = 'settings-debug-line';
-            debugLineEl.textContent = DEBUG_ENABLED_NOTE;
-            const panel = document.getElementById('log-panel')!;
-            const logsButton = document.createElement('button');
-            logsButton.type = 'button';
-            logsButton.className = 'settings-pill';
-            logsButton.textContent = 'Logs';
-            logsButton.setAttribute('aria-controls', panel.id);
-            logsButton.setAttribute('aria-expanded', String(panel.classList.contains('visible')));
-            logsButton.addEventListener('click', () => {
-                const visible = panel.classList.toggle('visible');
-                logsButton.setAttribute('aria-expanded', String(visible));
-                if (visible) {
-                    panel.scrollTop = 0;
-                    logsButton.scrollIntoView({ block: 'nearest' });
-                }
-            });
-            const expireButton = document.createElement('button');
-            expireButton.type = 'button';
-            expireButton.className = 'settings-pill';
-            expireButton.textContent = 'Expire';
-            expireButton.addEventListener('click', () => runMaybeAsyncUiAction(initial.onDebugExpire, 'settings expire'));
-            /** Turning off Debug closes its panel before hiding the control that dismisses it. */
-            const renderDebugControls = (): void => {
-                debugButton.textContent = debugEnabled ? 'Turn off' : 'Turn on';
-                debugLineEl.hidden = logsButton.hidden = expireButton.hidden = !debugEnabled;
-                if (!debugEnabled) {
-                    panel.classList.remove('visible');
-                    logsButton.setAttribute('aria-expanded', 'false');
-                }
-            };
-            debugButton.addEventListener('click', () => {
-                debugEnabled = !debugEnabled;
+            if (!initial.demo) {
+                const debug = section('Debug');
+                let debugEnabled = initial.debugEnabled;
+                const debugButton = document.createElement('button');
+                debugButton.type = 'button';
+                debugButton.className = 'settings-pill';
+                const debugLineEl = document.createElement('div');
+                debugLineEl.className = 'settings-debug-line';
+                debugLineEl.textContent = DEBUG_ENABLED_NOTE;
+                const panel = document.getElementById('log-panel')!;
+                const logsButton = document.createElement('button');
+                logsButton.type = 'button';
+                logsButton.className = 'settings-pill';
+                logsButton.textContent = 'Logs';
+                logsButton.setAttribute('aria-controls', panel.id);
+                logsButton.setAttribute('aria-expanded', String(panel.classList.contains('visible')));
+                logsButton.addEventListener('click', () => {
+                    const visible = panel.classList.toggle('visible');
+                    logsButton.setAttribute('aria-expanded', String(visible));
+                    if (visible) {
+                        panel.scrollTop = 0;
+                        logsButton.scrollIntoView({ block: 'nearest' });
+                    }
+                });
+                const expireButton = document.createElement('button');
+                expireButton.type = 'button';
+                expireButton.className = 'settings-pill';
+                expireButton.textContent = 'Expire';
+                expireButton.addEventListener('click', () => runMaybeAsyncUiAction(initial.onDebugExpire, 'settings expire'));
+                /** Turning off Debug closes its panel before hiding the control that dismisses it. */
+                const renderDebugControls = (): void => {
+                    debugButton.textContent = debugEnabled ? 'Turn off' : 'Turn on';
+                    debugLineEl.hidden = logsButton.hidden = expireButton.hidden = !debugEnabled;
+                    if (!debugEnabled) {
+                        panel.classList.remove('visible');
+                        logsButton.setAttribute('aria-expanded', 'false');
+                    }
+                };
+                debugButton.addEventListener('click', () => {
+                    debugEnabled = !debugEnabled;
+                    renderDebugControls();
+                    initial.onDebugToggle(debugEnabled);
+                });
                 renderDebugControls();
-                initial.onDebugToggle(debugEnabled);
-            });
-            renderDebugControls();
-            debug.append(debugLineEl, debugButton, ' ', logsButton, ' ', expireButton);
-            body.appendChild(debug);
+                debug.append(debugLineEl, debugButton, ' ', logsButton, ' ', expireButton);
+                body.appendChild(debug);
 
-            if (initial.onOpenPlaybackTests) {
-                const playbackTests = document.createElement('button');
-                playbackTests.className = 'settings-pill';
-                playbackTests.textContent = 'Playback tests…';
-                playbackTests.addEventListener('click', initial.onOpenPlaybackTests);
-                debug.append(' ', playbackTests);
+                if (initial.onOpenPlaybackTests) {
+                    const playbackTests = document.createElement('button');
+                    playbackTests.className = 'settings-pill';
+                    playbackTests.textContent = 'Playback tests…';
+                    playbackTests.addEventListener('click', initial.onOpenPlaybackTests);
+                    debug.append(' ', playbackTests);
+                }
             }
 
             root.append(header, body);
@@ -507,6 +548,10 @@ export function createSettings(container: HTMLElement): SettingsView {
 
         isOpen: () => openState,
         updateAuthAction,
+        updateDemoCredits(href) {
+            const link = container.querySelector<HTMLAnchorElement>('.settings-demo-summary a');
+            if (link) link.href = href;
+        },
 
         updateIndexSection(status) {
             indexStatus = status;

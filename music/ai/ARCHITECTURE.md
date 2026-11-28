@@ -59,6 +59,12 @@ A pin edit is confirmed when its favorites document commits to IndexedDB. The pa
 
 Swift schedules two pin transfers in a background URLSession. Each task has an account binding and a durable task ID. The file must match the Graph length before Swift records its expected length and version and stores it with the indexed filename suffix in the account’s backup-excluded Audio directory. A decoder can retain its open file through unpin, pause and seek. Sign-out closes admission before account cleanup. A partial download retries automatically with fresh OneDrive metadata. Only playback interprets the bytes as audio. An unreadable recording is skipped and its offline copy still counts toward the total. Transient failures retry with increasing delays. Returning to the app or regaining signed-in connectivity rechecks blocked recordings. On foreground return the page pulls missed inventory revisions. Normal completions update counts through reverse membership, without walking the library again. [Native downloader](../ios/App/OfflinePins.swift) · [Shared UI projection](../src/native-pins.ts)
 
+### Demo library
+
+OnePlay admits a chooser, Demo, or a personal library at document opening. The two library profiles share tree, search, player, favorite and pin behavior. Demo is a public `demo` root and supplies no Graph grant or remote app documents. Its flat GitHub Pages manifest contains a media commit, relative MP3 paths, byte lengths and Git blob IDs. Each raw URL uses the manifest commit. An escaped path and blob ID identify cached bytes across publications. A track replacement at the same path gets a new byte key while favorite healing can keep the reference.
+
+The browser keeps Demo library state in a distinct IndexedDB database and localStorage namespace. The signed app uses a distinct WebKit data store and a native `DemoPlayback` root. Explicit sign-out from either workspace returns to the provider chooser. Demo saves its playback position and retains its stores. OneDrive clears its local credentials and personal stores. Browser sign-out stays within the app. Swift binds one player and one pin worker to the admitted workspace. Its committed Demo catalog survives WebKit replacement, supplies native media lookups, and can recover pins on a background session wake. A verified personal pairing commits a switch even if the page that requested it is gone. The chooser may stage a Demo catalog before admitting the playback workspace. [M22 demo plan](PLAN-M22-demo.md)
+
 ## Module map
 
 - **index.html** — All HTML + CSS. Single `<script type="module">` loads `dist/index.js`. DOM elements: `#status`, `#tree-container` (`#breadcrumbs`, `#children`), `#settings-container`, `#player` (audio), `#footer`, `#action-bar`, `#select-cancel`, `#log-panel`.
@@ -91,14 +97,13 @@ Swift schedules two pin transfers in a background URLSession. Each task has an a
 Three types form the "language" of the app — every module speaks them:
 
 - **`FolderPath`** (`readonly string[]`) — the universal navigation identifier.
-  Every path starts with `["OnePlay Music", rootKey, ...]`. The root key is either a
-  OneDrive `driveId` (account) or `fav:{uuid}` (favorite). Deeper segments are
-  folder/file names for accounts, or synthetic `m:N` segments for playlist
-  members. Tree navigation, playback, selection, and state persistence all use
-  this single type.
+  Every path starts with `["OnePlay Music", rootKey, ...]`. Root keys are the
+  OneDrive `driveId`, `share:{shareId}`, `demo`, or `fav:{uuid}`. Deeper segments
+  are folder and file names, with synthetic `m:N` segments for playlist members.
+  Tree navigation, playback, selection, and state persistence all use this type.
 
 - **`RootsMap`** (`Map<string, Root>`) — the app's "mounted filesystem". Each
-  `Root` is a tagged union dispatched on `type: 'account' | 'shortcut' | 'playlist'`.
+  `Root` is a tagged union dispatched on `type: 'onedrive' | 'share' | 'demo' | 'shortcut' | 'playlist'`.
   Code dispatches on the discriminant, never on string-prefix parsing of keys.
 
 - **`MusicData` / `MusicFolder` / `MusicFile`** — the cached index model.
@@ -113,14 +118,13 @@ Three types form the "language" of the app — every module speaks them:
 `index.html` loads `dist/index.js` and calls `onBodyLoad()` on DOMContentLoaded.
 
 1. **`initWebLogger()`** — Install browser logging.
-2. **Restore M10 state** — Read `oneplay_music_view`, `oneplay_music_scroll`, `oneplay_music_playback`, `oneplay_music_time` from localStorage (synchronous, no flash).
-3. **Admit the account** from the native pairing or finish the browser’s `handleOauthRedirect()` exchange when returning from Entra.
-4. **Service worker registration** — Register `sw.js` early (before any early returns, so offline shell caching works for signed-out/first-time users too). `SW_DEBUG` mode auto-reloads on SW update.
-5. **Load favorites and shares** and their cached indexes. The data modules have no tree dependency and coalesce concurrent initialization.
-6. **`loadCachedData(driveId)`** — Read the primary index from IndexedDB. A confirmed miss permits first indexing. A rejected read keeps pulls closed and offers document retry.
-7. **`showTree(data)`** — Create tree + playback + wire callbacks. Calls `wireFavoritesUi()` at the end, which attaches favorites to tree and creates select + downloads modules (once).
-8. **`restorePlaybackState()`** — Apply `oneplay_music_playback`/`oneplay_music_time` to playback module.
-9. **`requestPullFromOneDrive()`** — Once local bootstrap installs the tree or confirms a miss, startup and browser recovery can request a single-flight pull. The coordinator syncs intents, checks indexes, heals confirmed references and updates offline state. Definite offline evidence skips the startup pull.
+2. **Schedule service worker registration** — The hosted shell schedules registration before any startup branch so a signed-out visit can install it for offline use. `SW_DEBUG` mode auto-reloads on SW update.
+3. **Admit the workspace** — Use native pairing or Demo selection in the bundle. In the browser, finish any Entra callback before choosing the personal library, Demo or the chooser.
+4. **Restore workspace state** — Read the active library's view, scroll and playback keys synchronously. The chooser offers both options. Demo loads its local catalog before revalidating in the background.
+5. **Load personal favorites, shares and indexes** — Read cached OneDrive state. A confirmed primary index miss permits first indexing. A rejected read keeps pulls closed and offers document retry.
+6. **`showTree()`** — Both workspaces wire the tree and playback. `wireFavoritesUi()` attaches favorites and creates Select and download controls once per document.
+7. **`restorePlaybackState()`** — The browser restores its saved playback position. The bundled page paints the native player's current snapshot.
+8. **`requestPullFromOneDrive()`** — The personal workspace can refresh after installing a local tree or confirming a cache miss. The coordinator syncs intents, checks indexes, heals confirmed references and updates offline state. Definite offline evidence skips the startup pull.
 
 The key design split is `ensureFavorites()` (data module, no tree dependency)
 vs `wireFavoritesUi()` (wires to tree, creates select + downloads). This
@@ -262,7 +266,7 @@ Both players use the same time-sliced projection of offline favorites and explic
 - **Browser retention.** Both folder pins and unpaused offline favorites contribute active keys. Paused owners also contribute retained keys. The downloader shares its local file-size map with playback and the folder dialog. It fetches missing active keys and deletes unowned blobs in one IndexedDB transaction when the retained set is nonempty and all surviving owners resolve against the local library. Storage reconciliation follows the local pin save in the background. An empty retained set preserves the existing browser cache.
 - **Evidence state machine**: tracks connectivity as `no-evidence`,
   `evidence:signed-in`, `evidence:signed-out`, or `evidence:not-online`.
-  Downloads only pump when signed in. Error classification consults
+  Personal downloads pump with signed-in evidence. Demo can try a queued public recording on an uncertain route, subject to its transfer backoff. Error classification consults
   `navigator.onLine` (via `deps.isOnline()`) to choose between `no-evidence`
   and `not-online` on network failures.
 
@@ -307,11 +311,14 @@ All top-level entries in the tree share a unified `RootsMap` (Map of string key
 
 - `'onedrive'` — a OneDrive account (key = driveId)
 - `'share'` — a connected shared folder (key = `share:{shareId}`)
+- `'demo'` — the public Demo library (key = `demo`)
 - `'shortcut'` — a favorited folder (key = `fav:{uuid}`)
 - `'playlist'` — a user-created playlist (key = `fav:{uuid}`)
 
 Display order: favorites first (in creation order), then accounts (sorted by
-key), then shares in connection order. When OneDrive is the sole root, home keeps its app-root selection and displays the account folder. Its child paths and scroll offset still belong to that account. Display names are resolved at render time from the Root object, never
+key), then shares in connection order. When OneDrive or Demo is the sole root,
+home keeps its app-root selection and displays that library's folder. Its child
+paths and scroll offset still belong to that library. Display names come from the Root object at render time and are never
 used as map keys.
 
 
@@ -391,7 +398,7 @@ gives spatial continuity during navigation.
 
 The app instantiates the evidence model described in `LEARNINGS.md` with four
 runtime states: `no-evidence`, `evidence:signed-in`, `evidence:signed-out`, and
-`evidence:not-online`. Downloads run only in signed-in evidence, and periodic
+`evidence:not-online`. Personal downloads require signed-in evidence, and periodic
 pulls are suppressed in signed-out/not-online states.
 
 
@@ -446,6 +453,9 @@ pulls are suppressed in signed-out/not-online states.
 - Opening offers an optional **Try again** after 15 seconds of observed
   visibility. Hiding before the offer resets the interval. Progress or a
   concrete outcome ends the timer. A valid late result still renders.
+  Explicit OneDrive connection from the chooser uses the indexing layout
+  before progress is available. The native view displays it before presenting
+  Microsoft and arms its timer after the sign-in reply confirms the paired store.
 - A settled opening yields an installed tree, sign-in or a concrete failure.
   Try again uses document reload and the native bridge's existing retirement.
   Retrying a pending OAuth response can require a fresh sign-in after the

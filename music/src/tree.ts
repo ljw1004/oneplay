@@ -36,7 +36,7 @@ import { type PlaybackInfo } from './playback.js';
 import { type RootsMap, type Favorite, type Favorites, type FolderPin, isFavRef } from './favorites.js';
 import { type EvidenceState } from './auth.js';
 import { type SearchResult } from './search.js';
-import { folderPinPathKey, isPathDeniedByShare, soleAccountKey } from './roots.js';
+import { folderPinPathKey, isPathDeniedByShare, solePrimaryLibraryKey } from './roots.js';
 import { resolvePathTailDisplayName } from './path-names.js';
 
 /** Appends the shared spinner glyph (⟳) used by sync and reindex states. */
@@ -93,6 +93,8 @@ type FolderIcons = ReadonlyMap<string, {partial: boolean; state: OfflineBadgeSta
 export interface TreeView {
     /** Add/update an account's data. Key is driveId; displayName comes from info. */
     setAccount(key: string, folder: MusicFolder, info: AccountInfo, reindexing?: boolean): void;
+    /** Install the account-free primary library. */
+    setDemoRoot(folder: MusicFolder, key: string): void;
     /** Wire the favorites module. Converts favorites to roots and renders. */
     setFavorites(favs: Favorites): void;
     /** Replaces all share roots in insertion order. */
@@ -192,12 +194,14 @@ interface RowOptions {
  *   Used to restore scroll position after render.
  * @param deployCounter - Deploy counter string shown as "OnePlay Music{N}" in the header
  *   only when debug mode is enabled. Empty string = plain "OnePlay Music".
+ * @param saveScroll - Stores the current workspace's scroll positions while it is admitted.
  */
 export function createTree(
     container: HTMLElement,
     initialPath?: FolderPath,
     initialScrollMap?: Record<string, {top: number}>,
     deployCounter = '',
+    saveScroll?: (scroll: Record<string, {top: number}>) => void,
 ): TreeView {
     const breadcrumbsEl = container.querySelector<HTMLElement>('#breadcrumbs')!;
     const childrenEl = container.querySelector<HTMLElement>('#children')!;
@@ -436,6 +440,10 @@ export function createTree(
             roots.set(key, { type: 'onedrive', key, name: info.displayName, folder, info, reindexing });
             render();
         },
+        setDemoRoot(folder, key) {
+            roots.set(key, {type: 'demo', key, name: 'Demo library', driveId: key, folder});
+            render();
+        },
         setFavorites(favs) {
             favoritesRef = favs;
             syncFavoriteRoots();
@@ -572,15 +580,15 @@ export function createTree(
      * 2. Root is shortcut/playlist: delegate to favorites.resolveChildren.
      * 3. Root is OneDrive account: walk MusicFolder tree (existing logic).
      */
-    function resolveFolderAndRepairSelection(homeAccount: string | undefined): Array<[string, boolean]> {
+    function resolveFolderAndRepairSelection(homeLibrary: string | undefined): Array<[string, boolean]> {
         // App root: list all roots — favorites first, then accounts sorted
-        const rootKey = selectedPath[1] ?? homeAccount;
+        const rootKey = selectedPath[1] ?? homeLibrary;
         if (rootKey === undefined) {
             const favKeys: Array<[string, boolean]> = [];
             const accountKeys: Array<[string, boolean]> = [];
             const shareKeys: Array<[string, boolean]> = [];
             for (const [key, root] of roots) {
-                if (root.type === 'onedrive') {
+                if (root.type === 'onedrive' || root.type === 'demo') {
                     accountKeys.push([key, true]);
                 } else if (root.type === 'share') {
                     shareKeys.push([key, true]);
@@ -601,7 +609,7 @@ export function createTree(
             // until setAccount(). Both cases: roots map won't have the key yet.
             if (rootKey.startsWith(FAV_PREFIX) ? !favoritesRef : roots.size === 0) return [];
             selectedPath = ['OnePlay Music'];
-            return resolveFolderAndRepairSelection(homeAccount);
+            return resolveFolderAndRepairSelection(homeLibrary);
         }
 
         // Favorites: delegate to favorites module
@@ -614,7 +622,7 @@ export function createTree(
                 // Broken path — reset to deepest valid prefix
                 if (selectedPath.length > 2) {
                     selectedPath = selectedPath.slice(0, -1);
-                    return resolveFolderAndRepairSelection(homeAccount);
+                    return resolveFolderAndRepairSelection(homeLibrary);
                 }
                 return [];
             }
@@ -629,7 +637,7 @@ export function createTree(
             if (!child || !isMusicFolder(child)) {
                 // Path is broken — reset to deepest valid prefix
                 selectedPath = selectedPath.slice(0, i);
-                return resolveFolderAndRepairSelection(homeAccount);
+                return resolveFolderAndRepairSelection(homeLibrary);
             }
             current = child;
         }
@@ -707,10 +715,10 @@ export function createTree(
 
         // Root type dispatch at depth 2
         // The OnePlay crumb always navigates home. A sole account supplies its source indicators.
-        const rootKey = isAppRoot ? soleAccountKey(roots) : opts.path[1];
+        const rootKey = isAppRoot ? solePrimaryLibraryKey(roots) : opts.path[1];
         const rootEntry = rootKey === undefined ? undefined : roots.get(rootKey);
         const rootType = rootEntry?.type;
-        const isAccount = depth === 2 && rootType === 'onedrive';
+        const isAccount = depth === 2 && (rootType === 'onedrive' || rootType === 'demo');
         const isShareRoot = depth === 2 && rootType === 'share';
         const isShareWithoutData = isShareRoot && rootEntry?.type === 'share' && rootEntry.folder === undefined;
         const isFavoriteRoot = depth === 2 && (rootType === 'shortcut' || rootType === 'playlist');
@@ -761,7 +769,7 @@ export function createTree(
         // - Playlist member segments "m:N" resolve via favorites.resolveDisplayName
         // - Everything else uses the raw segment name
         const displayName = isAppRoot ? `OnePlay${debugEnabled ? deployCounter : ''}`
-            : isAccount ? 'OneDrive'
+            : isAccount ? (rootType === 'demo' ? 'Demo library' : 'OneDrive')
             : isShareRoot && rootEntry ? rootEntry.name
             : isFavoriteRoot && rootEntry ? rootEntry.name
             : resolvePathTailDisplayName(opts.path, roots, favoritesRef);
@@ -806,7 +814,7 @@ export function createTree(
         // has its own owner badge, and never marks the corresponding OneDrive album.
         const keyFor = (subpath: FolderPath) => folderPinPathKey(rootEntry!.key,
             rootEntry?.type === 'share' ? rootEntry.connectionId : undefined, subpath);
-        const folderKey = opts.isFolder && (rootType === 'onedrive' || rootType === 'share')
+        const folderKey = opts.isFolder && (rootType === 'onedrive' || rootType === 'share' || rootType === 'demo')
             ? keyFor(opts.path.slice(2)) : undefined;
         const folderIcon = folderKey === undefined ? undefined : folderIcons.get(folderKey);
         const partial = folderIcon?.partial;
@@ -847,12 +855,13 @@ export function createTree(
         // The menu occupies the left gutter. Only the text belongs to the path.
         if (isAppRoot) {
             // Force text-presentation glyphs (FE0E) for a flatter, monochrome look.
-            const showWarning = evidence === 'evidence:signed-out' || [...deniedRootKeys].some(key => roots.has(key)) || hasIndexFailureWarning;
+            const demo = [...roots.values()].some(root => root.type === 'demo');
+            const showWarning = demo || evidence === 'evidence:signed-out' || [...deniedRootKeys].some(key => roots.has(key)) || hasIndexFailureWarning;
             const menuIcon = document.createElement('button');
             menuIcon.type = 'button';
             menuIcon.className = 'row-icon row-icon-menu row-icon-menu-left row-icon-settings';
             menuIcon.classList.toggle('row-icon-warning', showWarning);
-            menuIcon.setAttribute('aria-label', 'Open settings');
+            menuIcon.setAttribute('aria-label', demo ? 'Settings, demo library' : 'Open settings');
             menuIcon.textContent = showWarning ? '⚠\uFE0E' : '☰\uFE0E';
             menuIcon.onclick = event => {
                 event.stopPropagation();
@@ -860,7 +869,8 @@ export function createTree(
             };
             el.insertBefore(menuIcon, nameSpan);
             if (debugEnabled && evidence !== 'evidence:signed-in') {
-                const { icon, label } = DEBUG_EVIDENCE_BADGES[evidence];
+                const { icon, label } = demo && evidence === 'no-evidence'
+                    ? {icon: '‽', label: 'Demo library connection unconfirmed'} : DEBUG_EVIDENCE_BADGES[evidence];
                 const badge = document.createElement('span');
                 badge.setAttribute('role', 'img');
                 badge.setAttribute('aria-label', label);
@@ -1013,14 +1023,14 @@ export function createTree(
 
         // Child rows: immediate children of selected folder
         const pathBeforeResolve = selectedPath;
-        const homeAccount = soleAccountKey(roots);
-        const children = resolveFolderAndRepairSelection(homeAccount);
+        const homeLibrary = solePrimaryLibraryKey(roots);
+        const children = resolveFolderAndRepairSelection(homeLibrary);
         // Home stays home when another root appears. Child rows always retain the drive key.
-        if (homeAccount !== undefined && selectedPath.length === 2 && selectedPath[1] === homeAccount) {
+        if (homeLibrary !== undefined && selectedPath.length === 2 && selectedPath[1] === homeLibrary) {
             selectedPath = selectedPath.slice(0, 1);
         }
-        const displayedPath = homeAccount !== undefined && selectedPath.length === 1
-            ? [...selectedPath, homeAccount] : selectedPath;
+        const displayedPath = homeLibrary !== undefined && selectedPath.length === 1
+            ? [...selectedPath, homeLibrary] : selectedPath;
         // resolveFolderAndRepairSelection may correct selectedPath (broken path fallback).
         // If so, persist the correction via onPathChange.
         if (selectedPath !== pathBeforeResolve) view.onPathChange(selectedPath);
@@ -1040,7 +1050,7 @@ export function createTree(
         const showSelectedPlayButton = children.length > 0 && !allImmediateFilesUnavailable;
         const breadcrumbRows: HTMLElement[] = [];
         for (let i = 0; i < selectedPath.length; i++) {
-            if (i === 1 && homeAccount !== undefined) continue;
+            if (i === 1 && homeLibrary !== undefined) continue;
             breadcrumbRows.push(makeRow({
                 isFolder: true,
                 isBreadcrumb: true,
@@ -1165,8 +1175,7 @@ export function createTree(
 
     // -- Scroll position tracking (M10) ----------------------------------------
     // rAF-throttled scroll listener saves scrollTop keyed by current path.
-    // Writes to localStorage via a dedicated helper to avoid re-serializing
-    // unrelated state on every scroll event.
+    // The composing workspace owns persistence and can retire it on sign-out.
 
     childrenEl.addEventListener('scroll', () => {
         if (searchModeOpen) {
@@ -1181,10 +1190,9 @@ export function createTree(
             scrollRafPending = false;
             if (!previousPath || searchModeOpen) return;
             rememberListScroll();
-            // Persist to localStorage
             const obj: Record<string, {top: number}> = {};
             for (const [k, v] of scrollMap) obj[k] = v;
-            try { localStorage.setItem('oneplay_music_scroll', JSON.stringify(obj)); } catch { /* quota */ }
+            try { saveScroll?.(obj); } catch { /* quota */ }
         });
     });
 

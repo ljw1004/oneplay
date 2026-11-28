@@ -18,7 +18,8 @@ final class PinCDN: URLProtocol {
         case "/short": bytes = Data([1])
         default: bytes = Data([1, 2, 3])
         }
-        client?.urlProtocol(self, didReceive: HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+        let status = ["/missing":404, "/gone":410][url.path] ?? 200
+        client?.urlProtocol(self, didReceive: HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1",
             headerFields: ["Content-Length": String(bytes.count)])!, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: bytes)
         client?.urlProtocolDidFinishLoading(self)
@@ -26,6 +27,30 @@ final class PinCDN: URLProtocol {
 }
 
 @MainActor final class OfflinePinTests: XCTestCase {
+    func testPublicPinsResumeWithoutPageOrCatalogReachability() async throws {
+        let dir = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = try PlaybackStore(root: dir, home: "demo", drive: "demo")
+        let seed = OfflinePins(configuration: .ephemeral)
+        try await seed.bind(store)
+        try seed.apply(owners: [["id":"folder", "paused":false, "complete":true,
+                                 "sources":["demo":["demo:recording":"Song.mp3"]]]])
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [PinCDN.self]
+        let restored = OfflinePins(configuration: config)
+        restored.updateEvidence("no-evidence", publicMedia: true)
+        restored.lookup = { _, _, _ in MediaLocation(url: URL(string: "https://pin.test/clip")!, etag: "v1", size: 3) }
+        try await restored.bind(store)
+        let saved = expectation(description: "Restored public pin completed without a reachability probe")
+        restored.onChange = {
+            if restored.completeKeys == ["demo:recording"] { restored.onChange = nil; saved.fulfill() }
+        }
+        await restored.connectSession()
+        await fulfillment(of: [saved], timeout: 5)
+        XCTAssertEqual(try Data(contentsOf: store.pinURL("demo:recording", suffix: "mp3")), Data([1, 2, 3]))
+        await restored.unbindAndCancel()
+    }
+
     func testInterruptedPinRestartOverlapPauseAndLastOwnerRemoval() async throws {
         let dir = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: dir) }

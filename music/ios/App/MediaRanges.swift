@@ -20,10 +20,11 @@ final class MediaLocation: @unchecked Sendable {
     fileprivate func markRejected() { lock.withLock { rejected = true } }
     private var validators = [URL: String]()
 
-    init(url: URL, etag: String, size: Int64) {
+    init(url: URL, etag: String, size: Int64, immutable: Bool = false) {
         self.url = url
         self.etag = etag
         self.size = size
+        self.immutable = immutable
     }
 
     fileprivate func validator(for resource: URL) -> String? {
@@ -41,6 +42,7 @@ final class MediaLocation: @unchecked Sendable {
     let url: URL
     let etag: String
     let size: Int64
+    let immutable: Bool
 }
 
 struct PlaybackError: LocalizedError {
@@ -200,6 +202,7 @@ private final class RangeResponse: NSObject, URLSessionDataDelegate, @unchecked 
     var firstByte: TimeInterval?
     // HTTP 412/416 also mean the signed resource no longer satisfies this file's range contract.
     var rejectsResource: Bool { [401,403,404,410,412,416].contains(status) || changedResource }
+    var missingResource: Bool { status == 404 || status == 410 }
     private var changedResource = false
     var responseTag: String?
     var redirect: URL?
@@ -386,7 +389,7 @@ final class MediaRanges: @unchecked Sendable {
         self.speculative = speculative
         self.trace = trace
         self.diagnostic = diagnostic
-        self.renew = renew
+        self.renew = location.immutable ? nil : renew
         self.awaitDemand = awaitDemand
         self.budget = budget
         self.occurrence = occurrence
@@ -603,6 +606,7 @@ final class MediaRanges: @unchecked Sendable {
                 // A fully published range has no more bytes to supply and frees the forward slot.
                 if stream.response.isFinished || stream.response.availableEnd == stream.response.bounds.upperBound {
                     forward = nil
+                    if grant.immutable && stream.response.missingResource { throw NativeAccountError.missingRecording }
                 }
             }
             if let hit = pool.read(file, at: base) { return hit }
@@ -674,6 +678,7 @@ final class MediaRanges: @unchecked Sendable {
                 continue
             }
             if let failure = response.failure {
+                if grant.immutable && response.missingResource { throw NativeAccountError.missingRecording }
                 if response.rejectsResource, !retriedLocation, renew != nil {
                     diagnostic("HTTP \(response.status); renewing media URL at offset \(bounds.lowerBound)")
                     continue

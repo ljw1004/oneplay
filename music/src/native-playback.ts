@@ -30,7 +30,7 @@ interface NativeSample {
     readonly targetRevision?: number;
     readonly advanced?: boolean;
     readonly path?: FolderPath;
-    readonly state?: 'buffering' | 'positioning' | 'playing' | 'paused' | 'error' | 'ended';
+    readonly state?: 'buffering' | 'positioning' | 'playing' | 'paused' | 'error' | 'unavailable' | 'ended';
     readonly position?: number;
     readonly duration?: number;
     readonly message?: string;
@@ -129,6 +129,8 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
             ? `${timeString(position())} / ${timeString(sample.duration)}` : timeString(position());
         if (sample.state === 'error' && (last.item !== sample.item || last.state !== 'error'))
             showError(`${sample.message}. Tap Play to retry.`);
+        if (sample.state === 'unavailable' && (last.item !== sample.item || last.state !== 'unavailable'))
+            showError(`${sample.message}.`);
     }
 
     /** Defer a new spinner while a command is in flight. A rejected command keeps the current target's visible wait. */

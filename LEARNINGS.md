@@ -65,6 +65,7 @@
 - **Use top-level redirect for silent re-auth on mobile PWAs.** Pair it with one-shot and cooldown guards to prevent loops.
 - **`prompt=none` on localhost redirect URIs can still return `interaction_required`.** Provider trust/consent interstitials require real UI and cannot be satisfied silently.
 - **In signed-out evidence states, offer reconnect, not sign-out.** Recovery affordance should match actual session reality.
+- **Prepare the return screen before presenting native sign-in.** The system authentication sheet can close while the SDK still owes its result. Keep any reload action that would cancel sign-in out of the pending screen. Hold the SDK result and account verification separately in a foreground test window so a visibility gate cannot hide a premature retry.
 
 ## Graph/OneDrive API behavior
 
@@ -76,6 +77,11 @@
 ## Offline-first and persistence
 
 - Construct persistent directory URLs with an explicit directory flag. Foundation may otherwise infer a different trailing slash after the directory exists. OnePlay treated the second open of the same account directory as a different account during offline WebKit relaunch.
+
+- Scope both synchronous UI keys and async database operations at the library boundary. Check playback’s large checkpoint spill and legacy fallback when adding a profile. Both can bypass a scoped localStorage adapter.
+- Close personal-library transport and write admission before purging its stores on sign-out. Drain admitted IndexedDB writes through transaction completion. An operation-specific cancellation can have a narrower scope, such as letting an already dispatched share update finish before disconnect deletes it.
+- Register a cancellable bridge operation in the receive callback before queuing its work. Recheck the same operation ID before starting work and before publishing its result.
+- On an uncertain route, retry the failed operation with bounded backoff. A different host, recording or HTTP method can stay unavailable after the requested operation recovers.
 
 - **Keep pre-render state synchronous and cache state asynchronous.** Use localStorage for instant UI restore; IndexedDB for heavy cached data.
 - **Separate high-frequency and low-frequency persisted fields.** Avoid rewriting large state blobs for tiny updates.

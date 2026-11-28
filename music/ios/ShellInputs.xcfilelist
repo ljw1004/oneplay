@@ -5,9 +5,11 @@ $(SRCROOT)/../manifest.json
 $(SRCROOT)/../assets/favicon.png
 $(SRCROOT)/../assets/appicon.png
 $(SRCROOT)/../assets/bigicon.png
+$(SRCROOT)/../assets/onedrive.png
 $(SRCROOT)/../src/auth.ts
 $(SRCROOT)/../src/db.ts
 $(SRCROOT)/../src/downloads.ts
+$(SRCROOT)/../src/demo-provider.ts
 $(SRCROOT)/../src/favorites.ts
 $(SRCROOT)/../src/index-startup.ts
 $(SRCROOT)/../src/index-sync.ts

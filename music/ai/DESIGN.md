@@ -393,7 +393,7 @@ Search doesn't re-use the "currently selected folder" styling because that's not
 +----------------------+
 ```
 
-Reconnect? That's because if you've failed Entra, then you need an explicit interactive signin. The hamburger ☰ will have gained a warning badge dot, and you'll have to do an explicit interactive signin. This is similar to existing iPhone apps where you navigate to the Accounts page and it shows accounts that have problems and need to be signed in again. The Sign out and Reconnect buttons will both dismiss the Settings dialog (indeed they redirect the main frame). The other buttons leave it open.
+Reconnect? That's because if you've failed Entra, then you need an explicit interactive signin. The hamburger ☰ will have gained a warning badge dot, and you'll have to do an explicit interactive signin. This is similar to existing iPhone apps where you navigate to the Accounts page and it shows accounts that have problems and need to be signed in again. Both buttons dismiss Settings. Sign out returns to the provider chooser. Reconnect starts the existing OneDrive sign-in flow. The other buttons leave it open.
 
 The shared-with-you buttons (Rename..., Remove..., Add...) both bring up modals: Remove brings a modal to confirm, and Add brings a modal for you to paste the URL. The Remove modal will tell you how many favorites currently reference items in that share, and its confirmatory "Remove" button will be destructive-styled. Upon removing a share, the normal healing process runs.
 

@@ -6,7 +6,7 @@ import OSLog
 
 /// The only errors that may cross the page boundary. Underlying SDK and HTTP errors can contain signed URLs.
 enum NativeAccountError: String, LocalizedError {
-    case interactionRequired, cancelled, wrongAccount, unbound, invalidRequest, unavailable, cleanupPending, forbidden, transient, unavailableOffline
+    case interactionRequired, cancelled, wrongAccount, unbound, invalidRequest, unavailable, cleanupPending, forbidden, transient, unavailableOffline, missingRecording
     var errorDescription: String? { rawValue }
 
     static func classify(_ error: Error) -> Self {
@@ -106,6 +106,8 @@ enum MediaLookup: Sendable {
             return route.status == .satisfied && route.usesInterfaceType(.wifi) && !route.isExpensive && !route.isConstrained
         }
     }
+
+    var routeIsOffline: Bool { offline }
 
     var snapshot: [String: Any] {
         ["driveID": (cleanupPending ? nil : record?.driveID) as Any? ?? NSNull(), "evidence": evidence]

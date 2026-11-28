@@ -7,7 +7,19 @@ import WebKit
 @MainActor final class LibraryController: UIViewController, WKScriptMessageHandlerWithReply {
     private let shell = BundledShell()
     private let deviceTheme = URL.applicationSupportDirectory.appendingPathComponent("DeviceTheme")
-    private let store: WKWebsiteDataStore
+    private let personalStore: WKWebsiteDataStore
+    private lazy var demoWebStore = WKWebsiteDataStore(forIdentifier: UUID(uuidString: "C6D91655-F0E0-494C-B400-AE4269C6E8E7")!)
+    private let demo: DemoLibrary
+    private static let demoSelection = "DemoLibrarySelected"
+    private var demoActive = false
+    private var demoEvidence = "no-evidence"
+    private var demoChooserAttempt: String?
+    private var demoOpenFailed = false
+    private var focusDemoTree = false
+    private var focusProviderChooser = false
+    private var changingProfile = false
+    private var profileBound = false
+    private var bindingProfile: Task<Void, Error>?
     private var account: NativeAccount?
     private(set) var player: NativePlayback?
     private var systemPlayback: SystemPlayback?
@@ -28,12 +40,15 @@ import WebKit
         didSet { setNeedsStatusBarAppearanceUpdate() }
     }
 
-    init(account: NativeAccount? = nil, store: WKWebsiteDataStore? = nil, player: NativePlayback? = nil, pinConfiguration: URLSessionConfiguration? = nil) {
+    init(account: NativeAccount? = nil, store: WKWebsiteDataStore? = nil, player: NativePlayback? = nil,
+         pinConfiguration: URLSessionConfiguration? = nil, demo: DemoLibrary? = nil, demoStore: WKWebsiteDataStore? = nil) {
         self.pins = OfflinePins(configuration: pinConfiguration ?? (account == nil ? .background(withIdentifier: OfflinePins.identifier) : .ephemeral))
         self.player = player
         self.account = account
-        self.store = store ?? WKWebsiteDataStore(forIdentifier: UUID(uuidString: "83178CEF-278A-4625-9E7C-C7526D5AF452")!)
+        self.personalStore = store ?? WKWebsiteDataStore(forIdentifier: UUID(uuidString: "83178CEF-278A-4625-9E7C-C7526D5AF452")!)
+        self.demo = demo ?? DemoLibrary()
         super.init(nibName: nil, bundle: nil)
+        if let demoStore { self.demoWebStore = demoStore }
     }
 
     @available(*, unavailable)
@@ -66,43 +81,59 @@ import WebKit
             do {
                 let account = try self.account ?? NativeAccount()
                 self.account = account
-                player = player ?? NativePlayback(diagnostics: account.diagnostics, pool: MediaPool(unmeteredWiFi: account.unmeteredWiFi)) { drive, item, request, wifiOnly in
-                    try await account.media(driveID: drive, itemID: item, lookup: request, wifiOnly: wifiOnly)
+                configurePlayer(account)
+                pins.lookup = { [weak self] drive, item, lookup in
+                    guard let self else { throw NativeAccountError.cancelled }
+                    return try await self.lookupMedia(drive, item, lookup: lookup)
                 }
-                player?.onChange = { [weak self] debugOnly in self?.signalPlayerChange(debugOnly: debugOnly) }
-                account.onMediaRequestChange = { [weak self] in self?.signalPlayerChange(debugOnly: true) }
-                account.diagnostics.onPending = { [weak self] in self?.signalPendingDiagnostics() }
-                account.onNetworkPathChange = { [weak self] in self?.player?.cancelWiFiReadsIfMetered() }
-                pins.lookup = { drive, item, lookup in try await account.media(driveID: drive, itemID: item, lookup: lookup) }
                 pins.playerHolds = { [weak self] key in self?.player?.holdsPin(key) == true }
-                pins.allowsSource = { [weak self] root in self?.player?.allowsPinSource(root) == true }
+                pins.allowsSource = { [weak self] root in
+                    guard let self, !demoActive || root == DemoMusicCatalog.source else { return false }
+                    return player?.allowsPinSource(root) == true
+                }
+                pins.allowsMediaKey = { [weak self] key in
+                    guard let self else { return false }
+                    if !demoActive { return true }
+                    let prefix = DemoMusicCatalog.source + ":"
+                    return key.hasPrefix(prefix) && demo.catalog?.recordings[String(key.dropFirst(prefix.count))] != nil
+                }
                 pins.onChange = { [weak self] in
                     guard let self else { return }
-                    let limited = ["evidence:not-online", "evidence:signed-out"].contains(account.snapshot["evidence"] as? String ?? "")
+                    let limited = ["evidence:not-online", "evidence:signed-out"].contains(currentEvidence(account))
                     if player?.setOfflineAvailability(limited ? pins.completeKeys : nil) == true { systemPlayback?.publishNowPlaying() }
                     if UIApplication.shared.applicationState == .active {
                         webView?.evaluateJavaScript("window.dispatchEvent(new Event('oneplay-pins'))", completionHandler: nil)
                     }
                 }
+                account.diagnostics.onPending = { [weak self] in self?.signalPendingDiagnostics() }
+                account.onMediaRequestChange = { [weak self] in self?.signalPlayerChange(debugOnly: true) }
                 account.onEvidenceChange = { [weak self] evidence in
-                    self?.pins.updateEvidence(evidence)
-                    self?.webView?.callAsyncJavaScript(
-                        "window.dispatchEvent(new CustomEvent('oneplay-evidence', {detail:evidence}))",
-                        arguments: ["evidence": evidence], in: nil, in: .page, completionHandler: nil)
+                    guard let self, !demoActive else { return }
+                    publishEvidence(evidence)
                 }
-                if account.cleanupPending {
-                    try await finishCleanup(account)
+                account.onNetworkPathChange = { [weak self] in
+                    guard let self else { return }
+                    player?.cancelWiFiReadsIfMetered()
+                    if demoActive && account.routeIsOffline { setDemoEvidence("evidence:not-online") }
+                    else if demoActive && demoEvidence == "evidence:not-online" {
+                        setDemoEvidence("no-evidence")
+                        resumeDemoCatalogInBackground(account)
+                    }
                 }
-                if let storage = try account.openPlaybackStore(), let player {
-                    try await Task.detached { try player.restoreIfNeeded(from: storage) }.value
-                    try await pins.bind(storage)
+                if account.cleanupPending { try await finishCleanup(account) }
+                demoActive = account.snapshot["driveID"] is NSNull && UserDefaults.standard.bool(forKey: Self.demoSelection)
+                if demoActive {
+                    demoEvidence = account.routeIsOffline ? "evidence:not-online" : "no-evidence"
+                    do { _ = try demo.loadCatalog() }
+                    catch { account.diagnostics.record("Demo catalog read deferred") }
                 }
-                pins.updateEvidence(account.snapshot["evidence"] as? String ?? "no-evidence")
+                do { try await bindSelectedProfile(account) }
+                catch {
+                    guard demoActive else { throw error }
+                    abandonDemoBinding(account)
+                }
                 await pins.connectSession()
-                if let player {
-                    systemPlayback = SystemPlayback(player: player) { [weak self] in self?.signalPlayerChange(debugOnly: false) }
-                    systemPlayback?.publishNowPlaying()
-                }
+                if demoActive && !account.routeIsOffline { resumeDemoCatalogInBackground(account) }
                 servicesReady = true
                 if isViewLoaded { loadPage() }
             } catch {
@@ -113,6 +144,183 @@ import WebKit
                 if isViewLoaded { showUnavailable() }
             }
         }
+    }
+
+    /// A profile owns one player, while WebKit replacement keeps that player live.
+    private func configurePlayer(_ account: NativeAccount) {
+        player = player ?? NativePlayback(diagnostics: account.diagnostics,
+            pool: MediaPool(unmeteredWiFi: account.unmeteredWiFi)) { [weak self] drive, item, lookup, wifiOnly in
+            guard let self else { throw NativeAccountError.cancelled }
+            return try await self.lookupMedia(drive, item, lookup: lookup, wifiOnly: wifiOnly)
+        }
+        player?.onChange = { [weak self] debugOnly in self?.signalPlayerChange(debugOnly: debugOnly) }
+        if let player {
+            systemPlayback = SystemPlayback(player: player) { [weak self] in self?.signalPlayerChange(debugOnly: false) }
+            systemPlayback?.publishNowPlaying()
+        }
+    }
+
+    private func currentEvidence(_ account: NativeAccount) -> String {
+        demoActive ? demoEvidence : (account.snapshot["evidence"] as? String ?? "no-evidence")
+    }
+
+    private func publishEvidence(_ evidence: String, publicMedia: Bool? = nil) {
+        pins.updateEvidence(evidence, publicMedia: publicMedia)
+        webView?.callAsyncJavaScript(
+            "window.dispatchEvent(new CustomEvent('oneplay-evidence', {detail:evidence}))",
+            arguments: ["evidence": evidence], in: nil, in: .page, completionHandler: nil)
+    }
+
+    private func setDemoEvidence(_ next: String) {
+        guard demoEvidence != next else { return }
+        demoEvidence = next
+        publishEvidence(next)
+    }
+
+    private func lookupMedia(_ drive: String, _ item: String, lookup: MediaLookup, wifiOnly: Bool = false) async throws -> MediaLocation {
+        // The previous player and pin generation have drained before this flag opens.
+        guard let account, profileBound else { throw NativeAccountError.cancelled }
+        if demoActive {
+            guard drive == DemoMusicCatalog.source else { throw NativeAccountError.missingRecording }
+            // A seek within an admitted occurrence keeps its immutable revision across catalog refreshes.
+            if case let .reuse(admitted) = lookup, let admitted, admitted.immutable, !admitted.isRejected, !admitted.accessDenied {
+                return admitted
+            }
+            guard let media = demo.catalog?.recordings[item] else { throw NativeAccountError.missingRecording }
+            return MediaLocation(url: media.url, etag: media.blob, size: media.size, immutable: true)
+        }
+        return try await account.media(driveID: drive, itemID: item, lookup: lookup, wifiOnly: wifiOnly)
+    }
+
+    /// A pairing can arrive between two WebKit documents. Bind the shared store once.
+    private func bindSelectedProfile(_ account: NativeAccount) async throws {
+        if profileBound { return }
+        if let bindingProfile { return try await bindingProfile.value }
+        let binding = Task<Void, Error> {
+            pins.updateEvidence("no-evidence", publicMedia: false)
+            let storage = try demoActive ? demo.openStore() : account.openPlaybackStore()
+            if let storage, let player {
+                try await Task.detached { try player.restoreIfNeeded(from: storage) }.value
+                try await pins.bind(storage)
+                profileBound = true
+            }
+            publishEvidence(currentEvidence(account), publicMedia: demoActive)
+            systemPlayback?.publishNowPlaying()
+        }
+        bindingProfile = binding
+        defer { bindingProfile = nil }
+        try await binding.value
+    }
+
+    /// A background URLSession wake can recover eligible pins before WebKit exists.
+    private func resumeDemoCatalogInBackground(_ account: NativeAccount) {
+        Task { [weak self] in
+            guard let self else { return }
+            do { _ = try await refreshDemoSnapshot(account) }
+            catch { account.diagnostics.record("Background demo refresh deferred") }
+        }
+    }
+
+    private func refreshDemoSnapshot(_ account: NativeAccount) async throws -> DemoMusicCatalog {
+        guard demoActive, !changingProfile, let residence = player else { throw NativeAccountError.cancelled }
+        let next = try await demo.refresh()
+        guard player === residence, demoActive, !changingProfile else { throw NativeAccountError.cancelled }
+        do { try pins.reconcile() }
+        catch { account.diagnostics.record("Could not reconcile pins after demo refresh") }
+        return next
+    }
+
+    /// Storage failure leaves saved Demo files in place and returns to the neutral chooser.
+    private func abandonDemoBinding(_ account: NativeAccount) {
+        account.diagnostics.record("Could not bind demo storage")
+        demo.cancelRefresh()
+        profileBound = false
+        pins.closeAdmission()
+        systemPlayback = nil
+        player = nil
+        demoActive = false
+        demoOpenFailed = true
+        focusDemoTree = false
+        UserDefaults.standard.removeObject(forKey: Self.demoSelection)
+        configurePlayer(account)
+    }
+
+    /// Retire the old workspace before asynchronous checkpoint and store handoff work.
+    private func switchProfile(toDemo: Bool, account: NativeAccount) {
+        guard !changingProfile else { return }
+        changingProfile = true
+        UserDefaults.standard.set(toDemo, forKey: Self.demoSelection)
+        profileBound = false
+        // Clearing old pin inventory must not change the retiring playback cursor.
+        let retiringPlayer = player
+        player = nil
+        systemPlayback = nil
+        pins.closeAdmission()
+        let previousPage = webView
+        detachPage()
+        if demoActive {
+            demo.cancelRefresh()
+            retiringPlayer?.parkAndCheckpointForProfileSwitch()
+        }
+        Task {
+            do {
+                if demoActive { try await retiringPlayer?.waitForCheckpointWrites() }
+            } catch { account.diagnostics.record("Demo checkpoint deferred during profile switch") }
+            if let previousPage {
+                do { try await shell.retireDocument(in: previousPage) }
+                catch { account.diagnostics.record("Old workspace document could not finish retirement") }
+            }
+            await pins.unbindAndCancel()
+            do { try await retiringPlayer?.stopAndDrain() }
+            catch { account.diagnostics.record("Old workspace playback cleanup deferred") }
+            demoActive = toDemo
+            demoEvidence = account.routeIsOffline ? "evidence:not-online" : "no-evidence"
+            configurePlayer(account)
+            do {
+                try await bindSelectedProfile(account)
+                changingProfile = false
+                if demoActive && !account.routeIsOffline { resumeDemoCatalogInBackground(account) }
+                loadPage()
+            } catch {
+                changingProfile = false
+                if toDemo {
+                    abandonDemoBinding(account)
+                    loadPage()
+                } else {
+                    account.diagnostics.record("Could not bind workspace storage")
+                    showUnavailable()
+                }
+            }
+        }
+    }
+
+    /// Open only the isolated catalog from the neutral chooser. No media or UI state is admitted yet.
+    private func chooseDemo(_ attempt: String, focus: Bool, page: WKWebView, account: NativeAccount) async throws {
+        guard demoChooserAttempt == attempt, account.snapshot["driveID"] is NSNull else {
+            throw NativeAccountError.cancelled
+        }
+        defer { if demoChooserAttempt == attempt { demoChooserAttempt = nil } }
+        let confirmedCacheMiss: Bool
+        do { confirmedCacheMiss = try demo.loadCatalog() == nil }
+        catch {
+            if account.routeIsOffline { throw error }
+            account.diagnostics.record("Demo catalog could not be read")
+            confirmedCacheMiss = false
+        }
+        if demo.catalog == nil {
+            if account.routeIsOffline { throw NativeAccountError.unavailableOffline }
+            do { _ = try await demo.refresh() }
+            catch {
+                guard demoChooserAttempt == attempt else { throw NativeAccountError.cancelled }
+                if confirmedCacheMiss && account.routeIsOffline { throw NativeAccountError.unavailableOffline }
+                throw error
+            }
+        }
+        guard demoChooserAttempt == attempt, page === webView, account.snapshot["driveID"] is NSNull else {
+            throw NativeAccountError.cancelled
+        }
+        focusDemoTree = focus
+        switchProfile(toDemo: true, account: account)
     }
 
     /// Best effort. JS also pulls on startup, so a suspended or replaced page can miss this signal.
@@ -129,14 +337,14 @@ import WebKit
         }
         guard let page = webView, page.url == BundledShell.page, UIApplication.shared.applicationState == .active else { return }
         if debugOnly && !showingAudioRanges { return }
-        guard let player, let account, account.snapshot["driveID"] is String else { return }
+        guard let player, let account, profileBound else { return }
         page.callAsyncJavaScript("window.dispatchEvent(new CustomEvent('oneplay-playback', {detail:sample}))",
                                  arguments: ["sample": playbackSample(player, account)], in: nil, in: .page, completionHandler: nil)
     }
 
     /// Replies and pushed transitions share one sequence so a delayed command reply cannot rewind the drawer.
     private func playbackSample(_ player: NativePlayback, _ account: NativeAccount, includeDenied: Bool = false) -> [String: Any] {
-        let lookups = showingAudioRanges ? Array(account.mediaRequests.values) : nil
+        let lookups = showingAudioRanges && !demoActive ? Array(account.mediaRequests.values) : nil
         playbackSequence += 1
         var snapshot = player.snapshot(lookups: lookups, pinSizes: lookups == nil ? [:] : pins.sizes, includeDenied: includeDenied)
         let denied = snapshot.removeValue(forKey: "denied")
@@ -156,7 +364,7 @@ import WebKit
     }
 
     private func clearLibraryStore() async {
-        await store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
+        await personalStore.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
     }
 
     private func finishCleanup(_ account: NativeAccount) async throws {
@@ -165,6 +373,8 @@ import WebKit
             if let theme = account.cleanupTheme {
                 try Data(theme.utf8).write(to: self.deviceTheme, options: .atomic)
             }
+            UserDefaults.standard.removeObject(forKey: Self.demoSelection)
+            self.profileBound = false
             await self.pins.unbindAndCancel()
             try await self.player?.stopAndDrain()
             await self.clearLibraryStore()
@@ -172,16 +382,16 @@ import WebKit
     }
 
     func loadPage() {
-        guard webView == nil, let account, !account.cleanupPending else { return }
+        guard webView == nil, let account, !account.cleanupPending, !changingProfile else { return }
         pinRevision = -1
         subscription = UUID().uuidString
         let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = store
+        configuration.websiteDataStore = demoActive ? demoWebStore : personalStore
         configuration.setURLSchemeHandler(shell, forURLScheme: "oneplay")
         configuration.userContentController.addScriptMessageHandler(self, contentWorld: .page, name: "oneplay")
         // On a clean store the next account inherits only the device's chosen theme.
         if let theme = try? String(contentsOf: deviceTheme, encoding: .utf8), ["light", "dark", "auto"].contains(theme) {
-            let script = "if (!localStorage.getItem('oneplay_music_theme')) localStorage.setItem('oneplay_music_theme','\(theme)')"
+            let script = "localStorage.setItem('oneplay_music_theme','\(theme)')"
             configuration.userContentController.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart,
                                                                             forMainFrameOnly: true))
         }
@@ -216,6 +426,10 @@ import WebKit
     }
 
     func detachPage() {
+        if demoChooserAttempt != nil {
+            demoChooserAttempt = nil
+            demo.cancelRefresh()
+        }
         staged = nil
         pinParts = nil
         inventoryParts = nil
@@ -231,8 +445,8 @@ import WebKit
         webView = nil
     }
 
-    private func handlePins(_ args: [String: Any], account: NativeAccount) throws -> Any {
-        guard account.snapshot["driveID"] is String, let action = args["action"] as? String else { throw NativeAccountError.unbound }
+    private func handlePins(_ args: [String: Any]) throws -> Any {
+        guard profileBound, let action = args["action"] as? String else { throw NativeAccountError.unbound }
         switch action {
         case "snapshot":
             let reply = pins.snapshot(after: args["after"] as? Int)
@@ -259,6 +473,13 @@ import WebKit
                 let data = pinParts!.data
                 pinParts = nil
                 guard let rows = try JSONSerialization.jsonObject(with: data) as? [[String:Any]] else { throw NativeAccountError.invalidRequest }
+                if demoActive {
+                    for row in rows {
+                        guard let groups = row["sources"] as? [String:[String:String]],
+                              groups.allSatisfy({ root, keys in root == DemoMusicCatalog.source && keys.keys.allSatisfy(pins.allowsMediaKey) })
+                        else { throw NativeAccountError.invalidRequest }
+                    }
+                }
                 try pins.apply(owners: rows)
                 pinRevision = revision
             }
@@ -271,7 +492,7 @@ import WebKit
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage,
                                replyHandler: @escaping (Any?, String?) -> Void) {
         let frame = message.frameInfo
-        guard let account, !account.cleanupPending, let page = webView, message.webView === page,
+        guard let account, !account.cleanupPending, !changingProfile, let page = webView, message.webView === page,
               page.url == BundledShell.page, frame.isMainFrame, frame.request.url == BundledShell.page,
               frame.securityOrigin.protocol == "oneplay", frame.securityOrigin.host == "app",
               frame.securityOrigin.port == 0, let args = message.body as? [String: Any], let op = args["op"] as? String
@@ -279,9 +500,16 @@ import WebKit
 
         // Close admission in this delegate turn, before any queued operation can start.
         if op == "signOut" {
+            if demoActive {
+                focusProviderChooser = true
+                replyHandler(true, nil)
+                switchProfile(toDemo: false, account: account)
+                return
+            }
             do {
                 pins.closeAdmission()
                 try account.beginSignOut(theme: args["theme"] as? String)
+                focusProviderChooser = true
                 player?.stop()
                 systemPlayback?.publishNowPlaying()
                 replyHandler(true, nil)
@@ -298,30 +526,101 @@ import WebKit
             return
         }
 
+        if op == "demoCancelOpen" {
+            if let attempt = demoChooserAttempt, attempt == args["attempt"] as? String {
+                demoChooserAttempt = nil
+                demo.cancelRefresh()
+            }
+            replyHandler(true, nil)
+            return
+        }
+        let openingAttempt: String?
+        if op == "demoOpen" {
+            guard let attempt = args["attempt"] as? String, UUID(uuidString: attempt) != nil,
+                  !demoActive, !profileBound, account.snapshot["driveID"] is NSNull else {
+                replyHandler(nil, "invalidRequest")
+                return
+            }
+            // Connect may cancel this message before its async work begins.
+            if demoChooserAttempt != attempt { demo.cancelRefresh() }
+            demoChooserAttempt = attempt
+            openingAttempt = attempt
+        } else { openingAttempt = nil }
         Task<Void, Never> {
-            guard page === webView, !account.cleanupPending else { replyHandler(nil, "detached"); return }
+            guard page === webView, !account.cleanupPending, !changingProfile else { replyHandler(nil, "detached"); return }
             do {
                 let reply: Any
                 switch op {
-                case "state", "signIn":
-                    var state = op == "state" ? account.snapshot : try await account.signIn(presenting: self)
-                    // Cold startup loaded the existing account before admitting this page.
-                    // A fresh interactive pairing has an empty store after sign-out cleanup.
+                case "state":
+                    if !demoActive && account.snapshot["driveID"] is String { try await bindSelectedProfile(account) }
+                    var state = account.snapshot
+                    if demoActive {
+                        state = ["driveID": NSNull(), "workspace": "demo", "evidence": demoEvidence,
+                                 "focusDemoTree": focusDemoTree]
+                        focusDemoTree = false
+                    } else {
+                        if demoOpenFailed {
+                            state["demoOpenFailed"] = true
+                            demoOpenFailed = false
+                        }
+                        if focusProviderChooser {
+                            state["focusProviderChooser"] = true
+                            focusProviderChooser = false
+                        }
+                    }
+                    #if DEBUG
+                    state["debugPlayback"] = !demoActive
+                    #endif
+                    reply = state
+                case "signIn":
+                    guard !demoActive else { throw NativeAccountError.invalidRequest }
+                    var state = try await account.signIn(presenting: self)
+                    if !account.cleanupPending {
+                        do { try await bindSelectedProfile(account) }
+                        catch {
+                            guard page === webView, !account.cleanupPending else { throw NativeAccountError.cancelled }
+                            // Pairing committed. Recovery belongs to the library opening screen.
+                            account.diagnostics.record("Could not open OneDrive storage after sign-in")
+                            replyHandler(nil, "libraryOpeningFailed")
+                            return
+                        }
+                    }
                     guard page === webView, !account.cleanupPending else { throw NativeAccountError.cancelled }
-                    if let storage = try account.openPlaybackStore() { try player?.restoreIfNeeded(from: storage); try await pins.bind(storage) }
                     #if DEBUG
                     state["debugPlayback"] = true
                     #endif
                     reply = state
+                case "demoOpen":
+                    guard let attempt = openingAttempt else { throw NativeAccountError.invalidRequest }
+                    try await chooseDemo(attempt, focus: args["focus"] as? Bool == true, page: page, account: account)
+                    reply = true
+                case "demoCatalog":
+                    guard demoActive else { throw NativeAccountError.invalidRequest }
+                    let snapshot: DemoMusicCatalog?
+                    if args["refresh"] as? Bool == true {
+                        snapshot = try await refreshDemoSnapshot(account)
+                    } else { snapshot = try demo.loadCatalog() }
+                    if let snapshot { reply = try JSONSerialization.jsonObject(with: snapshot.data) }
+                    else { reply = NSNull() }
+                case "demoCredits":
+                    guard demoActive, let url = demo.catalog?.credits else { throw NativeAccountError.invalidRequest }
+                    reply = await UIApplication.shared.open(url)
+                case "deviceTheme":
+                    guard let theme = args["theme"] as? String, ["light", "dark", "auto"].contains(theme) else {
+                        throw NativeAccountError.invalidRequest
+                    }
+                    try Data(theme.utf8).write(to: deviceTheme, options: .atomic)
+                    reply = true
                 case "debugRequireInteractiveReconnect":
+                    guard !demoActive else { throw NativeAccountError.invalidRequest }
                     try account.requireInteractiveReconnectForDebug()
                     reply = true
                 case "pins":
-                    reply = try handlePins(args, account: account)
+                    reply = try handlePins(args)
                 case "diagnostics":
                     reply = try account.diagnostics.entries(after: (args["after"] as? String).flatMap(UUID.init(uuidString:)))
                 case "playback":
-                    guard args["version"] as? Int == 1, let player, account.snapshot["driveID"] is String,
+                    guard args["version"] as? Int == 1, let player, profileBound,
                           let action = args["action"] as? String else { throw NativeAccountError.invalidRequest }
                     var applied: Bool?
                     var staleProof = false
@@ -344,6 +643,7 @@ import WebKit
                         guard let session = args["session"] as? String, let revision = args["revision"] as? Int else { throw NativeAccountError.invalidRequest }
                         player.fence(session: session, revision: revision)
                     case "access":
+                        guard !demoActive else { throw NativeAccountError.invalidRequest }
                         guard let expected = args["subscription"] as? String, let base = args["base"] as? Int,
                               let denied = args["denied"] as? [String], base >= 0 else { throw NativeAccountError.invalidRequest }
                         let allowed = args["allowed"] as? [String] ?? []
@@ -392,6 +692,12 @@ import WebKit
                         }
                         staged = nil
                         guard Set(tracks.compactMap(\.key)).count == tracks.count else { throw NativeAccountError.invalidRequest }
+                        // A new catalog can commit between queue chunks. Admit only against the current snapshot.
+                        if demoActive {
+                            guard let catalog = demo.catalog, tracks.allSatisfy({ $0.driveId == DemoMusicCatalog.source
+                                && $0.sourceRootKey == DemoMusicCatalog.source && catalog.recordings[$0.itemId] != nil })
+                            else { throw NativeAccountError.invalidRequest }
+                        }
                         let favorite = args["favorite"] as? String
                         guard favorite == nil || folder.dropFirst().first == "fav:" + favorite! else { throw NativeAccountError.invalidRequest }
                         if action == "start" {
@@ -429,14 +735,16 @@ import WebKit
                     if action == "intent" { sample["base"] = player.sessionID }
                     reply = sample
                 case "request":
+                    guard !demoActive else { throw NativeAccountError.invalidRequest }
                     reply = try await account.request(message: args)
                 case "chunk", "abort":
+                    guard !demoActive else { throw NativeAccountError.invalidRequest }
                     guard let id = args["id"] as? String else { replyHandler(nil, "invalidRequest"); return }
                     if op == "chunk" { reply = try account.readChunk(id: id) }
                     else { account.abort(id: id); reply = true }
                 #if DEBUG
                 case "playIndexed":
-                    guard let player, account.snapshot["driveID"] is String,
+                    guard !demoActive, let player, profileBound,
                           let tracks = args["tracks"] as? [[String: String]], (1...10).contains(tracks.count),
                           let delay = args["delaySeconds"] as? Int, [0, 5, 10].contains(delay),
                           let nearEnd = args["nearEnd"] as? Bool, let force = args["forceRefresh"] as? Bool

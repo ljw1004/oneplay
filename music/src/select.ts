@@ -29,7 +29,7 @@ import { type Favorite, type Favorites, type RootsMap, type PlaylistMember, type
 import { walkFolder } from './indexer.js';
 import { log, logError } from './logger.js';
 import { type DownloadControls, QUOTA_OPTIONS_GB, classifyOfflineBadgeState } from './downloads.js';
-import { isWalkableRoot, soleAccountKey } from './roots.js';
+import { isWalkableRoot, solePrimaryLibraryKey } from './roots.js';
 import { buildMembersFromSelection as buildMembersFromSelectionFromState } from './select-dialogs.js';
 import {
     showModal,
@@ -65,6 +65,7 @@ export interface Select {
     onExitSelect: () => void;
     /** Called after a favorites action to navigate the tree to the target favorite. */
     onNavigateToFav: (favId: string) => Promise<void>;
+    onFavoriteSaveError: (message: string) => void;
     /** Set the downloads module reference for offline menu items and modal. */
     setDownloads(downloads: DownloadControls): void;
     /** Updates the offline modal DOM if it's currently open. Called on download state changes. */
@@ -296,7 +297,7 @@ export function createSelect(
 
     /** The first favorite unfolds home in place. Later creations open the new favorite. */
     const saveFavoriteAndExitSelect = async (favorite: Favorite, modal: HTMLElement, close: () => void): Promise<void> => {
-        const wasFolded = soleAccountKey(roots) !== undefined;
+        const wasFolded = solePrimaryLibraryKey(roots) !== undefined;
         // favorites.add owns the existing local/cloud write policy. A rejected edit has no destination.
         const added = await favorites.add(favorite);
         if (!modal.isConnected) return;
@@ -330,7 +331,8 @@ export function createSelect(
                     name: folderName,
                     target: {
                         driveId: folder.driveId, path: folder.path, itemId: folder.itemId, isFolder: true,
-                        sourceRootKey: folder.connectionId ? folder.sourceRootKey : undefined,
+                        sourceRootKey: folder.connectionId || roots.get(folder.sourceRootKey)?.type === 'demo'
+                            ? folder.sourceRootKey : undefined,
                     },
                     hasPrivatePlayback,
                 }, modal, close);
@@ -355,17 +357,30 @@ export function createSelect(
 
             const list = document.createElement('ul');
             list.className = 'modal-playlist-list';
+            const errorLine = document.createElement('div');
+            errorLine.className = 'modal-error';
+            errorLine.setAttribute('role', 'status');
+            let saving = false;
             for (const pl of playlists) {
                 const li = document.createElement('li');
                 li.textContent = `${pl.name} ♫`;
                 li.addEventListener('click', async () => {
-                    await favorites.addMembers(pl.id, selectedItems);
-                    close();
-                    select.exitSelectMode();
+                    if (saving) return;
+                    saving = true;
+                    errorLine.textContent = '';
+                    try {
+                        await favorites.addMembers(pl.id, selectedItems);
+                        if (!modal.isConnected) return;
+                        close();
+                        select.exitSelectMode();
+                    } catch (error) {
+                        logError(`Playlist update failed: ${error}`);
+                        if (modal.isConnected) errorLine.textContent = 'Couldn’t update this playlist.';
+                    } finally { saving = false; }
                 });
                 list.appendChild(li);
             }
-            modal.appendChild(list);
+            modal.append(list, errorLine);
 
             const actions = document.createElement('div');
             actions.className = 'modal-actions';
@@ -497,7 +512,11 @@ export function createSelect(
         items.push({
             label: fav.hasPrivatePlayback ? 'Remember my spot \u2713' : 'Remember my spot',
             onClick: async () => {
-                await favorites.setHasPrivatePlayback(favId, !fav.hasPrivatePlayback);
+                try { await favorites.setHasPrivatePlayback(favId, !fav.hasPrivatePlayback); }
+                catch (error) {
+                    logError(`Playback preference save failed: ${error}`);
+                    select.onFavoriteSaveError('Couldn’t save the playback preference.');
+                }
             },
         });
 
@@ -758,7 +777,7 @@ export function createSelect(
             const downloaded = snap.files.size;
             const queued = snap.queuedCount;
             const gb = snap.quotaBytes / (1024 ** 3);
-            globalCountText.textContent = queued && snap.evidence === 'evidence:signed-in'
+            globalCountText.textContent = queued && (snap.transferAllowed ?? (snap.evidence === 'evidence:signed-in'))
                 ? `${downloaded}/${downloaded + queued} tracks, ${formatBytes(snap.totalBytes)} / `
                 : `${downloaded} tracks, ${formatBytes(snap.totalBytes)} / `;
             quotaSelect.value = String(QUOTA_OPTIONS_GB.find(option => Math.abs(option - gb) < 0.1) ?? gb);
@@ -956,6 +975,7 @@ export function createSelect(
         onEnterSelect: () => {},
         onExitSelect: () => {},
         onNavigateToFav: async () => {},
+        onFavoriteSaveError: () => {},
         setDownloads(dl) { downloadsRef = dl; },
         updateOfflineModal() { refreshOfflineModal?.(); },
         refreshFolderActions() { if (active) syncActionBar(); },

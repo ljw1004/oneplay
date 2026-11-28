@@ -9,6 +9,7 @@ import AVFoundation
     var needsInteraction = false
     var ordinaryToken = "original"
     var beforeSilent: (() async -> Void)?
+    var beforeInteractive: (() async throws -> Void)?
     var forceCount = 0
     var removed = 0
 
@@ -20,7 +21,8 @@ import AVFoundation
     }
 
     func acquireInteractive(home: String?, presenting: UIViewController) async throws -> IdentityGrant {
-        IdentityGrant(homeID: self.home, accessToken: "interactive")
+        try await beforeInteractive?()
+        return IdentityGrant(homeID: self.home, accessToken: "interactive")
     }
 
     func cancelInteractive() {}
@@ -53,6 +55,33 @@ private final class TestAudioCDN: URLProtocol {
     }
 }
 
+private final class HeldDemoCatalog: URLProtocol {
+    private struct Loading: @unchecked Sendable { let protocolObject: HeldDemoCatalog }
+    private static let pending = OSAllocatedUnfairLock(initialState: [Loading]())
+    static var requestCount: Int { pending.withLock { $0.count } }
+    override class func canInit(with request: URLRequest) -> Bool { request.url == DemoMusicCatalog.index }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let loading = Loading(protocolObject: self)
+        Self.pending.withLock { $0.append(loading) }
+    }
+    override func stopLoading() {
+        let id = ObjectIdentifier(self)
+        Self.pending.withLock { $0.removeAll { ObjectIdentifier($0.protocolObject) == id } }
+    }
+
+    static func respond(_ bytes: Data) {
+        let waiting = pending.withLock { let list = $0; $0.removeAll(); return list }
+        for entry in waiting {
+            let load = entry.protocolObject
+            let response = HTTPURLResponse(url: DemoMusicCatalog.index, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+            load.client?.urlProtocol(load, didReceive: response, cacheStoragePolicy: .notAllowed)
+            load.client?.urlProtocol(load, didLoad: bytes)
+            load.client?.urlProtocolDidFinishLoading(load)
+        }
+    }
+}
+
 @MainActor final class AccountTests: XCTestCase {
     private var dir: URL!
     private var record: URL { dir.appendingPathComponent("binding") }
@@ -81,6 +110,301 @@ private final class TestAudioCDN: URLProtocol {
 
     private let drive = Data(#"{"id":"library"}"#.utf8)
     private let batch = "https://graph.microsoft.com/v1.0/$batch"
+
+    func testChooserOpensLibraryBeforeMicrosoftSignInReturns() async throws {
+        let defaults = UserDefaults.standard, selection = "DemoLibrarySelected"
+        let previous = defaults.object(forKey: selection)
+        defaults.removeObject(forKey: selection)
+        defer { defaults.set(previous, forKey: selection) }
+        let signingIn = expectation(description: "Microsoft sign-in is pending")
+        let verification = expectation(description: "Verify the Microsoft grant against OneDrive")
+        let musicProbe = expectation(description: "Open the paired OneDrive library")
+        let indexing = expectation(description: "First index requests the root")
+        var releaseSignIn: CheckedContinuation<Void, Error>?
+        var releaseVerification: CheckedContinuation<Void, Never>?
+        var releaseMusicProbe: CheckedContinuation<Void, Never>?
+        var releaseIndex: CheckedContinuation<Void, Never>?
+        var firstDriveRead = true
+        let identity = TestIdentity()
+        identity.beforeInteractive = {
+            try await withCheckedThrowingContinuation { releaseSignIn = $0; signingIn.fulfill() }
+        }
+        let account = try NativeAccount(recordFile: record, identity: identity) { [self] request in
+            switch request.url?.path {
+            case "/v1.0/me/drive":
+                if firstDriveRead {
+                    firstDriveRead = false
+                    await withCheckedContinuation { releaseVerification = $0; verification.fulfill() }
+                }
+                return try response(request, data: drive)
+            case "/v1.0/me/drive/special/music":
+                await withCheckedContinuation { releaseMusicProbe = $0; musicProbe.fulfill() }
+                let music = #"{"id":"root","name":"Music","size":20,"folder":{"childCount":1}}"#
+                return try response(request, data: Data(music.utf8))
+            case "/v1.0/$batch":
+                await withCheckedContinuation { releaseIndex = $0; indexing.fulfill() }
+                let cached = #"{"responses":[{"id":"cache-root","status":200,"body":{"kind":"MusicData","schemaVersion":1,"size":20,"count":1,"folder":{"id":"root","children":{"Overture.mp3":{"id":"track"}}}}},{"id":"children-root","status":200,"body":{"value":[]}}]}"#
+                return try response(request, data: Data(cached.utf8))
+            default:
+                return try response(request, status: 404, data: Data())
+            }
+        }
+        let controller = LibraryController(account: account, store: .nonPersistent())
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = controller
+        window.isHidden = false
+        defer {
+            window.isHidden = true
+            controller.detachPage()
+            releaseSignIn?.resume(throwing: CancellationError())
+            releaseVerification?.resume()
+            releaseMusicProbe?.resume()
+            releaseIndex?.resume()
+        }
+        let page = try await readyPage(in: controller)
+        let visibility = try await page.evaluateJavaScript("document.visibilityState") as? String
+        XCTAssertEqual(visibility, "visible")
+        _ = try await page.evaluateJavaScript("""
+            window._testStartupOpeningWaitMs = 40;
+            const connect = document.querySelector('.library-choice-onedrive');
+            connect.focus();
+            connect.click();
+            """)
+        await fulfillment(of: [signingIn], timeout: 5)
+        let waitingForMicrosoft = try await page.callAsyncJavaScript("""
+            await new Promise(resolve => setTimeout(resolve, 150));
+            const status = document.getElementById('status');
+            return [status.querySelector('.index-progress.startup-opening [role=status]')?.textContent === 'Indexing your music...',
+                !status.querySelector('.library-chooser'),
+                !status.querySelector('.startup-retry'), document.activeElement === status];
+            """, arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertEqual(waitingForMicrosoft as? [Bool], [true, true, true, true])
+        let titleTop = try await page.evaluateJavaScript("document.querySelector('.index-progress [role=status]').getBoundingClientRect().top") as? Double
+        XCTAssertNotNil(titleTop)
+        releaseSignIn?.resume()
+        releaseSignIn = nil
+        await fulfillment(of: [verification], timeout: 5)
+        let opening = try await page.callAsyncJavaScript("""
+            await new Promise(resolve => setTimeout(resolve, 150));
+            const status = document.getElementById('status');
+            return [status.querySelector('.index-progress.startup-opening [role=status]')?.textContent === 'Indexing your music...',
+                !status.querySelector('.library-chooser'),
+                !status.querySelector('.startup-retry')];
+            """, arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertEqual(opening as? [Bool], [true, true, true])
+        XCTAssertTrue(account.snapshot["driveID"] is NSNull)
+        releaseVerification?.resume()
+        releaseVerification = nil
+        await fulfillment(of: [musicProbe], timeout: 8)
+        XCTAssertEqual(account.snapshot["driveID"] as? String, "library")
+        let openingPairedLibrary = try await page.callAsyncJavaScript("""
+            const status = document.getElementById('status');
+            const retry = () => !!status.querySelector('.startup-retry');
+            if (!retry()) await new Promise(resolve => {
+                const observer = new MutationObserver(() => { if (retry()) finish(); });
+                const timer = setTimeout(finish, 2500);
+                function finish() { observer.disconnect(); clearTimeout(timer); resolve(); }
+                observer.observe(status, {childList:true, subtree:true});
+            });
+            return !status.querySelector('.library-chooser') && !!status.querySelector('.index-progress.startup-opening') && retry();
+            """, arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertEqual(openingPairedLibrary as? Bool, true)
+        releaseMusicProbe?.resume()
+        releaseMusicProbe = nil
+        await fulfillment(of: [indexing], timeout: 8)
+        let scanTitleTop = try await page.evaluateJavaScript("document.querySelector('.index-progress:not(.startup-opening) [role=status]').getBoundingClientRect().top") as? Double
+        XCTAssertEqual(scanTitleTop, titleTop)
+    }
+
+    func testChooserRestoresProviderChoicesAfterMicrosoftCancellation() async throws {
+        let defaults = UserDefaults.standard, selection = "DemoLibrarySelected"
+        let previous = defaults.object(forKey: selection)
+        defaults.removeObject(forKey: selection)
+        defer { defaults.set(previous, forKey: selection) }
+        let identity = TestIdentity()
+        identity.beforeInteractive = { throw NativeAccountError.cancelled }
+        let account = try NativeAccount(recordFile: record, identity: identity) { _ in
+            XCTFail("Cancelling Microsoft sign-in must not use Graph")
+            throw NativeAccountError.invalidRequest
+        }
+        let controller = LibraryController(account: account, store: .nonPersistent())
+        controller.loadViewIfNeeded()
+        defer { controller.detachPage() }
+        let page = try await readyPage(in: controller)
+        let outcome = try await page.callAsyncJavaScript("""
+            document.querySelector('.library-choice-onedrive').click();
+            const status = document.getElementById('status');
+            const deadline = performance.now() + 2500;
+            while (!status.querySelector('.library-choice-onedrive:not([aria-busy])') && performance.now() < deadline) {
+                await new Promise(resolve => setTimeout(resolve, 20));
+            }
+            const connect = status.querySelector('.library-choice-onedrive:not([aria-busy])');
+            return [!!connect && document.activeElement === connect, !!status.querySelector('.library-choice-demo'),
+                status.querySelector('.library-choice-status')?.textContent === ''];
+            """, arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertEqual(outcome as? [Bool], [true, true, true])
+        XCTAssertTrue(account.snapshot["driveID"] is NSNull)
+    }
+
+    func testVerifiedChooserSignInWithUnreadableStorageKeepsLibraryRecovery() async throws {
+        let defaults = UserDefaults.standard, selection = "DemoLibrarySelected"
+        let previous = defaults.object(forKey: selection)
+        defaults.removeObject(forKey: selection)
+        defer { defaults.set(previous, forKey: selection) }
+        let store = try PlaybackStore(root: dir.appendingPathComponent("Playback"), home: "listener", drive: "library")
+        try Data("unreadable".utf8).write(to: store.directory.appendingPathComponent("pins"))
+        let account = try NativeAccount(recordFile: record, identity: TestIdentity()) { [self] request in
+            try response(request, data: drive)
+        }
+        let controller = LibraryController(account: account, store: .nonPersistent())
+        controller.loadViewIfNeeded()
+        defer { controller.detachPage() }
+        let page = try await readyPage(in: controller)
+        let outcome = try await page.callAsyncJavaScript("""
+            document.querySelector('.library-choice-onedrive').click();
+            const status = document.getElementById('status');
+            const settled = () => !!status.querySelector('.startup-error, .library-choice-status:not(:empty)');
+            if (!settled()) await new Promise(resolve => {
+                const observer = new MutationObserver(() => { if (settled()) finish(); });
+                const timer = setTimeout(finish, 5000);
+                function finish() { observer.disconnect(); clearTimeout(timer); resolve(); }
+                observer.observe(status, {childList:true, subtree:true});
+            });
+            return !status.querySelector('.library-chooser') && !!status.querySelector('.startup-error ~ .startup-retry');
+            """, arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertEqual(outcome as? Bool, true)
+        XCTAssertEqual(account.snapshot["driveID"] as? String, "library")
+    }
+
+    func testChooserCancelRetiresCompetingDemoOpen() async throws {
+        let defaults = UserDefaults.standard, selection = "DemoLibrarySelected"
+        let previous = defaults.object(forKey: selection)
+        defaults.removeObject(forKey: selection)
+        defer { defaults.set(previous, forKey: selection) }
+        let account = try NativeAccount(recordFile: record, identity: TestIdentity()) { _ in
+            XCTFail("A Demo chooser command must not use Graph")
+            throw NativeAccountError.invalidRequest
+        }
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [HeldDemoCatalog.self]
+        let demo = DemoLibrary(root: dir.appendingPathComponent("Demo"), configuration: config)
+        let controller = LibraryController(account: account, store: .nonPersistent(), demo: demo)
+        controller.loadViewIfNeeded()
+        defer { controller.detachPage() }
+        let page = try await readyPage(in: controller)
+        let retired = try await page.callAsyncJavaScript("""
+            const bridge = window.webkit.messageHandlers.oneplay;
+            const attempt = crypto.randomUUID();
+            const opening = bridge.postMessage({op:'demoOpen',attempt}).then(() => 'admitted', error => error.message);
+            await bridge.postMessage({op:'demoCancelOpen',attempt});
+            return await opening;
+            """, arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertEqual(retired as? String, "cancelled")
+        XCTAssertTrue(controller.webView === page)
+    }
+
+    func testDemoRefreshSurvivesWebContentReplacement() async throws {
+        let defaults = UserDefaults.standard, selection = "DemoLibrarySelected"
+        let previous = defaults.object(forKey: selection)
+        defaults.set(true, forKey: selection)
+        defer { defaults.set(previous, forKey: selection) }
+        let account = try NativeAccount(recordFile: record, identity: TestIdentity()) { _ in
+            XCTFail("Demo refresh must not use Graph")
+            throw NativeAccountError.invalidRequest
+        }
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [HeldDemoCatalog.self]
+        let demo = DemoLibrary(root: dir.appendingPathComponent("Demo"), configuration: config)
+        defer { demo.cancelRefresh() }
+        func catalog(_ name: String, sha: String) throws -> Data {
+            try JSONSerialization.data(withJSONObject: ["schemaVersion": 1, "mediaCommit": String(repeating: sha, count: 40),
+                "tracks": [["path": name + "/Song.mp3", "bytes": 1234, "blob": String(repeating: "c", count: 40)]]])
+        }
+        let committed = try demo.openStore().directory.appendingPathComponent("catalog.json")
+        try catalog("Original album", sha: "a").write(to: committed)
+        func waitForAlbum(_ album: String, in page: WKWebView) async throws {
+            let result = try await page.callAsyncJavaScript("""
+                const installed = () => [...document.querySelectorAll('#children .row-name')].some(row => row.textContent === album);
+                if (!installed()) await new Promise(resolve => {
+                    const observer = new MutationObserver(() => { if (installed()) finish(); });
+                    const timer = setTimeout(finish, 5000);
+                    function finish() { observer.disconnect(); clearTimeout(timer); resolve(); }
+                    observer.observe(document.body, {childList:true, subtree:true});
+                });
+                return { installed: installed(), status: document.getElementById('status').innerText,
+                         log: document.getElementById('js-log').textContent.slice(-2048) };
+                """, arguments: ["album": album], in: nil, contentWorld: .page) as? [String: Any]
+            XCTAssertEqual(result?["installed"] as? Bool, true, "\(album) did not render: \(String(describing: result))")
+        }
+        let controller = LibraryController(account: account, store: .nonPersistent(), demo: demo, demoStore: .nonPersistent())
+        controller.loadViewIfNeeded()
+        defer { controller.detachPage() }
+        let old = try await readyPage(in: controller)
+        try await waitForAlbum("Original album", in: old)
+        let residence = try XCTUnwrap(controller.player)
+        let deadline = ContinuousClock.now + .seconds(3)
+        while HeldDemoCatalog.requestCount == 0 && .now < deadline { try await Task.sleep(for: .milliseconds(25)) }
+        XCTAssertEqual(HeldDemoCatalog.requestCount, 1)
+        old.reload()
+        let replacement = try await readyPage(in: controller, excluding: old)
+        XCTAssertTrue(controller.player === residence)
+        try await waitForAlbum("Original album", in: replacement)
+        XCTAssertEqual(HeldDemoCatalog.requestCount, 1)
+        let next = try catalog("Published album", sha: "b")
+        HeldDemoCatalog.respond(next)
+        try await waitForAlbum("Published album", in: replacement)
+        XCTAssertEqual(try Data(contentsOf: committed), next)
+
+        _ = try await replacement.evaluateJavaScript("""
+            localStorage.setItem('demo-fixture', 'retained');
+            document.querySelector('[aria-label="Settings, demo library"]').click();
+            """)
+        _ = try? await replacement.evaluateJavaScript("""
+            [...document.querySelectorAll('button')].find(button => button.textContent === 'Sign out of Demo').click();
+            """)
+        let chooser = try await readyPage(in: controller, excluding: replacement)
+        let choices = try await chooser.evaluateJavaScript("""
+            const connect = document.querySelector('.library-choice-onedrive');
+            [connect === document.activeElement, !!document.querySelector('.library-choice-demo'),
+             localStorage.getItem('demo-fixture') === null];
+            """)
+        XCTAssertEqual(choices as? [Bool], [true, true, true])
+        XCTAssertFalse(defaults.bool(forKey: selection))
+        XCTAssertEqual(try Data(contentsOf: committed), next)
+        _ = try? await chooser.evaluateJavaScript("document.querySelector('.library-choice-demo').click()")
+        let restored = try await readyPage(in: controller, excluding: chooser)
+        try await waitForAlbum("Published album", in: restored)
+        let saved = try await restored.evaluateJavaScript("localStorage.getItem('demo-fixture')")
+        XCTAssertEqual(saved as? String, "retained")
+    }
+
+    func testUnreadableDemoStateLeavesBothChoicesAvailable() async throws {
+        let defaults = UserDefaults.standard, selection = "DemoLibrarySelected"
+        let previous = defaults.object(forKey: selection)
+        defaults.set(true, forKey: selection)
+        defer { defaults.set(previous, forKey: selection) }
+        let account = try NativeAccount(recordFile: record, identity: TestIdentity()) { _ in
+            XCTFail("The chooser does not use Graph")
+            throw NativeAccountError.invalidRequest
+        }
+        let demo = DemoLibrary(root: dir.appendingPathComponent("Demo"))
+        let folder = try demo.openStore().directory
+        let catalog = #"{"schemaVersion":1,"mediaCommit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tracks":[{"path":"Song.mp3","bytes":3,"blob":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}"#
+        try Data(catalog.utf8).write(to: folder.appendingPathComponent("catalog.json"))
+        let unreadable = Data("unreadable".utf8), pinFile = folder.appendingPathComponent("pins")
+        try unreadable.write(to: pinFile)
+        let controller = LibraryController(account: account, store: .nonPersistent(), demo: demo)
+        controller.loadViewIfNeeded()
+        defer { controller.detachPage() }
+        let page = try await readyPage(in: controller)
+        let copy = try await page.evaluateJavaScript("document.getElementById('status').innerText") as? String ?? ""
+        XCTAssertTrue(copy.contains("Connect to OneDrive"))
+        XCTAssertTrue(copy.contains("Explore the demo library"))
+        XCTAssertTrue(copy.contains("The demo library couldn’t load."))
+        XCTAssertFalse(defaults.bool(forKey: selection))
+        XCTAssertEqual(try Data(contentsOf: pinFile), unreadable)
+    }
 
     /// Drive the actual favorite menu against the native transfer delegate, then replace WebKit
     /// without network and start the same favorite through the library's Play control.
@@ -1645,9 +1969,12 @@ private final class TestAudioCDN: URLProtocol {
             const state = await window.webkit.messageHandlers.oneplay.postMessage({op:'state'});
             const {dbGet} = await import('oneplay://app/music/dist/db.js');
             return {unbound:!state.driveID, writersCleared:!localStorage.getItem('retiredWriter'),
+                    chooserFocused:document.activeElement?.classList.contains('library-choice-onedrive') === true,
+                    demoAvailable:!!document.querySelector('.library-choice-demo'),
                     indexCleared:!await dbGet('index:library')};
             """, arguments: [:], in: nil, contentWorld: .page)
-        XCTAssertEqual(clean as? [String: Bool], ["unbound":true, "writersCleared":true, "indexCleared":true])
+        XCTAssertEqual(clean as? [String: Bool], ["unbound":true, "writersCleared":true, "indexCleared":true,
+                                                "chooserFocused":true, "demoAvailable":true])
         XCTAssertFalse(FileManager.default.fileExists(atPath: capture.path))
     }
     #endif

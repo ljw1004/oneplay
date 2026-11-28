@@ -20,6 +20,7 @@ export class ProviderHttpError extends Error {
 
 /** The provider responded successfully but supplied no playable URL. */
 export class MediaUnavailableError extends Error {}
+export class MediaTransientError extends Error {}
 
 /** App-folder reads return HTTP 200. Keep payload text out of diagnostics. */
 export function parsePrimaryDocument(text: string, operation: string): unknown {

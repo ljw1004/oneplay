@@ -2,7 +2,7 @@
  * Shared root-resolution helpers for ItemRef-based traversal.
  *
  * INVARIANTS:
- * - Walkable roots are exactly OneDrive account roots and share roots with a
+ * - Walkable roots are primary library roots and share roots with a
  *   loaded MusicFolder.
  * - ItemRef resolution prefers sourceRootKey when present.
  * - Legacy ItemRefs (no sourceRootKey) fall back by driveId only when there is
@@ -12,10 +12,10 @@
 import { type MusicFolder } from './indexer.js';
 import { type FolderPin, type ItemRef, type Root, type RootsMap } from './favorites.js';
 
-/** A lone OneDrive account supplies the contents of the OnePlay home screen. */
-export function soleAccountKey(roots: RootsMap): string | undefined {
+/** A lone primary library supplies the contents of the OnePlay home screen. */
+export function solePrimaryLibraryKey(roots: RootsMap): string | undefined {
     const root = roots.size === 1 ? roots.values().next().value : undefined;
-    return root?.type === 'onedrive' ? root.key : undefined;
+    return root?.type === 'onedrive' || root?.type === 'demo' ? root.key : undefined;
 }
 
 /** Native retention follows a folder ID through renames within one connection. */
@@ -30,13 +30,13 @@ export function folderPinPathKey(sourceRootKey: string, connectionId: string | u
 
 /** Root variant that can be traversed as a folder tree. */
 export type WalkableRoot =
-    | Extract<Root, { readonly type: 'onedrive' }>
+    | Extract<Root, { readonly type: 'onedrive' | 'demo' }>
     | (Extract<Root, { readonly type: 'share' }> & { readonly folder: MusicFolder });
 
-/** Returns true when the root is traversable (onedrive/share with loaded folder). */
+/** A primary library or a share with a loaded folder can be traversed. */
 export function isWalkableRoot(root: Root | undefined): root is WalkableRoot {
     return root !== undefined
-        && (root.type === 'onedrive' || root.type === 'share')
+        && (root.type === 'onedrive' || root.type === 'share' || root.type === 'demo')
         && root.folder !== undefined;
 }
 

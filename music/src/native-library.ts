@@ -11,6 +11,10 @@ interface NativeAccountState {
     readonly driveID: string | null;
     readonly evidence: EvidenceState;
     readonly debugPlayback?: boolean;
+    readonly workspace?: 'demo';
+    readonly focusDemoTree?: boolean;
+    readonly focusProviderChooser?: boolean;
+    readonly demoOpenFailed?: boolean;
 }
 
 interface NativeResponse {
@@ -143,6 +147,11 @@ export function createNativeLibrary(handler: ReplyHandler) {
             if (state.evidence !== previous.evidence) library.onEvidenceChange(state.evidence, previous.evidence);
         },
         requireInteractiveReconnectForDebug: () => post({ op: 'debugRequireInteractiveReconnect' }),
+        openDemo: (attempt: string, focus: boolean) => post({op: 'demoOpen', attempt, focus}),
+        cancelDemoOpen: (attempt: string) => post({op: 'demoCancelOpen', attempt}),
+        demoCatalog: (refresh: boolean) => post({op: 'demoCatalog', refresh}),
+        openDemoCredits: () => post({op: 'demoCredits'}),
+        saveDeviceTheme: (theme: string) => post({op: 'deviceTheme', theme}),
         signOut: (theme: string) => post({ op: 'signOut', theme }),
         fetch: request,
         followContent: (url: string, signal?: AbortSignal) => request(url, false, { signal, timeoutMs: 30000 }, true),

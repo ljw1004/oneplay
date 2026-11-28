@@ -35,7 +35,7 @@ import { parsePrimaryDocument, ProviderHttpError, type PrimaryStore } from './pr
 /** I/O dependencies injected by the app entrypoint. In unit tests, supply
  *  throwing stubs so accidental I/O paths fail fast. */
 export interface FavoritesDeps {
-    documents: PrimaryStore;
+    documents?: PrimaryStore;
     fenceQueueEdit?: () => Promise<void> | undefined;
     dbGet<T>(key: string): Promise<T | undefined>;
     dbPut(key: string, value: unknown): Promise<void>;
@@ -172,6 +172,7 @@ export interface FavoritesData {
 export type Root =
     | { readonly type: 'onedrive'; readonly key: string; readonly name: string;
         readonly folder: MusicFolder; readonly info: import('./indexer.js').AccountInfo; readonly reindexing: boolean }
+    | { readonly type: 'demo'; readonly key: string; readonly name: string; readonly driveId: string; readonly folder: MusicFolder }
     | { readonly type: 'share'; readonly key: string; readonly name: string; readonly connectionId: string;
         readonly driveId: string; readonly folder?: MusicFolder; readonly reindexing: boolean }
     | { readonly type: 'shortcut'; readonly key: string; readonly name: string;
@@ -276,7 +277,7 @@ export interface Favorites {
     loadFromCache(): Promise<void>;
 
     /** Adopt a newer cloud document. True after reading a valid document or confirming a 404. */
-    pullFavoritesFromOneDrive(): Promise<boolean>;
+    pullFavoritesFromOneDrive(signal?: AbortSignal): Promise<boolean>;
 }
 
 // ---------------------------------------------------------------------------
@@ -579,7 +580,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' 
                 if (fenceQueue) await fenceQueue();
                 if (!suppressSaveForTests) await deps.dbPut(IDB_KEY, nextData);
             } catch (error) {
-                if (options.queueEdit || origin === 'pins' || origin === 'mode') throw error;
+                if (!deps.documents || options.queueEdit || origin === 'pins' || origin === 'mode') throw error;
                 logCatch('favorites:dbPut')(error);
             }
             data = nextData;
@@ -605,6 +606,8 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' 
      *  INVARIANT: only one cloud document write runs at a time.
      *  Multiple calls while upload is in-flight coalesce into one follow-up upload. */
     function scheduleOneDriveUploadFireAndForget(): void {
+        const documents = deps.documents;
+        if (!documents) return;
         uploadDirty = true;
         if (uploadRunning) return;     // already looping — the flag is enough
         uploadRunning = true;
@@ -613,7 +616,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' 
                 uploadDirty = false;   // clear before upload so mutations during upload re-set it
                 if (suppressSaveForTests) continue;
                 try {
-                    await deps.documents.write(DOCUMENT, JSON.stringify(data));
+                    await documents.write(DOCUMENT, JSON.stringify(data));
                     log('favorites: saved to OneDrive');
                 } catch (e) {
                     if (e instanceof ProviderHttpError) logError(`favorites: OneDrive save failed: ${e.status}`);
@@ -630,7 +633,10 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' 
      */
     const loadFromCache = async (): Promise<void> => {
         const loaded = await serializeWrite(async () => {
-            const cached = await deps.dbGet<FavoritesData>(IDB_KEY).catch(() => undefined);
+            const cached = deps.documents
+                ? await deps.dbGet<FavoritesData>(IDB_KEY).catch(() => undefined)
+                : await deps.dbGet<FavoritesData>(IDB_KEY);
+            if (!cached && !deps.documents) loadedMembership = true;
             if (!cached || !Array.isArray(cached.favorites)) return false;
             loadedMembership = true;
             data = normalizedData(cached);
@@ -645,10 +651,11 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' 
      * updatedAt, adopts it into module state, persists to IndexedDB, and
      * calls onChange(). 404 means no server-side favorites yet — not an error.
      */
-    const pullFavoritesFromOneDrive = async (): Promise<boolean> => {
-        if (suppressSaveForTests) return false;
+    const pullFavoritesFromOneDrive = async (signal?: AbortSignal): Promise<boolean> => {
+        if (suppressSaveForTests || !deps.documents) return false;
         try {
-            const text = await deps.documents.read(DOCUMENT);
+            const text = await deps.documents.read(DOCUMENT, signal);
+            signal?.throwIfAborted();
             if (text === null) {
                 loadedMembership = true;
                 return true;
@@ -656,6 +663,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' 
             const server = parsePrimaryDocument(text, 'favorites:onedrive-load') as FavoritesData;
             if (!server || !Array.isArray(server.favorites)) return false;
             const adopted = await commitEdit(() => {
+                if (signal?.aborted) return;
                 if (loadedMembership && (server.updatedAt || 0) <= data.updatedAt) return;
                 const next = normalizedData(server);
                 // Structural rows drive playback. Modes and offline settings can
@@ -678,6 +686,7 @@ export function createFavorites(deps: FavoritesDeps, onChange: (origin?: 'sync' 
             if (adopted) log(`favorites: adopted server version (updatedAt=${server.updatedAt})`);
             return true;
         } catch (error) {
+            if (signal?.aborted) return false;
             if (error instanceof ProviderHttpError) logError(`favorites: OneDrive load failed: ${error.status}`);
             else logCatch('favorites:onedrive-load')(error);
             return false;

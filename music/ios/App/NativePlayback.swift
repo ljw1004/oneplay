@@ -749,6 +749,14 @@ final class NativePlayback: @unchecked Sendable {
     /// UIKit memory pressure may discard any compressed block. Active readers can fetch it again.
     func releaseCachedAudio() { lock.withLock { pool.clear() } }
 
+    /// Park the audible anchor before replacing the player. Logout's stop clears the saved queue.
+    func parkAndCheckpointForProfileSwitch() {
+        lock.withLock {
+            _ = try? applyLocked("pause", item: nil, seconds: nil)
+            saveCheckpoint()
+        }
+    }
+
     /// Logout drains all in-flight bytes before removing the diagnostic recording. Retrying cleanup is safe.
     func stopAndDrain() async throws {
         lock.withLock { interruptedItem = nil; ticker?.cancel(); ticker = nil; store = nil; accessRevision = 0; accessDirty = false; spots.removeAll(); hasHistory = false; savedPoint = nil; savedCursor = nil; structureDirty = true; favorite = nil; folder = []; folderKey = ""; active?.cancel(); active = nil; catalog = []; canonical = []; slots = [:]; connectedShares = nil; deniedRoots = []; mode = .all; armTimer(playing: false); pool = MediaPool(unmeteredWiFi: pool.unmeteredWiFi) }
@@ -1152,7 +1160,7 @@ private final class PlaybackRun: @unchecked Sendable {
             terminal = state
             // A finished footer has no decoder. Explicit cancellation may be handing a
             // descriptor to its replacement in the caller's seek/next critical section.
-            if state != nil && (!cancelled || state == "error") { pinLeases.removeAll() }
+            if state != nil && (!cancelled || state == "error" || state == "unavailable") { pinLeases.removeAll() }
         }
         if state != nil { signalChange(false) }
         log.notice("\(text, privacy: .public)")
@@ -1330,7 +1338,8 @@ private final class PlaybackRun: @unchecked Sendable {
             report(error.errorDescription ?? "Playback failed", terminal: "error")
         } catch let error as NativeAccountError {
             diagnostics?.record("Playback lookup stopped: \(error.rawValue)")
-            report(error == .forbidden ? "OneDrive denied access to this recording" : "Playback lookup: \(error.rawValue)", terminal: "error")
+            if error == .missingRecording { report("This demo recording is unavailable", terminal: "unavailable") }
+            else { report(error == .forbidden ? "OneDrive denied access to this recording" : "Playback lookup: \(error.rawValue)", terminal: "error") }
         } catch {
             report("Playback failed (\((error as NSError).code))", terminal: "error")
         }
@@ -1686,7 +1695,8 @@ private final class PlaybackRun: @unchecked Sendable {
         }
         let source = try MediaRanges(media, drive: track.driveId, item: track.itemId, pool: pool, budget: budget, occurrence: ordinal, speculative: speculative, successorWindow: successorWindow, signalDebug: { [signalChange] in signalChange(true) }, trace: { [log] entry in
             log.info("range item=\(ordinal) \(entry, privacy: .public)")
-        }, diagnostic: { [diagnostics] event in diagnostics?.record("CDN item=\(ordinal) \(event)") }, awaitDemand: awaitDemand, renew: { [unowned self] rejected in try self.resolve(track, .replace(rejected)) })
+        }, diagnostic: { [diagnostics] event in diagnostics?.record("CDN item=\(ordinal) \(event)") }, awaitDemand: awaitDemand,
+            renew: { [unowned self] rejected in try self.resolve(track, .replace(rejected)) })
         source.onDecoderWait = setWaiting
         try lock.withLock {
             if cancelled { throw CancellationError() }

@@ -31,7 +31,7 @@ import {
 } from './db.js';
 import type { FolderPin } from './favorites.js';
 import type { EvidenceState } from './auth.js';
-import { MediaUnavailableError, ProviderHttpError, type BrowserMedia } from './provider.js';
+import { MediaTransientError, MediaUnavailableError, ProviderHttpError, type BrowserMedia } from './provider.js';
 import { log, logError, logCatch, errorMessage, errorDetail } from './logger.js';
 
 // ---------------------------------------------------------------------------
@@ -46,11 +46,11 @@ const QUOTA_LS_KEY = 'oneplay_music_quota_bytes';
 /** Both the tree arrow and the open dialog report the same local progress. Until an
  * index tells us about a missing file, an incomplete owner has nothing it can download. */
 export function classifyOfflineBadgeState(progress: PinProgress | undefined,
-    snapshot: Pick<DownloadSnapshot, 'evidence' | 'overQuota' | 'lastError'>,
+    snapshot: Pick<DownloadSnapshot, 'evidence' | 'overQuota' | 'lastError' | 'transferAllowed'>,
     paused: boolean): 'complete' | 'downloading' | 'paused' {
     if (progress?.complete && progress.downloaded === progress.total) return 'complete';
     if (!progress || progress.downloaded + (progress.unavailable ?? 0) >= progress.total || paused || snapshot.overQuota
-        || snapshot.lastError || snapshot.evidence !== 'evidence:signed-in') return 'paused';
+        || snapshot.lastError || !(snapshot.transferAllowed ?? (snapshot.evidence === 'evidence:signed-in'))) return 'paused';
     return 'downloading';
 }
 
@@ -70,6 +70,7 @@ export interface DownloadSnapshot {
     readonly overQuota: boolean;
     readonly lastError: string | undefined;
     readonly evidence: EvidenceState;
+    readonly transferAllowed?: boolean;
     readonly quotaBytes: number;
     readonly totalBytes: number;
 }
@@ -92,9 +93,7 @@ export interface Downloads {
      * Triggers queue recalculation immediately (pump remains evidence-gated).
      */
     setPinnedKeys(activeKeys: ReadonlySet<string>, retainKeys: ReadonlySet<string>, membershipComplete?: boolean): Promise<void>;
-    /** Notifies the download engine that evidence changed externally.
-     *  Reads current state from deps.getEvidence() and reacts (start/stop
-     *  pump, clear errors, notifyUI). */
+    /** Reconciles the pump and UI after a route or retry gate change. */
     handleEvidenceTransition(): void;
     /** Returns an offline blob for a track, or undefined if not cached. */
     getOfflineBlob(driveId: string, itemId: string): Promise<Blob | undefined>;
@@ -121,6 +120,8 @@ export interface DownloadsDeps {
     saveQuotaBytes(bytes: number): void;
     /** Returns the current evidence state (owned by auth module). */
     getEvidence(): EvidenceState;
+    /** Public media can attempt a transfer while reachability is still unknown. */
+    canTransfer?(): boolean;
     /** Delegates HTTP status evidence classification to auth evidence owner. */
     provideEvidenceFromHttpStatus(status: number, reason: string): EvidenceState;
     /** Delegates error evidence classification to auth evidence owner. */
@@ -156,6 +157,7 @@ export function createDownloads(
     deps: Partial<DownloadsDeps> & Pick<DownloadsDeps, 'download' | 'getEvidence' | 'provideEvidenceFromHttpStatus' | 'provideEvidenceFromError'>,
 ): Downloads {
     const d: DownloadsDeps = { ...defaultDeps, ...deps } as DownloadsDeps;
+    const canTransfer = d.canTransfer ?? (() => d.getEvidence() === 'evidence:signed-in');
 
     // -- State ---------------------------------------------------------------
 
@@ -243,7 +245,7 @@ export function createDownloads(
 
     function pumpDownloads(): void {
         while (!recalculating && activeDownloads < MAX_CONCURRENT && queue.length > 0
-            && d.getEvidence() === 'evidence:signed-in' && !overQuota) {
+            && canTransfer() && !overQuota) {
             const item = queue.shift()!;
             downloadOneTrack(item);
         }
@@ -275,7 +277,15 @@ export function createDownloads(
 
                 const save = d.audioPut(key, blob);
                 pendingSaves.add(save);
-                try { await save; } finally { pendingSaves.delete(save); }
+                try { await save; }
+                catch (error) {
+                    if (!signal.aborted) {
+                        dirty = true;
+                        lastError = 'Could not save the recording offline.';
+                        logError(`download storage error for ${key}: ${errorDetail(error)}`);
+                    }
+                    return;
+                } finally { pendingSaves.delete(save); }
                 if (signal.aborted) return;
                 files.set(key, blob.size);
                 totalBytes += blob.size;
@@ -298,12 +308,13 @@ export function createDownloads(
                     const target = d.provideEvidenceFromError(e, `downloads:timeout-or-abort:${key}`);
                     log(`downloads: evidence from error reason=timeout-or-abort key=${key} -> ${target}`);
                     logError(`download: connectivity lost (${errorDetail(e)}) → ${target}`);
-                } else if (msg.includes('fetch') || msg.includes('network') || msg.includes('Failed to fetch')) {
+                } else if (e instanceof MediaTransientError || msg.includes('fetch') || msg.includes('network')) {
                     // Transient network error: evidence owner maps to no-evidence/not-online.
                     queue.push(item);
                     const target = d.provideEvidenceFromError(e, `downloads:transient-network:${key}`);
                     log(`downloads: evidence from error reason=transient-network key=${key} -> ${target}`);
-                    logError(`download: transient network error for ${key}: ${errorDetail(e)} → ${target}`);
+                    const cause = e instanceof MediaTransientError ? e.cause ?? e : e;
+                    logError(`download: transient network error for ${key}: ${errorDetail(cause)} → ${target}`);
                 } else {
                     lastError = msg;
                     logError(`download error for ${key}: ${errorDetail(e)}`);
@@ -319,7 +330,7 @@ export function createDownloads(
                         && queue.length === 0
                         && activeDownloads === 0
                         && activeKeys.size > 0
-                        && d.getEvidence() === 'evidence:signed-in'
+                        && canTransfer()
                     ) {
                         queueDrainedLogged = true;
                         log(`downloads: queue drained downloaded=${files.size} retain=${retainKeys.size}`);
@@ -389,12 +400,9 @@ export function createDownloads(
         },
 
         handleEvidenceTransition() {
-            const newState = d.getEvidence();
-
-            if (newState === 'evidence:signed-in' && dirty) {
+            if (canTransfer() && dirty) {
                 recalculate().catch(logCatch('downloads: evidence inventory'));
-            } else if (newState === 'evidence:signed-in' && !dirty) {
-                // Not dirty but signed in: clear latched error, resume pump
+            } else if (canTransfer()) {
                 lastError = undefined;
                 pumpDownloads();
                 notifyUI();
@@ -403,10 +411,7 @@ export function createDownloads(
                 // evidence indicator, static ↓ icons) even though pump doesn't run.
                 notifyUI();
             }
-            // All non-signed-in states (no-evidence, signed-out, not-online):
-            // pump is already guarded by the d.getEvidence() === 'evidence:signed-in' check.
-            // No special action needed. In-flight downloads fail naturally via
-            // error classification.
+            // In-flight downloads handle a route change through their own completion.
         },
 
         async getOfflineBlob(driveId, itemId) {
@@ -420,6 +425,7 @@ export function createDownloads(
                 overQuota,
                 lastError,
                 evidence: d.getEvidence(),
+                transferAllowed: canTransfer(),
                 quotaBytes,
                 totalBytes,
             };
@@ -429,7 +435,7 @@ export function createDownloads(
             quotaBytes = gb * 1024 * 1024 * 1024;
             d.saveQuotaBytes(quotaBytes);
             dirty = true;
-            if (d.getEvidence() === 'evidence:signed-in') {
+            if (canTransfer()) {
                 recalculate().catch(logCatch('downloads: refresh inventory'));
             }
         },
@@ -437,7 +443,7 @@ export function createDownloads(
         async clearError() {
             lastError = undefined;
             dirty = true;
-            if (d.getEvidence() === 'evidence:signed-in') await recalculate();
+            if (canTransfer()) await recalculate();
             else notifyUI();
         },
 

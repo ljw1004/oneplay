@@ -46,7 +46,7 @@ export function buildMembersFromSelection(
             if (root?.type === 'onedrive') {
                 const ref = walkToItemRef(root.folder, root.info.driveId, subPath);
                 if (ref) members.push(ref);
-            } else if (root?.type === 'share') {
+            } else if (root?.type === 'share' || root?.type === 'demo') {
                 if (!root.folder) continue;
                 const ref = walkToItemRef(root.folder, root.driveId, subPath, root.key);
                 if (ref) members.push(ref);
@@ -56,7 +56,7 @@ export function buildMembersFromSelection(
                     const targetFolder = walkFolder(targetRoot.folder, root.target.path);
                     if (!targetFolder) continue;
                     const driveId = targetRoot.type === 'onedrive' ? targetRoot.info.driveId : targetRoot.driveId;
-                    const sourceRootKey = targetRoot.type === 'share' ? targetRoot.key : undefined;
+                    const sourceRootKey = targetRoot.type === 'onedrive' ? undefined : targetRoot.key;
                     const ref = walkToItemRef(targetFolder, driveId, subPath, sourceRootKey);
                     if (ref) {
                         members.push({

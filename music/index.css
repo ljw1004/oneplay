@@ -131,10 +131,32 @@ body{background:var(--bg-header);height:100%;display:flex;flex-direction:column;
 .startup-retry:active{background:var(--accent-ms-blue-active);}
 :is(.startup-retry,.signin-btn):focus{outline:2px solid var(--text-primary);outline-offset:3px;}
 .startup-retry:disabled{opacity:.65;cursor:default;}
-.index-progress{text-align:center;width:min(500px,100% - 32px);margin:0 auto;}
+#status:has(.library-chooser){justify-content:flex-start;min-height:0;overflow-y:auto;box-sizing:border-box;padding-bottom:var(--sab);}
+.library-chooser{width:min(100%,36rem);margin-block:auto;flex:none;padding:clamp(12px,3vw,24px);box-sizing:border-box;display:grid;gap:16px;text-align:left;}
+.library-chooser-heading{text-align:center;margin-bottom:8px;color:var(--text-heading);}
+.library-chooser-heading h1{margin:0;font-size:2rem;line-height:1.2;}
+.library-chooser-heading p{margin:6px 0 0;color:var(--text-secondary);font-size:1rem;}
+.library-chooser .library-choice{margin:0;min-height:64px;display:grid;grid-template-columns:28px minmax(0,1fr) 14px;align-items:center;gap:10px;padding:14px;background:var(--bg-surface);color:var(--text-primary);border:1px solid var(--border-share-list);border-radius:12px;text-align:left;font:inherit;cursor:pointer;}
+.library-chooser .library-choice:focus-visible{outline:2px solid var(--text-primary);outline-offset:3px;}
+.library-chooser .library-choice:active{background:var(--border-subtle);}
+.library-choice-icon{width:25px;height:25px;justify-self:center;fill:none;stroke:currentColor;stroke-width:2;stroke-linejoin:round;}
+.library-choice strong{display:block;font-size:1rem;}
+.library-choice strong + span,.library-choice-status{display:block;color:var(--text-secondary);font-size:.92rem;margin-top:4px;}
+.library-choice-next{position:relative;display:grid;place-items:center;color:var(--text-secondary);}
+.library-choice[aria-busy="true"] .library-choice-next{color:transparent;}
+.library-choice[aria-busy="true"] .library-choice-next::after{content:'';position:absolute;width:14px;height:14px;border:2px solid var(--text-secondary);border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite;}
+@media (prefers-reduced-motion:reduce){.library-choice[aria-busy="true"] .library-choice-next::after{animation:none;}}
+.library-choice-connection-status{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;}
+.library-choice-status:empty{display:none;}
+.settings-demo-summary a{color:inherit;text-decoration:underline;}
+/* Equal space above and below keeps the title fixed when Retry appears. */
+#status:not([hidden]):has(.index-progress){display:grid;grid-template:minmax(0,1fr) auto minmax(0,1fr) / minmax(0,1fr);align-items:start;min-height:0;overflow-y:auto;}
+.index-progress{grid-row:2;text-align:center;width:min(500px,100% - 32px);margin:0 auto;}
+.index-progress + .startup-retry{grid-row:3;justify-self:center;margin-top:16px;}
+.index-progress.startup-opening :is(.progress-bar,.status-line){visibility:hidden;}
 .progress-bar{width:100%;height:3px;background:var(--progress-track);border-radius:2px;overflow:hidden;margin:16px 0 8px;}
 .progress-fill{height:100%;background:var(--accent-ms-blue);width:0%;transition:width 0.3s ease;}
-.status-line{color:var(--text-tertiary);font-size:0.8rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.status-line{color:var(--text-tertiary);font-size:0.8rem;height:1lh;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .track-indicator{flex:0 0 auto;width:21px;height:21px;pointer-events:none;}
 .track-indicator path{fill:none;stroke:var(--accent-indicator);stroke-width:3;stroke-linecap:butt;stroke-linejoin:miter;}
 .track-indicator circle{fill:none;stroke:var(--accent-indicator);stroke-width:3;stroke-linecap:round;stroke-dasharray:28 32;transform-origin:center;transform-box:fill-box;animation:spin 1.2s linear infinite;}

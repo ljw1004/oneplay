@@ -323,14 +323,14 @@ export function runSearchSingleWalk(options: SearchOptions): SearchRunResult {
     }
 
     if (!isAtCap()) {
-        const onedriveRoots = [...options.roots.values()]
-            .filter((root): root is Extract<Root, { readonly type: 'onedrive' }> => root.type === 'onedrive')
+        const primaryRoots = [...options.roots.values()]
+            .filter((root): root is Extract<Root, { readonly type: 'onedrive' | 'demo' }> => root.type === 'onedrive' || root.type === 'demo')
             .sort((a, b) => a.key.localeCompare(b.key));
 
-        for (const root of onedriveRoots) {
+        for (const root of primaryRoots) {
             if (isAtCap()) break;
             if (options.deniedRootKeys.has(root.key)) continue;
-            walkPhysicalFolder(root.folder, root.info.driveId, root.key, ['OnePlay Music', root.key]);
+            walkPhysicalFolder(root.folder, root.type === 'onedrive' ? root.info.driveId : root.driveId, root.key, ['OnePlay Music', root.key]);
         }
     }
 

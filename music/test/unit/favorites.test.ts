@@ -29,11 +29,11 @@ import { type MusicFolder, type AccountInfo } from '../../src/indexer.js';
 // dbGet throws (never expected in these test paths).
 // ---------------------------------------------------------------------------
 
-const sinkDeps: FavoritesDeps = {
+const sinkDeps = {
     documents: { async read() { return null; }, async write() {} },
     dbGet() { throw new Error('unexpected dbGet in unit test'); },
     dbPut() { return Promise.resolve(); },
-};
+} satisfies FavoritesDeps;
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -649,6 +649,23 @@ describe('setOfflinePin', () => {
 });
 
 describe('playlist edit acknowledgment', () => {
+    it('keeps local-only favorites unchanged when a write fails', async () => {
+        let fail = true, published = 0;
+        const favs = createFavorites({...sinkDeps, documents: undefined, dbPut: async () => {
+            if (fail) throw new Error('disk full');
+        }}, () => { published++; });
+        const favorite = playlist('p', 'Road trip', []);
+        await assert.rejects(favs.add(favorite), /disk full/);
+        assert.deepEqual(favs.getAll(), []);
+        assert.equal(published, 0);
+        fail = false;
+        assert.equal(await favs.add(favorite), true);
+        fail = true;
+        await assert.rejects(favs.rename('p', 'New name'), /disk full/);
+        assert.deepEqual(favs.getAll(), [favorite]);
+        assert.equal(published, 1);
+    });
+
     it('rapid deletions resolve their displayed members after earlier edits move the rows', async () => {
         const {favs} = makeFavs();
         const [a, b, c, d] = ['A', 'B', 'C', 'D'].map(id => itemRef([id], id, false));

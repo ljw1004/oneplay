@@ -67,6 +67,8 @@ export interface Playback {
     playTrack(path: FolderPath, accounts: AccountsMap): Promise<void>;
     /** Build folder queue and play first playable entry. */
     playFolder(path: FolderPath, accounts: AccountsMap): Promise<void>;
+    /** Pause pending or audible playback and save the position before OAuth navigation. */
+    pauseAndCheckpoint(): void;
     /** Immediately release the media element and invalidate queued work on account sign-out. */
     stop(): void;
     /** Collapse expanded controls (used when entering select mode). */
@@ -125,6 +127,8 @@ export function createPlayback(
     footerEl: HTMLElement,
     playbackUrl: BrowserMedia['playbackUrl'],
     migrateLegacyFavorite?: (id: string) => Promise<void>,
+    storage: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> = localStorage,
+    database = {dbGet, dbPut},
 ): Playback {
     // -----------------------------------------------------------------------
     // State
@@ -295,7 +299,7 @@ export function createPlayback(
         if (!activeFavId || !activeFavHasPrivatePlayback || !current || !queue) return;
         const time = restoredCurrentTime ?? audioEl.currentTime;
         const state = buildFavoritePlaybackStorageValue(current.path, time, {key: current.key, folderKey: queue.folderKey, folder: queue.folder});
-        try { localStorage.setItem(`oneplay_music_fav:${activeFavId}`, state); } catch { /* quota */ }
+        try { storage.setItem(`oneplay_music_fav:${activeFavId}`, state); } catch { /* quota */ }
     };
 
     /** A large former pass lives in IDB. The global record points at the exact acknowledged snapshot. */
@@ -305,7 +309,7 @@ export function createPlayback(
             savedNeighbors = {snapshot};
         } else {
             const id = crypto.randomUUID();
-            await dbPut('oneplay_music_held', {id, snapshot});
+            await database.dbPut('oneplay_music_held', {id, snapshot});
             savedNeighbors = {snapshot, id};
         }
     }
@@ -318,14 +322,14 @@ export function createPlayback(
                     ? savedNeighbors.id ? {heldId: savedNeighbors.id} : {held: savedNeighbors.snapshot} : {})});
         // An acknowledged playlist mutation needs this structural record across a crash.
         // Routine playback remains available if the browser temporarily declines a save.
-        try { localStorage.setItem('oneplay_music_playback', state); } catch (error) { if (requireDurable) throw error; }
+        try { storage.setItem('oneplay_music_playback', state); } catch (error) { if (requireDurable) throw error; }
     };
 
     /** Saves oneplay_music_time separately so high-frequency writes stay small. */
     const saveMmTime = (): void => {
         if (!current) return;
         const time = restoredCurrentTime ?? audioEl.currentTime;
-        try { localStorage.setItem('oneplay_music_time', JSON.stringify({generation, time})); } catch { /* quota */ }
+        try { storage.setItem('oneplay_music_time', JSON.stringify({generation, time})); } catch { /* quota */ }
     };
     // -- Playback controls ---------------------------------------------------
     /** Starts playback without toggling pause state. */
@@ -884,7 +888,7 @@ export function createPlayback(
         audioEl.load();
         urlEngine.clearPrefetchState();
         urlEngine.revokeCurrentBlobUrl();
-        try { localStorage.removeItem('oneplay_music_playback'); localStorage.removeItem('oneplay_music_time'); } catch { /* quota */ }
+        try { storage.removeItem('oneplay_music_playback'); storage.removeItem('oneplay_music_time'); } catch { /* quota */ }
         updateFooter();
         view.onPlaybackChange(undefined);
     }
@@ -967,16 +971,16 @@ export function createPlayback(
         if (intent !== selection) return;
         const favorite = favoritesRef?.getAll().find(f => folder[1] === 'fav:' + f.id);
         let saved = !tapped && favorite?.hasPrivatePlayback
-            ? parseFavoritePlaybackStorageValue(localStorage.getItem('oneplay_music_fav:' + favorite.id)) : undefined;
+            ? parseFavoritePlaybackStorageValue(storage.getItem('oneplay_music_fav:' + favorite.id)) : undefined;
         if (!tapped && favorite?.hasPrivatePlayback && !saved?.key && (favorite.mode ?? playbackMode) !== 'shuffle') {
             if (migrateLegacyFavorite) {
                 // The initial membership may still be waiting on another share. Only its
                 // matched key can carry old time across an intervening edit.
                 await migrateLegacyFavorite(favorite.id);
-                saved = parseFavoritePlaybackStorageValue(localStorage.getItem('oneplay_music_fav:' + favorite.id));
+                saved = parseFavoritePlaybackStorageValue(storage.getItem('oneplay_music_fav:' + favorite.id));
                 if (!saved?.key) saved = undefined;
             } else if (!saved) {
-                const old = await dbGet<PerFavoritePlaybackState>('playback:' + favorite.id).catch(() => undefined);
+                const old = migrateLegacyFavorite ? await database.dbGet<PerFavoritePlaybackState>('playback:' + favorite.id).catch(() => undefined) : undefined;
                 if (old && Array.isArray(old.trackPath)) saved = {track: old.trackPath, time: old.currentTime};
             }
         }
@@ -1038,6 +1042,12 @@ export function createPlayback(
 
     const view: Playback = {
         getInfo,
+        pauseAndCheckpoint() {
+            pausePlayback();
+            saveMmPlayback();
+            saveMmTime();
+            savePlaybackStateFireAndForget();
+        },
         stop() {
             ++selection;
             pendingSave?.resolve();
@@ -1135,7 +1145,7 @@ export function createPlayback(
             const entry = initial.tracks.find(t => bookmark?.key ? t.key === bookmark.key : pathEquals(t.path, track));
             let orphan = entry ? undefined : bookmark?.held;
             if (!entry && bookmark?.heldId) {
-                const stored = await dbGet<{id: string; snapshot: HeldBookmark}>('oneplay_music_held');
+                const stored = await database.dbGet<{id: string; snapshot: HeldBookmark}>('oneplay_music_held');
                 if (selection) return true;
                 if (revision !== libraryRevision) return false;
                 if (stored?.id === bookmark.heldId) orphan = parseGlobalPlaybackSave({...bookmark, held: stored.snapshot})?.held;

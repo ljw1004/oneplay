@@ -36,6 +36,7 @@ const tests = {
     ...require('./test-wheel.cjs'),
     ...require('./test-folders.cjs'),
     ...require('./test-cases-startup.cjs'),
+    ...require('./test-cases-demo.cjs'),
 };
 
 let passed = 0;
@@ -48,7 +49,7 @@ function isSignInGateFailure(error) {
 
 /** Standalone fixtures seed an isolated origin before opening the app. */
 function usesStandaloneFixture(name) {
-    return name.startsWith('wheel:') || name.startsWith('folders:') || name.startsWith('startup:');
+    return name.startsWith('wheel:') || name.startsWith('folders:') || name.startsWith('startup:') || name.startsWith('demo:');
 }
 
 /** Capture full localStorage snapshot for the current page origin. */

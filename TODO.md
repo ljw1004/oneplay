@@ -12,17 +12,6 @@ The issue is that `drive.file` scope is available to everyone, but `files.downlo
 
 Prior to Google Validation, we can let it be used for up to 100 users (lifetime cumulative users). They will see a warning sign when they connect that this is an unvalidated app. We need to do this anyway, because full validation submission is only done for a working app, where we can submit a video showing how it works. There is uncertainty whether they will validate us: their policy is that `files.download` is for only a narrow range of programs, e.g. file sync, not for arbitrary apps; we don't know whether our app (which does indeed have syncing) will pass muster.
 
-## Demo music
-
-For iOS app store submission we have to provide a demo signin. The problem is that OneDrive doesn't have demo signin that we can share with reviewers (it always has some kind of MFA, e.g. an SMS to our number, or an email to our primary address, or a passkey). So we'll need some kind of demo account.
-
-Also a demo account is just good practice, so users can try our app without a lengthy sync of their own music collection.
-
-My idea is that the app's primary signin will be with one of the proper providers (OneDrive, Google Drive, Dropbox, Demo). That's where index files will be stored. And then they can afterwards do "add additional account" which offers readonly access to other signins: full signin into any of OneDrive, Google, Dropbox, or a share link from OneDrive.
-
-The Demo will provider can be implemented under the hood with (1) a share link from my onedrive account `oneplay-test@outlook.com` which has 2gb of free music, and index files can be pregenerated there, (2) favorites and other things can be stored locally. By backing the actual files with a onedrive share, we'll be able to re-use a lot of our MS Graph implementation.
-
-
 ## OnePlay Video
 
 **Start with the workout.** Pick *Pumpin’*, a playlist drawn from a OneDrive folder of ’80s and ’90s music videos, tap Shuffle, and cast it to the living-room Chromecast. The appeal is the surprise of what comes on next, like watching MTV. Someone who has arranged *My treadmill workout* to match a warm-up, a run, and a cooldown can press All to play it in order. Music’s five playback modes cover both uses (All, Repeat, Shuffle, One, and Timer).
@@ -39,13 +28,3 @@ The Demo will provider can be implemented under the hood with (1) a share link f
 2. Cast a BBC episode, try its subtitles, and seek halfway through. Stop casting, then resume on the phone the following night. This tests the bookmark and whether the actual rip’s video, audio, and subtitles work on both screens. [Cast media support](https://developers.google.com/cast/docs/media)
 
 **Later options.** For offline viewing, consider downloading a selected episode or playlist with its size shown up front. For a home NAS, establish how the Chromecast would fetch the video as well as how OnePlay would browse the share. A media server such as Jellyfin is worth exploring if the collection needs format conversion. [Jellyfin playback options](https://jellyfin.org/docs/general/post-install/transcoding/)
-
-## Attach behaviors to existing folders
-
-The player has one active playback mode. Each favorite remembers the last mode the listener picked while playing it, independently of “Remember my spot”. Starting the favorite or a song within it restores that mode. A favorite with no saved mode uses the current mode. Playing a folder under OneDrive or a share uses the existing Play button and carries on in the current mode.
-
-Long-press a folder under OneDrive or a share, then tap the folder icon at the bottom right of the action bar. Its actions manage offline availability for the whole subtree. A partially offline folder offers both **Make available offline** and **Make unavailable offline**. The latter removes folder pins on that folder and its descendants. When a pinned ancestor already covers the selected folder, hide the folder menu. The breadcrumb trail shows the pinned ancestor.
-
-Folder pins sync across the listener’s devices through the same local save and best-effort upload as favorites. An offline edit is saved on the device. A refresh adopts newer cloud data. A later successful favorites save uploads the current local document. Disconnecting a share forgets its folder pins, including if the listener later reconnects the same share. Each device downloads its own files and reports its own progress. Removing the last pin clears its mark. The browser’s existing cache policy can keep the downloaded audio. Show the existing solid down-arrow after the name of the explicitly pinned folder and a dotted down-arrow on its ancestors. Folders covered by a pinned ancestor have no arrow. The dotted arrow has the same animated and hitting-a-wall variants as the solid arrow. Only folder pins contribute to these folder arrows. A track kept by a playlist or shortcut can still play offline after its folder pin is removed.
-
-M18 targets the current browser and bundled iOS apps. There are no existing users to migrate.

@@ -88,6 +88,7 @@ export interface IndexSyncController {
     buildSettingsShareRows(): SettingsShareRow[];
     updateSettingsIndexSection(): void;
     cancelScheduledPull(): void;
+    drainPullsAfterAdmissionCloses(): Promise<void>;
     requestPullFromOneDrive(source: PullSource): Promise<void>;
     onShareAdded(record: ShareRecordPersisted): void;
     onShareRemoved(record: ShareRecordPersisted): Promise<void>;
@@ -186,6 +187,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
 
     // The remote cache uses one namespace per link. Order a dispatched Graph PUT
     // before DELETE so old cleanup cannot erase the next build. Cached browsing can proceed.
+    let pullController: AbortController | undefined;
     let shareBuild: { recordID: string; cancel: AbortController; done: Promise<void> } | undefined;
     const deletingShareCaches = new Map<string, Promise<void>>();
     const stillConnected = (record: ShareRecordPersisted): boolean =>
@@ -357,8 +359,9 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         else deps.showOpeningFailure(offline);
     };
 
-    const fetchFreshAccountInfoOrHandleAuthFailures = async (wasInitialStartup: boolean): Promise<AccountInfo | undefined> => {
-        const freshInfo = await deps.oneDrive.fetchAccountInfo();
+    const fetchFreshAccountInfoOrHandleAuthFailures = async (wasInitialStartup: boolean, signal: AbortSignal): Promise<AccountInfo | undefined> => {
+        const freshInfo = await deps.oneDrive.fetchAccountInfo(signal);
+        if (!deps.canPull()) return undefined;
         if (freshInfo === 'network') {
             logError('failed to fetch account info (network)');
             browserAuth?.transition('no-evidence');
@@ -416,8 +419,8 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         cachedDataRef = cachedData;
     };
 
-    const fetchMusicFolderMetadata = async (): Promise<MusicDriveItem | undefined> => {
-        const musicR = await deps.oneDrive.probeMusicFolder();
+    const fetchMusicFolderMetadata = async (signal: AbortSignal): Promise<MusicDriveItem | undefined> => {
+        const musicR = await deps.oneDrive.probeMusicFolder(signal);
         if (!musicR.ok) {
             logError(`music folder fetch failed: ${musicR.status}`);
             showPrimaryOpeningFailure(musicR.status === 401);
@@ -430,6 +433,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         freshInfo: AccountInfo,
         musicDriveItem: MusicDriveItem,
         cachedData: MusicData | undefined,
+        signal: AbortSignal,
     ): Promise<void> => {
         if (isCurrentIndex(cachedData, musicDriveItem)) {
             log('cache is current, no re-index needed');
@@ -462,11 +466,16 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
                     if (!isReindex) deps.showIndexProgress(p);
                 },
                 freshInfo.driveId,
+                undefined,
+                signal,
             );
+            if (signal.aborted || !deps.canPull()) return;
             // Only publish membership that can survive an offline reopen.
             await dbPut(indexKey(freshInfo.driveId), data);
+            if (!deps.canPull()) return;
             deps.showTree(freshInfo, data);
         } catch (e) {
+            if (signal.aborted) return;
             // A partial first installation already closed admission. Leave its
             // retry screen in place and stop all remaining tree-dependent work.
             if (!deps.canPull()) throw e;
@@ -490,7 +499,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         browserAuth?.transition('evidence:signed-in');
     };
 
-    const probeShareRootsConcurrently = async (): Promise<Map<string, ShareProbeResult>> => {
+    const probeShareRootsConcurrently = async (signal: AbortSignal): Promise<Map<string, ShareProbeResult>> => {
         const shares = getShares();
         if (!shares) return new Map();
         const records = shares.getAll();
@@ -498,9 +507,9 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
             const startedAt = Date.now();
             const applyAccess = native?.beginSourceProbe(share.rootKey);
             try {
-                const r = await deps.oneDrive.probeShareRoot(share.driveId, share.rootItemId);
+                const r = await deps.oneDrive.probeShareRoot(share.driveId, share.rootItemId, signal);
                 const durationMs = Date.now() - startedAt;
-                if (!stillConnected(share)) return { share, status: 'skipped' };
+                if (signal.aborted || !stillConnected(share)) return { share, status: 'skipped' };
                 if (!r.ok) {
                     if (native && (r.status === 401 || r.headers.has('X-OnePlay-Account-Error'))) {
                         // MSAL lost the account. Keep this share's last permission state and cached tracks.
@@ -519,7 +528,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
                     return { share, status: 'failed', failureMessage };
                 }
                 const item = await readGraphJson(r, 'share probe');
-                if (!stillConnected(share)) return { share, status: 'skipped' };
+                if (signal.aborted || !stillConnected(share)) return { share, status: 'skipped' };
                 // Missing/malformed metadata is not a permission result. A verified response
                 // for this exact item can establish that it is no longer a folder.
                 if (native && item?.id !== share.rootItemId) return {share, status: 'failed'};
@@ -533,7 +542,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
                 log(`share probe ok: ${share.name} (${durationMs}ms)`);
                 return { share, status: 'ok', driveItem: item };
             } catch (e) {
-                if (!stillConnected(share)) return { share, status: 'skipped' };
+                if (signal.aborted || !stillConnected(share)) return { share, status: 'skipped' };
                 logCatch(`share probe ${share.name}`)(e);
                 const failureMessage = errorMessage(e);
                 setLatestIndexFailureFromMessageAndPushUi(share.name, `Probe failed (${failureMessage})`);
@@ -549,6 +558,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         for (const share of shares.getAll()) {
             const deleting = deletingShareCaches.get(share.shareId);
             if (deleting) await deleting;
+            if (!deps.canPull()) return;
             const probe = probes.get(share.shareId);
             if (!stillConnected(share) || probe?.share.id !== share.id) continue;
             const driveItem = probe?.driveItem;
@@ -625,14 +635,16 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
     const pullMusicFolderFromOneDriveInner = async (
         savedInfo: AccountInfo | undefined,
         cachedData: MusicData | undefined,
+        signal: AbortSignal,
     ): Promise<void> => {
         const wasInitialStartup = isInitialStartup;
         isInitialStartup = false;
         currentFolders.clear();
         await deps.ensureFavorites();
         await deps.ensureShares();
-        const freshInfo = await fetchFreshAccountInfoOrHandleAuthFailures(wasInitialStartup);
-        if (!freshInfo) return;
+        signal.throwIfAborted();
+        const freshInfo = await fetchFreshAccountInfoOrHandleAuthFailures(wasInitialStartup, signal);
+        if (!freshInfo || !deps.canPull()) return;
         writeFreshAccountInfoIntoStateAndSetSignedIn(freshInfo);
 
         const evidence = browserAuth?.reconcileEvidenceFromNavigator('index-sync:auto-redirect:token-refresh');
@@ -647,51 +659,55 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
             : cachedData;
         showTreeFromCachedDataIfPresent(freshInfo, cacheForThisAccount);
         const favorites = getFavorites();
-        const favoritesRead = favorites?.pullFavoritesFromOneDrive().then(checked => {
+        const favoritesRead = favorites?.pullFavoritesFromOneDrive(signal).then(checked => {
             // Favorites and shares open independently. Invalidated browser
             // credentials can establish recovery before the shares read returns.
             if (browserAuth?.isSignedIn() === false) showPrimaryOpeningFailure();
             return checked;
         });
-        const sharesChecked = await getShares()?.pullFromOneDrive();
+        const sharesChecked = await getShares()?.pullFromOneDrive(signal);
+        if (!deps.canPull()) { await favoritesRead; return; }
         await loadShareIndexesFromCacheIntoState();
         syncShareRootsIntoTreeAndPlayback();
         browserAuth?.transition('evidence:signed-in');
 
         const [musicDriveItem, shareProbes] = await Promise.all([
-            fetchMusicFolderMetadata().catch(error => {
+            fetchMusicFolderMetadata(signal).catch(error => {
+                if (signal.aborted) return undefined;
                 logCatch('music folder probe')(error);
                 setLatestIndexFailureFromErrorAndPushUi('OneDrive', error);
                 showPrimaryOpeningFailure();
                 return undefined;
             }),
-            probeShareRootsConcurrently(),
+            probeShareRootsConcurrently(signal),
         ]);
         setSettingsCheckingForUpdatesInFlight(false);
+        if (!deps.canPull()) { await favoritesRead; return; }
         if (musicDriveItem) {
             log(`music folder: ${musicDriveItem.name}, size=${musicDriveItem.size}`);
-            await refreshIndexIfNeeded(freshInfo, musicDriveItem, cacheForThisAccount);
+            await refreshIndexIfNeeded(freshInfo, musicDriveItem, cacheForThisAccount, signal);
         }
         getTree()?.setSyncing(false);
         // Primary and share access are independent; a failed Music probe cannot cancel a healthy share refresh.
-        await refreshShareIndexesSequentially(shareProbes);
+        if (deps.canPull()) await refreshShareIndexesSequentially(shareProbes);
         syncShareRootsIntoTreeAndPlayback();
         const favoritesChecked = await favoritesRead;
         const tree = getTree();
         // Healing can upload a rewritten document. Wait for the cloud intent and its sources before doing so.
-        if (tree && favorites && favoritesChecked && sharesChecked) await favorites.heal(tree.getRoots(), currentFolders);
+        if (deps.canPull() && tree && favorites && favoritesChecked && sharesChecked) await favorites.heal(tree.getRoots(), currentFolders);
         deps.computeAndPushOfflineState();
     };
 
     const pullMusicFolderFromOneDrive = async (
         savedInfo: AccountInfo | undefined,
         cachedData: MusicData | undefined,
+        signal: AbortSignal,
     ): Promise<void> => {
         getTree()?.setSyncing(true);
         latestIndexProgress = undefined;
         updateSettingsIndexSection();
         try {
-            await pullMusicFolderFromOneDriveInner(savedInfo, cachedData);
+            await pullMusicFolderFromOneDriveInner(savedInfo, cachedData, signal);
         } finally {
             if (deps.hasInstalledTree()) getTree()?.setSyncing(false);
             latestIndexProgress = undefined;
@@ -701,7 +717,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
 
     const scheduleNextPull = (delayMs = PULL_INTERVAL_MS): void => {
         clearTimeout(pullTimer);
-        if (pullInFlightPromise || !deps.hasInstalledTree()) return;
+        if (pullInFlightPromise || !deps.canPull() || !deps.hasInstalledTree()) return;
         const ev = deps.auth.getEvidence();
         if (ev === 'evidence:not-online' || ev === 'evidence:signed-out') return;
         pullTimer = setTimeout(() => {
@@ -746,12 +762,14 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         clearLatestIndexFailureIntoRuntimeStateAndPushUi();
         const startedAt = Date.now();
         setSettingsCheckingForUpdatesInFlight(true);
+        const controller = new AbortController();
+        pullController = controller;
         pullInFlightPromise = (async () => {
             log(`pull: start (${source})`);
             try {
-                await pullMusicFolderFromOneDrive(savedInfoRef, cachedDataRef);
+                await pullMusicFolderFromOneDrive(savedInfoRef, cachedDataRef, controller.signal);
             } catch (e) {
-                logError(`pull failed (${source}): ${errorDetail(e)}`);
+                if (!controller.signal.aborted) logError(`pull failed (${source}): ${errorDetail(e)}`);
             } finally {
                 const opening = deps.canPull() && !deps.hasInstalledTree();
                 const offline = opening && reconcileEvidenceAndCheckOffline();
@@ -767,6 +785,7 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
                 log(`pull: complete (${source}; ${elapsedMs}ms)`);
                 setSettingsCheckingForUpdatesInFlight(false);
                 pullInFlightPromise = undefined;
+                pullController = undefined;
                 updateSettingsIndexSection();
                 if (recovery) await requestPullFromOneDrive(recovery);
                 else scheduleNextPull();
@@ -826,6 +845,12 @@ export function createIndexSync(deps: IndexSyncDeps): IndexSyncController {
         buildSettingsShareRows,
         updateSettingsIndexSection,
         cancelScheduledPull,
+        async drainPullsAfterAdmissionCloses() {
+            cancelScheduledPull();
+            pullController?.abort();
+            shareBuild?.cancel.abort();
+            await pullInFlightPromise;
+        },
         requestPullFromOneDrive,
         onShareAdded,
         onShareRemoved,

@@ -3,12 +3,13 @@ import { isFavRef, type PlaylistMember, type Favorite, type FolderPin, type Root
 import { logCatch } from './logger.js';
 import type { NativeLibrary } from './native-library.js';
 import { isMusicFolder, walkFolder, type MusicFolder } from './indexer.js';
-import { folderPinOwnerId, folderPinPathKey, resolveWalkableRootForItemRef } from './roots.js';
+import { folderPinOwnerId, folderPinPathKey, isWalkableRoot, resolveWalkableRootForItemRef } from './roots.js';
 
 interface Inventory {
     revision: number;
     files?: Record<string, number>;
     queuedCount: number;
+    transferAllowed?: boolean;
     unavailable?: Record<string, string>;
     added?: Record<string, number>;
     quota: number;
@@ -50,7 +51,7 @@ async function walkOwner(start: PlaylistMember, sources: Sources, current: () =>
         const parent = ref.path.length ? walkFolder(root.folder, ref.path.slice(0, -1)) : undefined;
         const node = ref.path.length ? parent?.children[ref.path.at(-1)!] : root.folder;
         if (!node || node.id !== ref.itemId || isMusicFolder(node) !== ref.isFolder) { complete = false; continue; }
-        if (root.reindexing) complete = false;
+        if (root.type !== 'demo' && root.reindexing) complete = false;
         let seen = seenFolders.get(root.key);
         if (!seen) seenFolders.set(root.key, seen = new Set());
         const pending: [string, typeof node][] = [[ref.path.at(-1) ?? '', node]];
@@ -81,6 +82,7 @@ export function createOfflinePins(backend: NativeLibrary | Downloads, render: (p
     // The browser supplies its live map on each full notification. Swift supplies deltas.
     let sizes: ReadonlyMap<string, number> = nativeFiles;
     let queuedCount = 0;
+    let transferAllowed: boolean | undefined;
     let unavailable = new Map<string, string | undefined>();
     let reverse = new Map<string, Set<string>>();
     let counts = new Map<string, PinProgress>();
@@ -159,6 +161,7 @@ export function createOfflinePins(backend: NativeLibrary | Downloads, render: (p
                 try {
                     const sample = await library.pins('snapshot', {after: revision ?? null}) as Inventory;
                     queuedCount = sample.queuedCount;
+                    transferAllowed = sample.transferAllowed;
                     const changed = applyInventory(Object.entries(sample.files ?? sample.added ?? {}), !!sample.files);
                     for (const [key, reason] of Object.entries(sample.unavailable ?? {})) markUnavailable(key, reason);
                     revision = sample.revision;
@@ -274,7 +277,7 @@ export function createOfflinePins(backend: NativeLibrary | Downloads, render: (p
         getSnapshot(): DownloadSnapshot {
             if (browser) return browser.getSnapshot();
             return {files:sizes, queuedCount, overQuota: totalBytes > quotaBytes, lastError,
-                evidence: library!.getEvidence(), quotaBytes, totalBytes};
+                evidence: library!.getEvidence(), transferAllowed, quotaBytes, totalBytes};
         },
         async setQuota(gb: number) {
             if (browser) return browser.setQuota(gb);
@@ -320,7 +323,7 @@ export function createOfflinePins(backend: NativeLibrary | Downloads, render: (p
             if (!favoritesKnown) return;
             // Tree rendering recreates root wrappers. Only source folder identity, reindexing,
             // denial and favorite edits can invalidate physical membership.
-            const physical: RootsMap = new Map([...roots].filter(([, r]) => r.type === 'onedrive' || r.type === 'share'));
+            const physical: RootsMap = new Map([...roots].filter(([, r]) => r.type === 'share' || isWalkableRoot(r)));
             const prev = latest;
             const unchanged = prev && prev.sharesKnown === sharesKnown && prev.pins === pins
                 && prev.favorites.length === favorites.length && favorites.every((f,i) => {
@@ -333,7 +336,7 @@ export function createOfflinePins(backend: NativeLibrary | Downloads, render: (p
                 && prev.denied.size === denied.size && [...denied].every(k => prev.denied.has(k))
                 && prev.roots.size === physical.size && [...physical].every(([k,r]) => {
                     const old = prev.roots.get(k);
-                    return old && 'folder' in r && 'folder' in old && r.folder === old.folder && r.reindexing === old.reindexing
+                    return old && 'folder' in r && 'folder' in old && r.folder === old.folder && ('reindexing' in r && r.reindexing) === ('reindexing' in old && old.reindexing)
                         && (r.type !== 'share' || (old.type === 'share' && r.connectionId === old.connectionId));
                 });
             if (unchanged) return;

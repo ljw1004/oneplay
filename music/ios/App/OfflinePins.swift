@@ -56,8 +56,12 @@ private struct PinManifest: Codable, Equatable {
     var onChange: (() -> Void)?
     var onFinishEvents: (() -> Void)?
     var allowsSource: (String) -> Bool = { _ in true }
+    var allowsMediaKey: (String) -> Bool = { _ in true }
+    private var publicMedia = false
     var lookup: ((String, String, MediaLookup) async throws -> MediaLocation)?
     var completeKeys: Set<String> { Set(sizes.keys) }
+    // Cached public pins can let the transfer itself test an uncertain route.
+    private var canTransfer: Bool { evidence == "evidence:signed-in" || (publicMedia && evidence == "no-evidence") }
 
     /// Session creation is delayed until the account and its inventory are ready to receive daemon callbacks.
     func connectSession() async {
@@ -151,10 +155,13 @@ private struct PinManifest: Codable, Equatable {
         for task in await session.allTasks { task.cancel() }
     }
 
-    func updateEvidence(_ value: String) {
-        guard value != evidence else { return }
+    func updateEvidence(_ value: String, publicMedia: Bool? = nil) {
+        let nextPolicy = publicMedia ?? self.publicMedia
+        guard value != evidence || nextPolicy != self.publicMedia else { return }
+        let wasAllowed = canTransfer
         evidence = value
-        if value == "evidence:signed-in" { resumePending() }
+        self.publicMedia = nextPolicy
+        if !wasAllowed && canTransfer { resumePending() }
         changed()
     }
 
@@ -206,7 +213,7 @@ private struct PinManifest: Codable, Equatable {
         var wanted = Set<String>(), retained = Set<String>()
         for owner in manifest.owners.values {
             retained.formUnion(owner.retained)
-            for (root, keys) in owner.sources where !owner.paused && allowsSource(root) { wanted.formUnion(keys) }
+            for (root, keys) in owner.sources where !owner.paused && allowsSource(root) { wanted.formUnion(keys.filter(allowsMediaKey)) }
         }
         for (key, timer) in delayed where !wanted.contains(key) { timer.cancel(); delayed[key] = nil }
         retryCount = retryCount.filter { wanted.contains($0.key) }
@@ -272,7 +279,8 @@ private struct PinManifest: Codable, Equatable {
 
     /// A gap or policy change requires a full inventory. Ordinary completions cross WebKit as bounded deltas.
     func snapshot(after: Int?) -> [String: Any] {
-        var result: [String: Any] = ["revision": revision, "quota": manifest.quota, "total": total, "queuedCount": missing.count]
+        var result: [String: Any] = ["revision": revision, "quota": manifest.quota, "total": total,
+                                     "queuedCount": missing.count, "transferAllowed": canTransfer]
         if let after, after <= revision, after == revision || after >= (deltas.first?.revision ?? revision + 1) - 1 {
             result["added"] = Dictionary(uniqueKeysWithValues: deltas.filter { $0.revision > after }.compactMap { d in sizes[d.key].map { (d.key, $0) } })
         } else {
@@ -322,7 +330,7 @@ private struct PinManifest: Codable, Equatable {
     }
 
     private func pump() {
-        guard attached, storage != nil, evidence == "evidence:signed-in", total <= manifest.quota else { return }
+        guard attached, storage != nil, canTransfer, total <= manifest.quota else { return }
         for key in missing where resolving[key] == nil && running[key] == nil && failures[key] == nil && delayed[key] == nil {
             if resolving.count + running.count >= 2 { break }
             startLookup(key, retry: renew.contains(key))
@@ -338,7 +346,7 @@ private struct PinManifest: Codable, Equatable {
                 let media = try await lookup(String(parts[0]), String(parts[1]), retry ? .fresh : .reuse())
                 try Task.checkCancellation()
                 guard manifest.binding == binding, eligible.contains(key), storage != nil else { return }
-                guard evidence == "evidence:signed-in" else { resolving[key] = nil; return }
+                guard canTransfer else { resolving[key] = nil; return }
                 let ticket = Ticket(binding: binding, key: key, size: media.size, version: media.etag, retry: retry)
                 let description = String(decoding: try JSONEncoder().encode(ticket), as: UTF8.self)
                 let task = session.downloadTask(with: media.url)
@@ -363,10 +371,10 @@ private struct PinManifest: Codable, Equatable {
                 let cause = NativeAccountError.classify(error)
                 let message: String
                 switch cause {
-                case .transient: message = "Couldn’t reach OneDrive for this recording."
-                case .forbidden: message = "This recording is unavailable to this account on OneDrive."
+                case .transient: message = publicMedia ? "Couldn’t reach the demo recording." : "Couldn’t reach OneDrive for this recording."
+                case .forbidden, .missingRecording: message = publicMedia ? "This demo recording is unavailable." : "This recording is unavailable to this account on OneDrive."
                 case .interactionRequired: message = "Sign in to OneDrive to download this recording."
-                default: message = "OneDrive didn’t provide download details for this recording."
+                default: message = publicMedia ? "Couldn’t open the demo recording." : "OneDrive didn’t provide download details for this recording."
                 }
                 failed(key, transient: cause == .transient, message: message)
             }
@@ -387,9 +395,9 @@ private struct PinManifest: Codable, Equatable {
             if status == 206 {
                 renew.insert(ticket.key)
                 failed(ticket.key, transient: true, message: "The server sent only part of the recording.")
-            } else if [401,403,404].contains(status), !ticket.retry { renew.insert(ticket.key) }
+            } else if !publicMedia, [401,403,404].contains(status), !ticket.retry { renew.insert(ticket.key) }
             else {
-                failed(ticket.key, transient: status == 408 || status == 429 || status >= 500,
+                failed(ticket.key, transient: publicMedia ? status != 404 && status != 410 : status == 408 || status == 429 || status >= 500,
                        message: "Download returned HTTP " + String(status) + ".",
                        minimumDelay: min(3600, Int(http?.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 0))
             }
@@ -406,7 +414,7 @@ private struct PinManifest: Codable, Equatable {
             guard size == ticket.size else {
                 // A short transfer or a changed recording needs current Graph metadata and a new URL.
                 renew.insert(ticket.key)
-                failed(ticket.key, transient: true, message: "The downloaded size differs from OneDrive’s.")
+                failed(ticket.key, transient: true, message: publicMedia ? "The demo download returned a different size." : "The downloaded size differs from OneDrive’s.")
                 return
             }
             try PinReceipt(size: size, version: ticket.version).write(to: location)

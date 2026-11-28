@@ -118,8 +118,8 @@ export function createOneDriveProvider(
         media,
 
         /** A 4xx proves connectivity, including a failed refresh mapped to 400. A 5xx supplies no evidence. */
-        async fetchAccountInfo(): Promise<AccountInfo | 'auth' | 'network'> {
-            const response = await authFetch(`${graph}/me/drive?$select=id,owner`, false);
+        async fetchAccountInfo(signal?: AbortSignal): Promise<AccountInfo | 'auth' | 'network'> {
+            const response = await authFetch(`${graph}/me/drive?$select=id,owner`, false, { signal });
             if (!response.ok) {
                 logError(`fetchAccountInfo: ${response.status} ${response.statusText}`);
                 return response.status >= 400 && response.status < 500 ? 'auth' : 'network';
@@ -129,11 +129,11 @@ export function createOneDriveProvider(
         },
 
         /** Keep the native account proof on the original response. */
-        probeMusicFolder: () => authFetch(`${graph}/me/drive/special/music?$select=${folderFields}`, false,
-            { cache: 'no-store' }), // Recursive size can change without a new folder ETag.
-        probeShareRoot: (driveId: string, rootItemId: string) => authFetch(
+        probeMusicFolder: (signal?: AbortSignal) => authFetch(`${graph}/me/drive/special/music?$select=${folderFields}`, false,
+            { cache: 'no-store', signal }), // Recursive size can change without a new folder ETag.
+        probeShareRoot: (driveId: string, rootItemId: string, signal?: AbortSignal) => authFetch(
             `${graph}/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(rootItemId)}?$select=${folderFields}`,
-            false, { cache: 'no-store' }), // Recursive size can change without a new folder ETag.
+            false, { cache: 'no-store', signal }), // Recursive size can change without a new folder ETag.
 
         /** Run the existing schema-1 builder with the bound batch and redirect transport. */
         buildAndCacheIndex: (item: MusicDriveItem, onProgress: (progress: IndexProgress) => void,

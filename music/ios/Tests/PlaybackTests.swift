@@ -84,6 +84,22 @@ final class PlaybackTests: XCTestCase {
         XCTAssertThrowsError(try ranges.read(0, 1)) { XCTAssertTrue($0 is CancellationError) }
     }
 
+    func testImmutableMissingRecordingsDoNotRenew() throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PinCDN.self]
+        let pool = MediaPool(configuration: configuration)
+        for path in ["missing", "gone"] {
+            let location = MediaLocation(url: URL(string: "https://pin.test/" + path)!, etag: path,
+                                         size: 512_000, immutable: true)
+            let reader = try MediaRanges(location, item: path, pool: pool, speculative: false, trace: { _ in }, renew: { _ in
+                XCTFail("An absent immutable recording has no URL to renew")
+                throw NativeAccountError.invalidRequest
+            })
+            XCTAssertThrowsError(try reader.read(0, 1)) { XCTAssertEqual($0 as? NativeAccountError, .missingRecording) }
+            reader.cancelAndDrain()
+        }
+    }
+
     /// A high-bitrate opening makes a headerless VBR song look short. A relative skip can still land in it.
     func testRelativeSkipCanPassProvisionalDuration() async throws {
         let high = Data([0xff, 0xfb, 0xe0, 0]) + Data(repeating: 0, count: 1040)

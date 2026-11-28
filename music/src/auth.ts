@@ -9,7 +9,7 @@
  *   1. User clicks sign-in → PKCE redirect to Microsoft → redirect back with ?code=
  *   2. handleOauthRedirect() exchanges code for access_token + refresh_token
  *   3. auth.fetch() adds Bearer header; on 401 it tries refresh_token grant
- *   4. Tokens live in localStorage; sign-out clears them and redirects to Microsoft logout
+ *   4. Explicit app sign-out closes OneDrive transport and invalidates local tokens.
  *
  * Evidence state:
  *   auth.fetch() classifies every response via classifyEvidence() and
@@ -128,8 +128,7 @@ export interface Auth {
     isSignedIn(): boolean;
     /** Initiates PKCE sign-in redirect. */
     signIn(): Promise<void>;
-    /** Signs out: clears cache via the provided callback, invalidates tokens in
-     *  localStorage, and redirects to Microsoft logout. */
+    /** Close OneDrive transport, clear its cache and invalidate local tokens. */
     signOut(onClear: () => Promise<void>): Promise<void>;
     /** Processes ?code= redirect on page load. Must be called first in onBodyLoad. */
     handleOauthRedirect(): Promise<{ error: string | null }>;
@@ -149,7 +148,6 @@ const CLIENT_ID = 'e4adae2b-3cf8-4ce8-b59f-d341b3bacbf6';
 const GRAPH_SCOPES = 'Files.Read Files.ReadWrite.AppFolder offline_access';
 const AUTHORIZE_URL = 'https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize';
 const TOKEN_URL = 'https://login.microsoftonline.com/consumers/oauth2/v2.0/token';
-const LOGOUT_URL = 'https://login.microsoftonline.com/consumers/oauth2/v2.0/logout';
 
 // ---------------------------------------------------------------------------
 // Stateless helpers (module-scoped — shared, pure, no instance state)
@@ -351,6 +349,9 @@ const exchangeCodeForToken = async (
  */
 export function createAuth(): Auth {
     let evidence: EvidenceState = 'no-evidence';
+    // Account retirement aborts all Graph requests, including cache writes that
+    // deliberately ignore the narrower cancellation used for disconnecting one share.
+    let libraryRequests = new AbortController();
 
     // -- isSignedIn (used internally and exposed on the interface) -----------
 
@@ -420,6 +421,7 @@ export function createAuth(): Auth {
                 signal: options?.signal,
             });
 
+            if (localStorage.getItem('refresh_token') !== refreshToken) return r;
             if (!refreshResult.ok) {
                 // Only sentinel tokens on client errors (4xx). Server errors (5xx)
                 // and transient failures should not force sign-out — the refresh
@@ -437,6 +439,8 @@ export function createAuth(): Auth {
 
             log('refreshed!');
             const tokenData = await readGraphJson(refreshResult, 'refresh token');
+            // Logout or a newer connection may have committed while the body was pending.
+            if (localStorage.getItem('refresh_token') !== refreshToken) return r;
             localStorage.setItem('access_token', tokenData.access_token);
             localStorage.setItem('refresh_token', tokenData.refresh_token);
             // Successful refresh proves tokens are valid — clear auto-redirect
@@ -458,6 +462,9 @@ export function createAuth(): Auth {
 
     const auth: Auth = {
         async fetch(url, retryOn429, options) {
+            const admitted = libraryRequests.signal;
+            admitted.throwIfAborted();
+            const signal = options?.signal ? AbortSignal.any([options.signal, admitted]) : admitted;
             const onlineBeforeFetch = navigator.onLine;
             const evidenceBeforeFetch = auth.reconcileEvidenceFromNavigator(
                 'authFetch:init',
@@ -468,7 +475,8 @@ export function createAuth(): Auth {
                 auth.provideEvidenceFromHttpStatus(offlineResponse.status, 'authFetch:skip-offline');
                 return offlineResponse;
             }
-            const r = await rawAuthFetch(url, retryOn429, options);
+            const r = await rawAuthFetch(url, retryOn429, {...options, signal});
+            admitted.throwIfAborted();
             auth.provideEvidenceFromHttpStatus(r.status, 'authFetch');
             return r;
         },
@@ -547,11 +555,15 @@ export function createAuth(): Auth {
         },
 
         async signOut(onClear) {
-            await onClear();
+            libraryRequests.abort();
+            try { await onClear(); }
+            catch (error) {
+                libraryRequests = new AbortController();
+                throw error;
+            }
             const sentinel = `null: logged out ${new Date().toLocaleString()}`;
             localStorage.setItem('access_token', sentinel);
             localStorage.setItem('refresh_token', sentinel);
-            location.href = `${LOGOUT_URL}?post_logout_redirect_uri=${encodeURIComponent(redirectUri())}`;
         },
 
         async handleOauthRedirect() {
@@ -612,10 +624,13 @@ export function createAuth(): Auth {
         },
 
         async attemptSilentRedirect() {
+            const admitted = libraryRequests.signal;
+            admitted.throwIfAborted();
             localStorage.setItem('oneplay_music_redirect_attempt', String(Date.now()));
             const codeVerifier = base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)));
             const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier));
             const codeChallenge = base64UrlEncode(new Uint8Array(digest));
+            admitted.throwIfAborted();
             sessionStorage.setItem('code_verifier', codeVerifier);
 
             const params = new URLSearchParams({

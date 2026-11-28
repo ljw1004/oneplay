@@ -393,18 +393,19 @@ module.exports = {
         assert(!await page.locator(retry).count() && !await page.locator(tree).count(), "Sign-in competed with another startup outcome");
     },
 
-    async "startup: first-ever offline launch offers retry, then browser reconnect shows sign-in"(page) {
+    async "startup: first-ever offline launch keeps the two library choices" (page) {
         await configureStartupScenario(page, {signedIn: false, forceOffline: true});
         await page.goto(URL, {waitUntil: "domcontentloaded"});
-        await assertStartupFailure(page, offline);
-        await page.locator(retry).focus();
+        const connect = page.getByRole('button', {name:/Connect to OneDrive/});
+        const demo = page.getByRole('button', {name:/Explore the demo library/});
+        await connect.waitFor();
+        await demo.waitFor();
+        await demo.click();
+        await page.getByText('The demo library needs an internet connection to open.').waitFor();
+        await connect.click();
+        await page.getByText('Connect to the internet to sign in to OneDrive.').waitFor();
         await page.evaluate(() => window._testSetOnline(true));
-        await page.locator(signIn).waitFor();
-        assert(await page.evaluate(() => document.activeElement.matches(".signin-btn")
-            && getComputedStyle(document.activeElement).outlineStyle === "solid"),
-            "Retry focus did not transfer visibly to sign-in");
-        await page.evaluate(() => window._testSetOnline(false));
-        await assertStartupFailure(page, offline);
+        assert(await connect.isVisible() && await demo.isVisible(), 'Reconnect hid a library choice');
     },
 
     async "startup: browser reconnect from an empty cache shows indexing and a settled failure"(page) {
@@ -691,6 +692,49 @@ module.exports = {
         assert(await page.evaluate(() => document.activeElement.id) === "status", "Progress dropped focus");
         assert(await page.evaluate(() => window._testMusicRootRequestCache) === "no-store",
             "A saved folder ETag can validate a stale recursive size. The root probe must bypass HTTP cache.");
+    },
+
+    async "startup: OneDrive sign-in and scanning keep the same indexing heading"(page) {
+        await page.setViewportSize({width: 390, height: 844});
+        await configureStartupScenario(page, {signedIn: false, mockGraph: true, holdAccountDetails: true, openingWaitMs: 10_000});
+        await page.route(URL + "seed-indexing", route => route.fulfill({contentType: "text/html", body: "<title>Seed</title>"}));
+        await page.goto(URL + "seed-indexing");
+        await page.evaluate(() => {
+            sessionStorage.oneplay_connect_origin = "chooser";
+            sessionStorage.code_verifier = "fixture-verifier";
+        });
+        let releaseToken;
+        const tokenPending = new Promise(resolve => { releaseToken = resolve; });
+        await page.route("https://login.microsoftonline.com/**/token", async route => {
+            await tokenPending;
+            await route.fulfill({
+                headers: {"access-control-allow-origin": "*"},
+                json: {access_token: "fixture-access", refresh_token: "fixture-refresh"},
+            });
+        });
+        await page.clock.install();
+        const title = page.getByText("Indexing your music...", {exact: true});
+        const meter = page.locator("#status .progress-bar");
+        let bounds;
+        try {
+            await page.goto(URL + "?code=fixture", {waitUntil: "domcontentloaded"});
+            await title.waitFor({timeout: 4500});
+            bounds = await title.boundingBox();
+            assert(!await meter.isVisible(), "A scan meter was visible before scanning started");
+            assert(!await page.locator(retry).count(), "Retry appeared before the visible wait expired");
+        } finally {
+            releaseToken();
+        }
+        await page.waitForFunction(() => window._testReleaseDetails);
+        await page.clock.fastForward(10_001);
+        await page.locator(retry).focus();
+        assert(JSON.stringify(await title.boundingBox()) === JSON.stringify(bounds), "Retry moved the indexing heading");
+        await page.evaluate(() => window._testReleaseDetails());
+        await page.waitForFunction(() => window._testStartedBatch);
+        assert(await meter.isVisible(), "Scanning did not reveal progress");
+        assert(JSON.stringify(await title.boundingBox()) === JSON.stringify(bounds), "Real progress moved the indexing heading");
+        assert(!await page.locator(retry).count(), "Retry stayed visible while scanning");
+        assert(await page.evaluate(() => document.activeElement.id) === "status", "Progress dropped focus");
     },
 
     async "startup: a late OAuth body finishes with its one-use verifier"(page) {

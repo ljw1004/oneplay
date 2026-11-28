@@ -37,7 +37,7 @@ import WebKit
             try { await iframe.contentWindow.webkit.messageHandlers.oneplay.postMessage({op:'state'}); denied = false; }
             catch { denied = true; }
             iframe.remove();
-            const images = await Promise.all(['favicon','appicon','bigicon'].map(async name => {
+            const images = await Promise.all(['favicon','appicon','bigicon','onedrive'].map(async name => {
                 const image = new Image(); image.src = './assets/'+name+'.png'; await image.decode(); return image.naturalWidth;
             }));
             const ls = localStorage.getItem('m17-shell-build');
@@ -61,7 +61,7 @@ import WebKit
         XCTAssertNotNil(values["evidence"] as? String)
         XCTAssertEqual(values["denied"] as? Bool, true)
         XCTAssertEqual((values["styles"] as? [Int])?.filter { $0 > 0 }.count, 2)
-        XCTAssertEqual((values["images"] as? [Int])?.filter { $0 > 0 }.count, 3)
+        XCTAssertEqual((values["images"] as? [Int])?.filter { $0 > 0 }.count, 4)
         XCTAssertEqual(values["ls"] as? String, values["idb"] as? String)
         if let expected = ProcessInfo.processInfo.environment["ONEPLAY_EXPECT_PREVIOUS_BUILD"] {
             XCTAssertEqual(values["ls"] as? String, expected, "Prior localStorage build marker")

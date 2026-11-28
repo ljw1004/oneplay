@@ -53,7 +53,7 @@ export interface Shares {
     getAll(): readonly ShareRecordPersisted[];
     loadFromCache(): Promise<void>;
     /** True after reading a valid document or confirming there is none (404). */
-    pullFromOneDrive(): Promise<boolean>;
+    pullFromOneDrive(signal?: AbortSignal): Promise<boolean>;
     addFromUrl(url: string, signal?: AbortSignal): Promise<ShareRecordPersisted>;
     rename(id: string, nextName: string): Promise<void>;
     remove(id: string): Promise<void>;
@@ -142,9 +142,10 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
             onChange();
         },
 
-        async pullFromOneDrive() {
+        async pullFromOneDrive(signal) {
             try {
-                const text = await deps.documents.read(DOCUMENT);
+                const text = await deps.documents.read(DOCUMENT, signal);
+                signal?.throwIfAborted();
                 if (text === null) {
                     loadedMembership = true;
                     return true;
@@ -157,13 +158,14 @@ export function createShares(deps: SharesDeps, onChange: () => void): Shares {
                 const next = sortByAddedAt(server.shares.map(normalizeShare));
                 await deps.dbPut(IDB_KEY, {version:1, updatedAt:serverTime, shares:next});
                 // A local edit admitted during this write wins. Reconcile its graph on the next pull.
-                if (shares !== previous) return false;
+                if (signal?.aborted || shares !== previous) return false;
                 shares = next;
                 updatedAt = serverTime;
                 loadedMembership = true;
                 onChange();
                 return true;
             } catch (error) {
+                if (signal?.aborted) return false;
                 if (error instanceof ProviderHttpError) logError(`shares: OneDrive load failed: ${error.status}`);
                 else logCatch('shares:onedrive-load')(error);
                 return false;

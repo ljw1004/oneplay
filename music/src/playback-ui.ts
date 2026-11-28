@@ -11,6 +11,20 @@
  * - Reading or controlling the media element.
  */
 import { type PlaybackMode } from './playback.js';
+import { logCatch } from './logger.js';
+
+export interface DrawerState {
+    readonly expanded: boolean;
+    readonly autoExpand: boolean;
+}
+
+/** The workspace owns persistence and the tree owns marker geometry. */
+export interface DrawerView {
+    readonly initial: DrawerState;
+    readonly onStateChange: (state: DrawerState) => void;
+    readonly captureMarkerReveal: () => (() => void) | undefined;
+    readonly coveredViews?: {readonly tree: HTMLElement; readonly settings: HTMLElement};
+}
 
 /** A wheel release is valid only for the play on which the pointer went down. */
 interface ScrubGesture {
@@ -22,11 +36,12 @@ interface ScrubGesture {
 
 export interface PlaybackUiDeps {
     readonly footerEl: HTMLElement;
+    readonly drawer?: DrawerView;
     readonly getMode: () => PlaybackMode;
     readonly getDuration: () => number | undefined;
     readonly onScrubStart: () => ScrubGesture | undefined;
     readonly onModeCycleClick?: () => void;
-    readonly onExpandedChange: (expanded: boolean) => void;
+    readonly onLayoutChange: (expanded: boolean) => void;
     readonly onChevronClick: () => void;
     readonly onFooterPlayPauseClick: () => void;
     readonly onCenterTapToggle: () => 'play' | 'pause' | undefined;
@@ -43,7 +58,13 @@ export interface PlaybackUiController {
     readonly expansionEl: HTMLDivElement;
     setModeLabelText(mode: PlaybackMode): void;
     setPlayPausePlaying(isPlaying: boolean): void;
-    setExpanded(value: boolean): void;
+    setTargetVisible(visible: boolean): boolean;
+    restoreDrawer(): void;
+    beginPlaybackAction(): number;
+    updateDrawerAfterPlay(revision: number | undefined, firstTarget?: boolean): void;
+    collapseForBrowsing(): void;
+    collapseAfterStop(): void;
+    resizeDrawer(): void;
     isExpanded(): boolean;
     isScrubbing(): boolean;
 }
@@ -109,13 +130,20 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
 
     // Gripper is a direct child of #footer, above expansion — it's the
     // top edge of the drawer, stays at top whether collapsed or expanded.
-    const gripper = document.createElement('div');
+    const gripRow = document.createElement('div');
+    gripRow.className = 'footer-grip-row';
+    const gripper = document.createElement('button');
+    gripper.type = 'button';
     gripper.className = 'footer-gripper';
+    gripper.setAttribute('aria-label', 'Player controls');
+    gripper.setAttribute('aria-expanded', 'false');
+    gripRow.append(gripper);
 
     // -- Expansion DOM -------------------------------------------------------
 
     const expansion = document.createElement('div');
     expansion.className = 'expansion';
+    expansion.inert = true;
 
     const expansionInner = document.createElement('div');
     expansionInner.className = 'expansion-inner';
@@ -203,19 +231,74 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
     expansion.appendChild(expansionInner);
 
     // Gripper at top (drawer handle), expansion in middle, footer-bar at bottom
-    footerEl.append(gripper, expansion, footerBar);
+    footerEl.append(gripRow, expansion, footerBar);
 
     // -- Expand/collapse -----------------------------------------------------
 
-    let expanded = false;
-    const setExpanded = (value: boolean): void => {
-        if (value && !footerEl.classList.contains('visible')) return;
+    let {expanded, autoExpand} = deps.drawer?.initial ?? {expanded: false, autoExpand: true};
+    let targetVisible = false;
+    let actionRevision = 0;
+    const fullHeight = matchMedia('(orientation: landscape) and (max-height: 500px)');
+    const isExpanded = () => footerEl.classList.contains('expanded');
+
+    /** Match the fixed landscape drawer, preserving the workspace sign-out lock. */
+    function syncCoveredViews(): void {
+        const views = deps.drawer?.coveredViews;
+        if (!views) return;
+        const covered = fullHeight.matches && isExpanded();
+        if (covered && (views.tree.contains(document.activeElement) || views.settings.contains(document.activeElement))) {
+            gripper.focus({preventScroll: true});
+        }
+        views.tree.inert = covered || footerEl.inert;
+        views.settings.inert = covered;
+    }
+
+    function resizeDrawer(): void {
+        if (isExpanded()) {
+            expansion.style.setProperty('--drawer-content-height', `${expansion.scrollHeight}px`);
+        }
+    }
+
+    /** The saved layout survives an absent target. Only a manual gesture changes preference. */
+    function setExpanded(value: boolean, reason: 'manual' | 'automatic' | 'restore'): void {
+        const show = value && targetVisible;
+        if (show && document.body.classList.contains('select-mode')) return;
+        const preference = reason === 'manual' ? value : autoExpand;
+        const changed = value !== expanded || preference !== autoExpand;
         expanded = value;
-        footerEl.classList.toggle('expanded', value);
-        if (value) expansion.style.setProperty('--drawer-content-height', `${expansion.scrollHeight}px`);
-        if (value) modeLabel.textContent = deps.getMode();
-        deps.onExpandedChange(value);
-    };
+        autoExpand = preference;
+        if (changed) deps.drawer?.onStateChange({expanded, autoExpand});
+        if (show === isExpanded()) return;
+
+        const reveal = show && reason !== 'restore' && !fullHeight.matches ? deps.drawer?.captureMarkerReveal() : undefined;
+        const revision = actionRevision;
+        if (!show) {
+            if (scrub) endScrub(scrub.pointerId);
+            if (targetVisible && expansion.contains(document.activeElement)) gripper.focus({preventScroll: true});
+        }
+        if (reason === 'restore') expansion.style.transition = 'none';
+        footerEl.classList.toggle('expanded', show);
+        gripper.setAttribute('aria-expanded', String(show));
+        expansion.inert = !show;
+        if (show) {
+            resizeDrawer();
+            modeLabel.textContent = deps.getMode();
+        }
+        syncCoveredViews();
+        if (reason === 'restore') {
+            void expansion.offsetHeight; // Commit the restored layout before reenabling transitions.
+            expansion.style.transition = '';
+        }
+        deps.onLayoutChange(show);
+        if (!reveal) return;
+        const revealIfCurrent = () => {
+            if (expanded && targetVisible && actionRevision === revision && !fullHeight.matches) reveal();
+        };
+        const transition = expansion.getAnimations().find(animation =>
+            (animation as CSSTransition).transitionProperty === 'max-height');
+        if (transition) transition.finished.then(revealIfCurrent, () => {}).catch(logCatch('drawer marker reveal'));
+        else revealIfCurrent();
+    }
 
     // -- Mode and drawer handlers -------------------------------------------
 
@@ -225,17 +308,22 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
         modeLabel.textContent = deps.getMode();
     });
 
-    window.addEventListener('resize', () => {
-        if (expanded) expansion.style.setProperty('--drawer-content-height', `${expansion.scrollHeight}px`);
-    });
+    window.addEventListener('resize', resizeDrawer);
+    fullHeight.addEventListener('change', syncCoveredViews);
+
+    const setExpandedManually = (value: boolean): void => {
+        if (!targetVisible || footerEl.inert) return;
+        actionRevision++;
+        setExpanded(value, 'manual');
+    };
 
     expansionInner.addEventListener('click', (e) => {
-        if (e.target === e.currentTarget) setExpanded(false);
+        if (e.target === e.currentTarget) setExpandedManually(false);
     });
 
     gripper.addEventListener('click', () => {
         if (document.body.classList.contains('select-mode')) return;
-        setExpanded(!expanded);
+        setExpandedManually(!isExpanded());
     });
 
     // -- Gripper hit zone ----------------------------------------------------
@@ -244,77 +332,36 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
     const safeAreaBottom = (): number =>
         parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--sab')) || 0;
     const gripperOverlay = document.createElement('div');
-    gripperOverlay.style.cssText =
-        'position:absolute;left:0;right:0;top:-' + GRIPPER_EXTEND_PX + 'px;'
-        + 'height:' + GRIPPER_EXTEND_PX + 'px;pointer-events:auto';
+    gripperOverlay.className = 'compact-gripper-reach';
+    gripperOverlay.style.height = `${GRIPPER_EXTEND_PX}px`;
     footerEl.appendChild(gripperOverlay);
 
-    let swipeStartY: number | null = null;
-    let swipePointerId: number | null = null;
+    let drawerSwipe: {pointerId: number; startY: number; opening: boolean} | undefined;
+    /** Only the compact drawer can begin a swipe in the 22 px above its edge. */
     document.addEventListener('pointerdown', (e) => {
-        if (expanded) return;
-        if (document.body.classList.contains('select-mode')) return;
-        if (!footerEl.classList.contains('visible')) return;
+        if (!targetVisible || footerEl.inert || e.button !== 0 || document.body.classList.contains('select-mode')) return;
+        const opening = !isExpanded();
         const footerTop = footerEl.getBoundingClientRect().top;
         const safeAreaCutoff = window.innerHeight - safeAreaBottom();
-        if (e.clientY < footerTop - GRIPPER_EXTEND_PX || e.clientY > safeAreaCutoff) return;
-        swipeStartY = e.clientY;
-        swipePointerId = e.pointerId;
+        if (e.clientY < footerTop - (opening ? GRIPPER_EXTEND_PX : 0) || e.clientY >= safeAreaCutoff) return;
+        if (!opening) {
+            const target = e.target as Node;
+            if (!footerEl.contains(target) || (scrubberShell.contains(target) && wheelPosition(scrubberShell, e).getZone() === 'wheel')) return;
+        }
+        drawerSwipe = {pointerId: e.pointerId, startY: e.clientY, opening};
     }, true);
     document.addEventListener('pointermove', (e) => {
-        if (e.pointerId !== swipePointerId || swipeStartY === null) return;
-        if (swipeStartY - e.clientY >= 30) {
-            swipeStartY = null;
-            swipePointerId = null;
-            setExpanded(true);
-        }
+        if (e.pointerId !== drawerSwipe?.pointerId) return;
+        const {startY, opening} = drawerSwipe;
+        if ((opening ? startY - e.clientY : e.clientY - startY) < 30) return;
+        drawerSwipe = undefined;
+        if (opening !== isExpanded()) setExpandedManually(opening);
     });
-    document.addEventListener('pointerup', (e) => {
-        if (e.pointerId !== swipePointerId) return;
-        swipeStartY = null;
-        swipePointerId = null;
-    });
-    document.addEventListener('pointercancel', (e) => {
-        if (e.pointerId !== swipePointerId) return;
-        swipeStartY = null;
-        swipePointerId = null;
-    });
-
-    let expansionSwipeStartY: number | null = null;
-    let expansionSwipePointerId: number | null = null;
-    document.addEventListener('pointerdown', (e) => {
-        if (!expanded) return;
-        const footerTop = footerEl.getBoundingClientRect().top;
-        const safeAreaCutoff = window.innerHeight - safeAreaBottom();
-        if (e.clientY < footerTop - GRIPPER_EXTEND_PX || e.clientY >= safeAreaCutoff) return;
-        const shellRect = scrubberShell.getBoundingClientRect();
-        const inShellArea = e.clientX >= shellRect.left && e.clientX <= shellRect.right
-            && e.clientY >= shellRect.top && e.clientY <= shellRect.bottom;
-        if (inShellArea) {
-            const zone = wheelPosition(scrubberShell, e).getZone();
-            if (zone === 'wheel') return;
-        }
-        expansionSwipeStartY = e.clientY;
-        expansionSwipePointerId = e.pointerId;
-    }, true);
-    document.addEventListener('pointermove', (e) => {
-        if (e.pointerId !== expansionSwipePointerId || expansionSwipeStartY === null) return;
-        if (e.clientY - expansionSwipeStartY >= 30) {
-            expansionSwipeStartY = null;
-            expansionSwipePointerId = null;
-            setExpanded(false);
-        }
-    });
-    document.addEventListener('pointerup', (e) => {
-        if (e.pointerId !== expansionSwipePointerId) return;
-        expansionSwipeStartY = null;
-        expansionSwipePointerId = null;
-    });
-    document.addEventListener('pointercancel', (e) => {
-        if (e.pointerId !== expansionSwipePointerId) return;
-        expansionSwipeStartY = null;
-        expansionSwipePointerId = null;
-    });
+    const clearDrawerSwipe = (e: PointerEvent): void => {
+        if (e.pointerId === drawerSwipe?.pointerId) drawerSwipe = undefined;
+    };
+    document.addEventListener('pointerup', clearDrawerSwipe);
+    document.addEventListener('pointercancel', clearDrawerSwipe);
 
     // -- Footer controls -----------------------------------------------------
 
@@ -328,18 +375,22 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
     });
     skipFwdBtn.addEventListener('click', (e) => {
         e.stopPropagation();
+        actionRevision++;
         deps.onSeekBy(+30);
     });
     skipBackBtn.addEventListener('click', (e) => {
         e.stopPropagation();
+        actionRevision++;
         deps.onSeekBy(-15);
     });
     prevBtn.addEventListener('click', (e) => {
         e.stopPropagation();
+        actionRevision++;
         deps.onPrev();
     });
     nextBtn.addEventListener('click', (e) => {
         e.stopPropagation();
+        actionRevision++;
         deps.onNext();
     });
 
@@ -410,6 +461,7 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
 
     scrubberShell.addEventListener('pointerup', (e) => {
         if (!scrub || e.pointerId !== scrub.pointerId) return;
+        actionRevision++;
         scrub.gesture.commitScrubIfCurrent(scrub.previewTime);
         endScrub(e.pointerId);
     });
@@ -443,8 +495,26 @@ export function createPlaybackUi(deps: PlaybackUiDeps): PlaybackUiController {
             playpauseBtn.textContent = isPlaying ? '\u23F8\uFE0E' : '\u25B6\uFE0E';
         },
 
-        setExpanded,
-        isExpanded: () => expanded,
+        setTargetVisible(visible) {
+            if (visible === targetVisible) return false;
+            targetVisible = visible;
+            footerEl.classList.toggle('visible', visible);
+            if (!visible) setExpanded(expanded, 'restore');
+            return visible;
+        },
+        restoreDrawer() { setExpanded(expanded, 'restore'); },
+        beginPlaybackAction: () => ++actionRevision,
+        updateDrawerAfterPlay(revision, firstTarget) {
+            if (revision === actionRevision && autoExpand) setExpanded(true, 'automatic');
+            if (firstTarget && !isExpanded()) setExpanded(false, 'automatic');
+        },
+        collapseForBrowsing() {
+            actionRevision++;
+            setExpanded(false, 'automatic');
+        },
+        collapseAfterStop() { setExpanded(false, 'automatic'); },
+        resizeDrawer,
+        isExpanded,
         isScrubbing: () => scrub !== undefined,
     };
 }

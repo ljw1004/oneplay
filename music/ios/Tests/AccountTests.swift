@@ -1638,20 +1638,25 @@ private final class HeldDemoCatalog: URLProtocol {
         let last = try XCTUnwrap(player.snapshot["item"] as? String)
         wifi.withLock { $0 = false }
         try player.apply("seek", item: last, seconds: duration)
+        try await waitForUI("document.querySelector('.footer-gripper').getAttribute('aria-expanded') === 'false'")
         pool.clear()
         try player.apply("seek", item: last, seconds: 45)
         try player.apply("play", item: last, seconds: nil)
         try await waitForUI("Math.abs(window.readyPosition - 45) < 1")
         XCTAssertEqual(calls, ["A", "B"])
         XCTAssertTrue(TestAudioCDN.fixture.withLock { $0.paths.contains("/B/2") })
+        _ = try await page.evaluateJavaScript("document.querySelector('.footer-gripper').click()")
 
         // Hold Graph after a genuine CDN rejection. Seeking into retained audio still resumes immediately.
         try player.apply("seek", item: last, seconds: duration)
+        try await waitForUI("document.querySelector('.footer-gripper').getAttribute('aria-expanded') === 'false'")
         holdLookups = true
         TestAudioCDN.fixture.withLock { $0.expired = true }
         pool.clear()
         try player.apply("seek", item: last, seconds: 90)
         try player.apply("play", item: last, seconds: nil)
+        // Direct native Play keeps the layout. Reopen to subscribe to range evidence.
+        _ = try await page.evaluateJavaScript("document.querySelector('.footer-gripper').click()")
         try await waitForUI("!!document.querySelector('.scrubber-text.loading') && !!document.querySelector('.audio-ranges > :nth-child(2) .lookup')")
         // Only the target block survives. Header and scan reads need the held renewal, but the
         // listener can still see the requested time while those ancillary bytes are unavailable.
@@ -1674,9 +1679,11 @@ private final class HeldDemoCatalog: URLProtocol {
 
         // The next uncached read can renew, then reuse the replacement for later ranges.
         try player.apply("seek", item: last, seconds: duration)
+        try await waitForUI("document.querySelector('.footer-gripper').getAttribute('aria-expanded') === 'false'")
         pool.clear()
         try player.apply("seek", item: last, seconds: 60)
         try player.apply("play", item: last, seconds: nil)
+        _ = try await page.evaluateJavaScript("document.querySelector('.footer-gripper').click()")
         try await waitForUI("Math.abs(window.readyPosition - 60) < 1 && !document.querySelector('.scrubber-text.loading')")
         XCTAssertEqual(calls, ["A", "B", "B", "B", "B"])
         XCTAssertTrue(TestAudioCDN.fixture.withLock { $0.paths.contains("/B/5") })
@@ -1701,6 +1708,7 @@ private final class HeldDemoCatalog: URLProtocol {
         try player.apply("seek", item: finalItem, seconds: duration)
         XCTAssertEqual(player.snapshot["position"] as? Double, duration)
         XCTAssertEqual(player.snapshot["state"] as? String, "ended", player.status)
+        try await waitForUI("document.querySelector('.footer-gripper').getAttribute('aria-expanded') === 'false'")
         XCTAssertEqual(calls, ["A", "B", "B", "B", "B"])
 
         // A new selection has cached audio but no admitted URL. Hold the actual Graph response
@@ -1711,6 +1719,7 @@ private final class HeldDemoCatalog: URLProtocol {
         _ = try await page.evaluateJavaScript("window.spinnerSeen = false")
         let cold = IndexedTrack(driveId: "library", itemId: "D", path: ["Music", "Album", "D"])
         try player.start(tracks: [cold, cached], startIndex: 1, delaySeconds: 0, nearEnd: false, forceRefresh: false)
+        _ = try await page.evaluateJavaScript("document.querySelector('.footer-gripper').click()")
         try await waitForUI("document.querySelector('.footer-title')?.textContent === 'C' && !!document.querySelector('.audio-ranges > :nth-child(2) .lookup')")
         _ = try await page.callAsyncJavaScript("await new Promise(resolve => setTimeout(resolve, 500))", arguments: [:], in: nil, contentWorld: .page)
         releaseLookups()
@@ -2112,6 +2121,89 @@ extension AccountTests {
 }
 
 extension AccountTests {
+    #if DEBUG
+    /// Hold the real native bridge after admission. The reply must represent both admission and the later clock.
+    func testDrawerPlayReplyAcrossNaturalAdvanceAndStop() async throws {
+        let account = try NativeAccount(recordFile: record, identity: TestIdentity()) { [self] request in
+            try response(request, status: request.url?.path == "/v1.0/me/drive" ? 200 : 404, data: drive)
+        }
+        let bytes = try Data(contentsOf: XCTUnwrap(Bundle(for: Self.self).url(forResource: "AudibleTail", withExtension: "mp3")))
+        let media = MediaLocation(url: URL(string: "https://audio.test/drawer")!, etag: "v", size: Int64(bytes.count))
+        let pool = MediaPool()
+        for item in ["a", "b"] {
+            pool.store(bytes, for: .init(drive: "library", item: item, version: "v", size: media.size), at: 0)
+        }
+        let player = NativePlayback(pool: pool) { _, _, _, _ in media }
+        let controller = LibraryController(account: account, store: .nonPersistent(), player: player)
+        let host = try XCTUnwrap((UIApplication.shared.delegate as? AppDelegate)?.library)
+        host.addChild(controller)
+        host.view.addSubview(controller.view)
+        controller.didMove(toParent: host)
+        var releaseReply: CheckedContinuation<Void, Never>?
+        defer {
+            releaseReply?.resume()
+            player.stop()
+            controller.detachPage()
+            controller.willMove(toParent: nil)
+            controller.view.removeFromSuperview()
+            controller.removeFromParent()
+        }
+        let page = try await readyPage(in: controller)
+        _ = try await account.signIn(presenting: controller)
+        _ = try await page.callAsyncJavaScript("""
+            const {createNativeLibrary} = await import('./dist/native-library.js');
+            const {attachNativePlayback} = await import('./dist/native-playback.js');
+            const native = createNativeLibrary(window.webkit.messageHandlers.oneplay);
+            await native.loadAccountState('state');
+            const folder = ['OnePlay Music', 'library', 'Album'];
+            const tracks = ['a', 'b'].map(itemId => ({path:[...folder,itemId], key:itemId, title:itemId,
+                driveId:'library', itemId, album:'Album', sourceRootKey:'library'}));
+            const drawer = attachNativePlayback(native, document.getElementById('footer'), () => {}, () => {}, () => {});
+            window.runDrawerSelection = count => drawer.start({folder, folderKey:'drawer-fixture', tracks:tracks.slice(0,count)},0,true,'30m');
+            window.collapseDrawer = drawer.collapse;
+            """, arguments: [:], in: nil, contentWorld: .page)
+        func waitForPlayback(title: String, state: String) async throws {
+            let deadline = ContinuousClock.now + .seconds(8)
+            repeat {
+                let sample = player.snapshot
+                if sample["title"] as? String == title && sample["state"] as? String == state { return }
+                try await Task.sleep(for: .milliseconds(20))
+            } while .now < deadline
+            XCTFail("Expected \(title) \(state), got \(player.status)")
+        }
+        for trackCount in [2, 1] {
+            let admitted = expectation(description: "Native Play admitted with \(trackCount) tracks")
+            controller.beforePlayReplySampleForTesting = {
+                await withCheckedContinuation { continuation in
+                    releaseReply = continuation
+                    admitted.fulfill()
+                }
+            }
+            _ = try await page.evaluateJavaScript("window.drawerSelection = window.runDrawerSelection(\(trackCount)); null")
+            await fulfillment(of: [admitted], timeout: 8)
+            if trackCount == 2 {
+                try await waitForPlayback(title: "b", state: "playing")
+            } else {
+                try await waitForPlayback(title: "a", state: "ended")
+                XCTAssertTrue(try player.applyRemote("play"))
+                try await waitForPlayback(title: "a", state: "playing")
+            }
+            controller.beforePlayReplySampleForTesting = nil
+            releaseReply?.resume()
+            releaseReply = nil
+            let result = try await page.callAsyncJavaScript("""
+                await window.drawerSelection;
+                const {snapshot} = await window.webkit.messageHandlers.oneplay.postMessage({op:'playback',version:1,action:'snapshot'});
+                return {expanded:document.querySelector('.footer-gripper').getAttribute('aria-expanded'), foreground:snapshot.foregroundStart === true};
+                """, arguments: [:], in: nil, contentWorld: .page)
+            let layout = try XCTUnwrap(result as? [String: Any])
+            XCTAssertEqual(layout["expanded"] as? String, trackCount == 2 ? "true" : "false")
+            XCTAssertEqual(layout["foreground"] as? Bool, true)
+            _ = try await page.evaluateJavaScript("window.collapseDrawer()")
+        }
+    }
+    #endif
+
     /// With the same optional fixture UUID, a second XCTest process reopens the first process's
     /// WebKit and Swift files. The ordinary suite uses a fresh pairing and exercises the migration.
     func testBundledLegacyBookmarksAndColdReopen() async throws {
@@ -2154,6 +2246,7 @@ extension AccountTests {
                 const root = ['OnePlay Music','library'];
                 localStorage.setItem('oneplay_music_playback',JSON.stringify({folder:root,track:[...root,'First.mp3'],mode:'one'}));
                 localStorage.setItem('oneplay_music_time','2.25');
+                localStorage.setItem('oneplay_music_view',JSON.stringify({path:root,expanded:true,autoExpand:true}));
                 await dbPut('index:library',{kind:'MusicData',count:3,size:30,folder:{id:'album',children:{'First.mp3':{id:'a'},'Second.mp3':{id:'b'},'Third.mp3':{id:'c'}}}});
                 await dbPut('favorites',{updatedAt:1,favorites:[{kind:'playlist',id:'reader',name:'Remembered album',hasPrivatePlayback:true,
                     mode:'repeat',members:['First','Second'].map((name,i)=>({driveId:'library',sourceRootKey:'library',itemId:i?'b':'a',isFolder:false,path:[name+'.mp3']}))}]});
@@ -2170,6 +2263,16 @@ extension AccountTests {
         }
         try await waitFor { $0["state"] as? String == "paused" }
         XCTAssertEqual(lookups.withLock { $0 }, 0)
+        let restoredDrawer = try await page.callAsyncJavaScript("""
+            const end = performance.now() + 3000;
+            while (document.querySelector('.footer-gripper')?.getAttribute('aria-expanded') !== 'true') {
+                if (performance.now() > end) throw Error('The paused layout did not restore');
+                await new Promise(requestAnimationFrame);
+            }
+            const {snapshot} = await window.webkit.messageHandlers.oneplay.postMessage({op:'playback',version:1,action:'snapshot'});
+            return JSON.parse(localStorage.oneplay_music_view).autoExpand && snapshot.foregroundStart !== true;
+            """, arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertEqual(restoredDrawer as? Bool, true)
         if !reopening {
             XCTAssertEqual(player.snapshot["position"] as? Double, 2.25)
             XCTAssertEqual(player.snapshot["title"] as? String, "First.mp3")
@@ -2185,7 +2288,8 @@ extension AccountTests {
         XCTAssertEqual(player.snapshot["mode"] as? String, "repeat")
         XCTAssertEqual(player.snapshot["path"] as? [String], ["OnePlay Music", "fav:reader", "m:1"])
         _ = try await page.callAsyncJavaScript("""
-            document.querySelector('.footer-gripper').click();
+            const gripper = document.querySelector('.footer-gripper');
+            if (gripper.getAttribute('aria-expanded') !== 'true') gripper.click();
             await Promise.all(document.querySelector('.expansion').getAnimations().map(a => a.finished));
             """, arguments: [:], in: nil, contentWorld: .page)
         let attachment = XCTAttachment(image: try await page.takeSnapshot(configuration: nil))

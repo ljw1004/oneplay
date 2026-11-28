@@ -48,6 +48,7 @@
 - **Invalidate orphaned background tasks with a generation counter.** `abort()` alone is not enough once work has passed its last abort check.
 - **Idempotent setters prevent callback feedback loops.** No-op when effective value is unchanged.
 - **Record newer observations before deduplicating their notifications.** An unchanged connectivity value can still supersede the state captured for an asynchronous bridge reply.
+- Record command admission at the owner’s state boundary. A native playback reply samples the live decoder after a checkpoint write, by which time the queue can have advanced or stopped and resumed. Compare the admission's identity and latest stop ID with the newest accepted sample.
 - **If fire-and-forget is truly required, encode it in the callee contract.** The callee owns all errors and returns `void`.
 
 ## Network and reliability
@@ -89,6 +90,7 @@
 - **Do not consume one-shot restore values before success.** Clear restored values only after the restore action completes.
 - **Deferred data must not trigger eager invalidation.** If dependencies are not loaded yet, defer validation instead of resetting state.
 - **Programmatic scroll/state restoration needs guardrails.** Empty-container scroll events and resource-default values can silently corrupt restored state. When Search and the tree reuse a viewport, save the outgoing list’s offset before replacing it. Switching a scrolled viewport to `overflow: visible` for an animation can also reset its offset.
+- Observe wheel, touch and keyboard input when the effect depends on user browsing. Chromium and WebKit send trusted scroll events for a script's `scrollTop` assignment as well as a user scroll. Those events can still save the resulting offset.
 - **Tests must clear persistent state in setup.** Shared browser profiles make state leakage otherwise inevitable.
 
 
@@ -167,6 +169,7 @@
 - **Drive play/pause UI from media events, not optimistic click updates.**
 - Skip unreadable recordings during playback. A network interruption is a separate failure and leaves the current track selected.
 - **Scrubbing should preserve prior play/pause intent.**
+- HTML audio can queue `timeupdate` and `pause` before `ended`, with `paused` already true. Leave an EOF deadline for the terminal policy to consume. Clear it on every terminal path so replay gets a fresh interval.
 - **On iOS, ended-to-next transitions must avoid async gaps where possible.** Sync-ready next URLs reduce background suspension risk.
 - **Sync-first async wrappers are useful when handlers must branch on immediate availability.**
 - **Wrap MediaSession action registration in per-action try/catch for partial platform support.**
@@ -197,6 +200,7 @@
 - **Isolate destructive auth/token tests in throwaway browser profiles.** Shared profiles should stay usable for manual workflows.
 - **Neutralize service-worker interference in integration harnesses.** Unregister/stub as needed to avoid stale shell or reload side effects.
 - **Budget explicit waits for real production startup work.** Token refresh and first render can require deterministic grace time.
+- When a UI state can repeat, wait for the event or revision that produced it. An already compact drawer can satisfy a check before WebKit paints the next stop. Reopening in that gap leaves the later stop free to close it and suspend Debug updates.
 
 - On a USB-connected iPhone, the status-bar setting alone does not establish which route carried a test download. Record URLSession transaction metrics per request, including the cellular flag, across the whole run. A native PCM tap can measure joins under lock without requiring the listener to time a screen recording. See the [M17 device measurements](music/ai/PLAN-M17-ios.md#gate-2-measurements-on-luphone13-2026-11-24).
 

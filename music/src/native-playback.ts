@@ -1,6 +1,7 @@
 import { cleanMediaSessionTitle } from './media-title.js';
+import { logCatch } from './logger.js';
 import type { NativeLibrary } from './native-library.js';
-import { createPlaybackUi, timeString } from './playback-ui.js';
+import { createPlaybackUi, timeString, type DrawerView } from './playback-ui.js';
 import type { FolderPath } from './tree.js';
 import type { LibraryQueue } from './tracks.js';
 import type { TimerDuration } from './settings.js';
@@ -28,6 +29,8 @@ interface NativeSample {
     readonly title?: string;
     readonly item?: string;
     readonly targetRevision?: number;
+    readonly naturalStopID?: number;
+    readonly foregroundStart?: boolean;
     readonly advanced?: boolean;
     readonly path?: FolderPath;
     readonly state?: 'buffering' | 'positioning' | 'playing' | 'paused' | 'error' | 'unavailable' | 'ended';
@@ -36,12 +39,26 @@ interface NativeSample {
     readonly message?: string;
 }
 
-interface PlaybackReply { readonly applied?: boolean; readonly sequence: number; readonly snapshot: NativeSample }
+interface AcceptedPlay {
+    readonly session: string;
+    readonly targetRevision: number;
+    readonly naturalStopID: number;
+}
+
+interface PlaybackReply {
+    readonly applied?: boolean;
+    readonly acceptedPlay?: AcceptedPlay;
+    readonly sequence: number;
+    readonly snapshot: NativeSample;
+}
+
+const wantsPlay = (sample: NativeSample): boolean =>
+    sample.state === 'playing' || sample.state === 'positioning' || sample.state === 'buffering';
 
 /** Swift owns the clock and queue. Each document paints only replies newer than its last sample. */
 export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
     updateTree: (info: PlaybackInfo | undefined, advanced?: boolean) => void, reveal: (path: FolderPath) => void,
-    showError: (message: string) => void,
+    showError: (message: string) => void, drawer?: DrawerView,
     rebuild?: (folder: FolderPath, key: string) => Promise<LibraryQueue | undefined> | undefined,
     getConnected?: () => readonly string[] | undefined,
     saveFavoriteMode?: (folder: FolderPath, mode: PlaybackMode) => Promise<void>,
@@ -64,7 +81,9 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
     let buildGeneration = 0;
     let refreshGeneration = 0;
     let pendingSelection: {queue: LibraryQueue; key?: string; timer: TimerDuration} | undefined;
-    let intent: {id: string; base: Promise<string>} | undefined;
+    let intent: {id: string; base: Promise<string>; drawerRevision: number} | undefined;
+    let deferredForegroundDrawer = false;
+    let presentedSession: string | undefined;
     let pendingRevision = false;
     let awaitingSave = false;
     let publication: {done: Promise<void>; resolve: () => void} | undefined;
@@ -102,13 +121,26 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
 
     function paint(reply: PlaybackReply, action?: string): void {
         if (reply.sequence <= sequence) return;
+        const hasBaseline = sequence !== 0;
         sequence = reply.sequence;
         const last = sample;
         sample = reply.snapshot;
         sampledAt = performance.now();
         const path = sample.path;
-        footer.classList.toggle('visible', !!sample.item);
+        if (hasBaseline && sample.naturalStopID !== undefined && sample.naturalStopID !== last.naturalStopID) {
+            ui.collapseAfterStop();
+        }
+        const firstTarget = ui.setTargetVisible(!!sample.item);
         ui.setModeLabelText(sample.mode ?? 'all');
+        if (firstTarget) {
+            // A pushed target can beat its command reply. Keep its compact viewport for a possible reveal.
+            // A fenced held track can briefly disappear and come back in the same session.
+            const foreground = sample.foregroundStart && presentedSession !== sample.session;
+            if (foreground) {
+                deferredForegroundDrawer = !!intent;
+                if (!deferredForegroundDrawer) ui.updateDrawerAfterPlay(undefined, true);
+            } else if (!deferredForegroundDrawer) ui.restoreDrawer();
+        }
         ui.indicatorSvg.setAttribute('aria-disabled', String(!path));
         if (last.session !== sample.session || !intent && last.hasHistory === undefined && sample.hasHistory === false) {
             issuedRevision = sample.revision ?? 0;
@@ -116,14 +148,15 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
             awaitingSave = false;
             publication?.resolve();
             publication = undefined;
-            if (action !== 'start') refreshLibraryQueue().catch(() => { pendingRevision = true; });
+            if (action !== 'start' && !pendingSelection) refreshLibraryQueue().catch(() => { pendingRevision = true; });
         }
         const itemChanged = last.item !== sample.item;
         paintIndicators(sample.advanced && !!last.item && itemChanged && last.session === sample.session,
             itemChanged || last.targetRevision !== sample.targetRevision);
         if (!sample.item) return;
+        presentedSession = sample.session;
         ui.titleEl.textContent = sample.title ?? path?.at(-1) ?? '';
-        ui.setPlayPausePlaying(['playing', 'positioning', 'buffering'].includes(sample.state ?? ''));
+        ui.setPlayPausePlaying(wantsPlay(sample));
         if (!strip.hidden && sample.bars) paintRanges(strip, sample);
         if (!ui.isScrubbing()) ui.scrubberTimeEl.textContent = sample.duration
             ? `${timeString(position())} / ${timeString(sample.duration)}` : timeString(position());
@@ -155,14 +188,32 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
         }
     }
 
-    async function send(action: string, args: Record<string, unknown> = {}): Promise<void> {
-        try { await applyAndPaint(action, args); }
+    /** The live sequence may have moved during the checkpoint wait and reply delivery. */
+    function updateDrawerForAcceptedPlay(play: AcceptedPlay, revision: number, firstTarget = false): void {
+        const continuing = play.session === sample.session && play.targetRevision === sample.targetRevision
+            && play.naturalStopID === sample.naturalStopID && wantsPlay(sample);
+        ui.updateDrawerAfterPlay(continuing ? revision : undefined, firstTarget);
+    }
+
+    async function send(action: string, args: Record<string, unknown> = {}, drawerRevision?: number): Promise<void> {
+        try {
+            const reply = await applyAndPaint(action, args);
+            if (drawerRevision !== undefined && reply.applied && reply.acceptedPlay) {
+                updateDrawerForAcceptedPlay(reply.acceptedPlay, drawerRevision);
+            }
+        }
         catch { if (action !== 'snapshot') showError('The player could not apply that command. Try again.'); }
     }
 
-    const toggle = () => {
-        const action = ['playing', 'positioning', 'buffering'].includes(sample.state ?? '') ? 'pause' : 'play';
-        send(action, {item: sample.item});
+    /** DOM handlers return immediately. The command owns its reply and error reporting. */
+    function sendInBackground(action: string, args?: Record<string, unknown>, drawerRevision?: number): void {
+        send(action, args, drawerRevision).catch(logCatch('native playback command'));
+    }
+
+    const toggle = (footerPlay = false) => {
+        const revision = ui.beginPlaybackAction();
+        const action = wantsPlay(sample) ? 'pause' : 'play';
+        sendInBackground(action, {item: sample.item}, footerPlay && action === 'play' ? revision : undefined);
         return action;
     };
     const strip = document.createElement('div');
@@ -171,6 +222,7 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
     paintRanges(strip, {bars: [{}, {}, {}]});
     const ui = createPlaybackUi({
         footerEl: footer,
+        drawer,
         getMode: () => sample.mode ?? 'all',
         onModeCycleClick: () => {
             const item = sample.item;
@@ -188,13 +240,13 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
             if (!sample.duration) return undefined;
             const item = sample.item;
             return {startTime: position(), isCurrent: () => item === sample.item,
-                commitScrubIfCurrent: seconds => send('seek', {item, seconds})};
+                commitScrubIfCurrent: seconds => sendInBackground('seek', {item, seconds})};
         },
-        onExpandedChange: () => { send('snapshot'); },
+        onLayoutChange: () => sendInBackground('snapshot'),
         onChevronClick: () => { if (sample.path) reveal(sample.path); },
-        onFooterPlayPauseClick: toggle, onCenterTapToggle: toggle,
-        onPrev: () => send('previous', {item: sample.item}), onNext: () => send('next', {item: sample.item}),
-        onSeekBy: seconds => send('skip', {item: sample.item, seconds}),
+        onFooterPlayPauseClick: () => toggle(true), onCenterTapToggle: toggle,
+        onPrev: () => sendInBackground('previous', {item: sample.item}), onNext: () => sendInBackground('next', {item: sample.item}),
+        onSeekBy: seconds => sendInBackground('skip', {item: sample.item, seconds}),
     });
     ui.expansionEl.prepend(strip);
     window.addEventListener('oneplay-playback', event => {
@@ -218,7 +270,7 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
     refresh();
     /** Small albums commit in one message. The chunks of a large library are private
      * to this document until commit. A newer intent invalidates the loop at its next await. */
-    async function transfer(queue: LibraryQueue, action: 'start' | 'revise', args: Record<string, unknown>): Promise<void> {
+    async function transfer(queue: LibraryQueue, action: 'start' | 'revise', args: Record<string, unknown>, drawerRevision?: number): Promise<void> {
         const generation = ++buildGeneration;
         const {tracks, ...folder} = queue;
         // Clean only the outgoing chunk so a 30k queue yields between bridge messages.
@@ -235,6 +287,10 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
             const settings = favoriteSettings?.(folder.folder);
             const reply = await applyAndPaint(action, {...folder, favorite: settings?.favorite,
                 ...(action === 'start' && {mode: settings?.mode}), ...args, ...data});
+            if (drawerRevision !== undefined && generation === buildGeneration && reply.acceptedPlay) {
+                updateDrawerForAcceptedPlay(reply.acceptedPlay, drawerRevision, deferredForegroundDrawer);
+                deferredForegroundDrawer = false;
+            }
             const session = reply.snapshot.session;
             const accepted = action === 'start' ? session !== args.base
                 : session === args.session && reply.snapshot.revision === args.revision && !reply.snapshot.fenced;
@@ -275,13 +331,21 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
 
     /** Invalidate a slow build at the tap, before traversal yields to another event. */
     function beginSelection(): void {
+        const drawerRevision = ui.beginPlaybackAction();
         ++buildGeneration;
         ++refreshGeneration;
         pendingSelection = undefined;
         const id = crypto.randomUUID();
         const base = native.playback('intent', {intent: id})
             .then(reply => (reply as {base: string}).base).catch(() => '');
-        intent = {id, base};
+        intent = {id, base, drawerRevision};
+    }
+
+    /** Settle the compact viewport when the first foreground target has lost its Play request. */
+    function settleDeferredForegroundDrawer(): void {
+        if (intent || !deferredForegroundDrawer) return;
+        ui.updateDrawerAfterPlay(undefined, true);
+        deferredForegroundDrawer = false;
     }
 
     /** Cancel only the vanished selection. A newer tap can arrive before WebKit replies. */
@@ -290,6 +354,7 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
         intent = undefined;
         pendingSelection = undefined;
         if (cancelled) await send('cancelIntent', {intent: cancelled.id});
+        settleDeferredForegroundDrawer();
     }
 
     async function start(queue: LibraryQueue, index: number, selected: boolean, timer: TimerDuration): Promise<void> {
@@ -302,8 +367,9 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
         if (favorite) await migratePrivateSpots?.(favorite);
         const base = await target.base;
         if (target !== intent || generation !== buildGeneration) return;
-        await transfer(queue, 'start', {intent: target.id, base, index, selected, timer});
+        await transfer(queue, 'start', {intent: target.id, base, index, selected, timer}, target.drawerRevision);
         if (target === intent && !pendingSelection) intent = undefined;
+        settleDeferredForegroundDrawer();
     }
 
     /** The next durable library edit must not leave an obsolete successor playing under lock. */
@@ -394,14 +460,17 @@ export function attachNativePlayback(native: NativeLibrary, footer: HTMLElement,
             if (!intent) await refreshLibraryQueue();
         },
         refreshLibraryQueue,
-        setTimer: (timer: TimerDuration) => send('timer', {timer}),
+        setTimer: (timer: TimerDuration) => sendInBackground('timer', {timer}),
         currentFolder: () => sample.folder,
-        collapse: () => ui.setExpanded(false),
+        collapse: () => ui.collapseForBrowsing(),
         setDebugEnabled(enabled: boolean): void {
             if (strip.hidden === !enabled) return;
             strip.hidden = !enabled;
             // Recompute the open drawer height and immediately update its native subscription.
-            if (ui.isExpanded()) ui.setExpanded(true);
+            if (ui.isExpanded()) {
+                ui.resizeDrawer();
+                sendInBackground('snapshot');
+            }
         },
         currentPath: () => sample.path,
     };

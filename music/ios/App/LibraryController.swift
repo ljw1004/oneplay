@@ -31,8 +31,12 @@ import WebKit
     private var subscription = UUID().uuidString
     /// Only one document can stage a queue. Every append checks its build ID and offset.
     private var selectionIntent: String?
+    private var foregroundStartSession: String?
     private var staged: (id: String, count: Int, tracks: [IndexedTrack])?
     private var showingAudioRanges = false
+    #if DEBUG
+    var beforePlayReplySampleForTesting: (() async -> Void)?
+    #endif
     /// Both library themes draw a blue header beneath the system status icons.
     override var preferredStatusBarStyle: UIStatusBarStyle { webView == nil ? .default : .lightContent }
 
@@ -347,6 +351,10 @@ import WebKit
         let lookups = showingAudioRanges && !demoActive ? Array(account.mediaRequests.values) : nil
         playbackSequence += 1
         var snapshot = player.snapshot(lookups: lookups, pinSizes: lookups == nil ? [:] : pins.sizes, includeDenied: includeDenied)
+        // A push can beat its command reply. Origin belongs to the session admitted by this document.
+        if let foregroundStartSession, snapshot["session"] as? String == foregroundStartSession {
+            snapshot["foregroundStart"] = true
+        }
         let denied = snapshot.removeValue(forKey: "denied")
         var reply: [String: Any] = ["sequence": playbackSequence, "subscription": subscription, "snapshot": snapshot]
         reply["denied"] = denied
@@ -434,6 +442,7 @@ import WebKit
         pinParts = nil
         inventoryParts = nil
         selectionIntent = nil
+        foregroundStartSession = nil
         showingAudioRanges = false
         // beginSignOut already cancelled page-owned work when it committed the marker.
         if let account, !account.cleanupPending { account.detachView() }
@@ -623,6 +632,7 @@ import WebKit
                     guard args["version"] as? Int == 1, let player, profileBound,
                           let action = args["action"] as? String else { throw NativeAccountError.invalidRequest }
                     var applied: Bool?
+                    var acceptedPlay: NativePlayback.PlayAdmission?
                     var staleProof = false
                     switch action {
                     case "snapshot", "readAccess": break
@@ -710,15 +720,18 @@ import WebKit
                             }
                             guard let index = args["index"] as? Int else { throw NativeAccountError.invalidRequest }
                             let mode = (args["mode"] as? String).flatMap(QueueMode.init(rawValue:))
-                            try player.start(tracks: tracks, startIndex: index, delaySeconds: 0, nearEnd: false, forceRefresh: false,
+                            acceptedPlay = try player.start(tracks: tracks, startIndex: index, delaySeconds: 0, nearEnd: false, forceRefresh: false,
                                              folder: folder, folderKey: folderKey, selected: args["selected"] as? Bool == true, timer: args["timer"] as? String, initialMode: mode, favorite: favorite, legacyPosition: legacy)
+                            if let acceptedPlay { foregroundStartSession = acceptedPlay.session }
                         } else {
                             guard let session = args["session"] as? String, let revision = args["revision"] as? Int else { throw NativeAccountError.invalidRequest }
                             player.revise(session: session, revision: revision, folder: folder, tracks: tracks, favorite: favorite)
                         }
                     default:
                         guard let item = args["item"] as? String else { throw NativeAccountError.invalidRequest }
-                        applied = try player.apply(action, item: item, seconds: args["seconds"] as? Double)
+                        let command = try player.applyFromPage(action, item: item, seconds: args["seconds"] as? Double)
+                        applied = command.applied
+                        acceptedPlay = command.play
                     }
                     // Queue and access updates share this bridge. Only the drawer sets its subscription.
                     if let showing = args["debugRanges"] as? Bool { showingAudioRanges = showing }
@@ -729,8 +742,12 @@ import WebKit
                         // checkpoint writer persists the playing session independently.
                         if action != "cycleMode" { try await player.waitForCheckpointWrites() }
                     }
+                    #if DEBUG
+                    if acceptedPlay != nil { await beforePlayReplySampleForTesting?() }
+                    #endif
                     var sample = playbackSample(player, account, includeDenied: action == "readAccess")
                     if let applied { sample["applied"] = applied }
+                    if let acceptedPlay { sample["acceptedPlay"] = acceptedPlay.bridgeValue }
                     if staleProof { sample["staleProof"] = true }
                     if action == "intent" { sample["base"] = player.sessionID }
                     reply = sample

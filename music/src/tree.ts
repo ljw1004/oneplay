@@ -114,6 +114,8 @@ export interface TreeView {
     setSelectedPath(path: FolderPath): void;
     /** Opens the track's logical parent and scrolls its row into view if needed. */
     revealTrack(path: FolderPath): void;
+    /** Capture an in-view marker and reveal it if the drawer subsequently clips it. */
+    captureMarkerReveal(): (() => void) | undefined;
     /** Update playback indicators (track SVG, folder highlighting, play glyph). */
     setPlaybackInfo(info: PlaybackInfo | undefined, advanced?: boolean): void;
     /** Update select mode rendering state. Checkboxes appear on selectable rows
@@ -136,6 +138,8 @@ export interface TreeView {
     /** Called on every selectedPath change (folder click, breadcrumb, setSelectedPath).
      *  Wired by index.ts to persist oneplay_music_view to localStorage. */
     onPathChange: (path: FolderPath) => void;
+    /** A folder action or scroll input from the listener, independent of scroll events. */
+    onBrowse: () => void;
     /** Physical icons use the same scoped path for a marked folder and its ancestors. */
     setOfflineIcons(favorites: OfflineIcons, folders?: FolderIcons): void;
     /** The selection menu shares the tree's definition of coverage. */
@@ -207,6 +211,15 @@ export function createTree(
     const childrenEl = container.querySelector<HTMLElement>('#children')!;
     const trackRow = (path: FolderPath) => childrenEl.querySelector<HTMLElement>(
         `.tree-row.file[data-path="${CSS.escape(JSON.stringify(path))}"]`);
+    /** Include overlays that can cover the viewport without resizing it. */
+    function visibleListBounds() {
+        const list = childrenEl.getBoundingClientRect();
+        const logTop = document.querySelector('#log-panel.visible')?.getBoundingClientRect().top;
+        const footer = document.querySelector('#footer.expanded');
+        const footerTop = footer && getComputedStyle(footer).position === 'fixed'
+            ? footer.getBoundingClientRect().top : window.innerHeight;
+        return {top: Math.max(list.top, 0), bottom: Math.min(list.bottom, footerTop, logTop ?? window.innerHeight)};
+    }
     const trail = document.createElement('div');
     trail.className = 'folder-trail';
     const search = document.createElement('button');
@@ -494,6 +507,29 @@ export function createTree(
             view.closeSearchMode();
             trackRow(path)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
         },
+        captureMarkerReveal() {
+            if (!playbackInfo || !previousPath || searchModeOpen || selectModeActive || container.hidden) return;
+            const path = playbackInfo.track;
+            const folder = previousPath;
+            const marker = trackRow(path)?.querySelector('.track-indicator')?.getBoundingClientRect();
+            if (!marker?.height) return;
+            const before = visibleListBounds();
+            if (marker.top < before.top || marker.bottom > before.bottom) return;
+            return () => {
+                if (!playbackInfo || !previousPath || !pathEquals(playbackInfo.track, path) || !pathEquals(folder, previousPath)
+                    || searchModeOpen || selectModeActive || container.hidden) return;
+                const marker = trackRow(path)?.querySelector('.track-indicator')?.getBoundingClientRect();
+                if (!marker?.height) return;
+                const {top, bottom} = visibleListBounds();
+                if (bottom - top < marker.height) return;
+                const delta = marker.bottom > bottom ? Math.ceil(marker.bottom - bottom)
+                    : marker.top < top ? Math.floor(marker.top - top) : 0;
+                const target = childrenEl.scrollTop + delta;
+                if (delta && target >= 0 && target <= childrenEl.scrollHeight - childrenEl.clientHeight) {
+                    childrenEl.scrollTop = target;
+                }
+            };
+        },
         setPlaybackInfo(info, advanced = false) {
             // Sample the outgoing row before render replaces it. The children list is clipped
             // by the breadcrumbs and drawer. A covered row cannot grant permission to navigate.
@@ -503,13 +539,21 @@ export function createTree(
             let follow = false;
             if (row) {
                 const bounds = row.getBoundingClientRect();
-                const list = childrenEl.getBoundingClientRect();
-                const top = Math.max(bounds.top, list.top, 0);
-                const logTop = document.querySelector('#log-panel.visible')?.getBoundingClientRect().top;
-                follow = top < Math.min(bounds.bottom, list.bottom, logTop ?? window.innerHeight);
+                const list = visibleListBounds();
+                follow = Math.max(bounds.top, list.top) < Math.min(bounds.bottom, list.bottom);
             }
+            const focused = document.activeElement;
+            const focusedPlay = breadcrumbsEl.contains(focused) ? focused?.closest('.play-btn') : undefined;
+            const focusedRow = focusedPlay?.closest<HTMLElement>('.tree-row')?.dataset.path;
             playbackInfo = info;
             render();
+            if (document.activeElement === document.body) {
+                // The landscape drawer can hand off the control's focus after publishing the marker.
+                const retainedFocus = focusedRow
+                    ? breadcrumbsEl.querySelector<HTMLElement>(`[data-path="${CSS.escape(focusedRow)}"] .play-btn`)
+                    : focused === search ? search : undefined;
+                retainedFocus?.focus({preventScroll: true});
+            }
             if (follow && info) view.revealTrack(info.track);
         },
         setSelectMode(active, paths) {
@@ -528,6 +572,7 @@ export function createTree(
         onSelectExit: () => {},
         onFavoriteRootTap: (_path) => {},
         onPathChange: (_path) => {},
+        onBrowse: () => {},
         setOfflineIcons(favorites, folders = new Map()) {
             offlineIcons = favorites;
             folderIcons = folders;
@@ -693,6 +738,7 @@ export function createTree(
             // Folders navigate into children.
             // Clicking the already-selected folder is a no-op (avoids flicker).
             el.addEventListener('click', () => {
+                view.onBrowse();
                 if (pathEquals(opts.path, selectedPath)) return;
                 selectedPath = opts.path;
                 if (isFavoriteRoot) view.onFavoriteRootTap(opts.path);
@@ -1178,6 +1224,31 @@ export function createTree(
             });
         }
     }
+
+    // Observe input before browsers report identical scroll events for users and scripts.
+    childrenEl.addEventListener('wheel', event => {
+        if (!event.ctrlKey && Math.abs(event.deltaY) > Math.abs(event.deltaX)) view.onBrowse();
+    }, {passive: true});
+    let panStart: Touch | undefined;
+    childrenEl.addEventListener('touchstart', event => {
+        panStart = event.touches.length === 1 ? event.touches[0] : undefined;
+    }, {passive: true});
+    childrenEl.addEventListener('touchmove', event => {
+        if (!panStart || event.touches.length !== 1) return;
+        const touch = event.touches[0];
+        if (touch.identifier !== panStart.identifier) return;
+        const y = Math.abs(touch.clientY - panStart.clientY);
+        if (y < 8 || y <= Math.abs(touch.clientX - panStart.clientX)) return;
+        panStart = undefined;
+        view.onBrowse();
+    }, {passive: true});
+    childrenEl.addEventListener('touchend', () => { panStart = undefined; }, {passive: true});
+    childrenEl.addEventListener('touchcancel', () => { panStart = undefined; }, {passive: true});
+    childrenEl.addEventListener('keydown', event => {
+        if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
+        if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'].includes(event.key)
+            || (event.key === ' ' && event.target === childrenEl)) view.onBrowse();
+    });
 
     // -- Scroll position tracking (M10) ----------------------------------------
     // rAF-throttled scroll listener saves scrollTop keyed by current path.

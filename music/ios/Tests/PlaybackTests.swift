@@ -507,6 +507,7 @@ extension PlaybackTests {
         try await Task.sleep(for: .milliseconds(650))
         try player.finishInterruption(shouldResume: true)
         XCTAssertEqual(player.snapshot["state"] as? String, "paused")
+        XCTAssertEqual(player.snapshot["naturalStopID"] as? Int, 0, "An already interrupted run does not stop again at the deadline")
     }
 
     func testRemovedCurrentFinishesThenUsesSurvivingFormerNeighbor() async throws {
@@ -539,6 +540,7 @@ extension PlaybackTests {
         try player.apply("seek", item: item, seconds: duration - 0.4)
         let ended = try await waitFor(player) { $0["state"] as? String == "ended" }
         XCTAssertEqual(ended["item"] as? String, item)
+        XCTAssertEqual(ended["naturalStopID"] as? Int, 1)
         try player.apply("next", item: item, seconds: nil)
         _ = try await waitFor(player) { $0["key"] as? String == "B" && $0["state"] as? String == "playing" }
     }
@@ -583,10 +585,13 @@ extension PlaybackTests {
         let first = try await waitFor(player) { $0["state"] as? String == "paused" }
         let time = try XCTUnwrap(first["position"] as? Double)
         XCTAssertGreaterThan(time, 0)
-        try player.apply("play", item: try XCTUnwrap(first["item"] as? String), seconds: nil)
+        XCTAssertEqual(first["naturalStopID"] as? Int, 1)
+        let resume = try player.applyFromPage("play", item: try XCTUnwrap(first["item"] as? String), seconds: nil)
+        XCTAssertEqual(resume.play?.naturalStopID, 1)
         let second = try await waitFor(player) { $0["state"] as? String == "paused" }
         XCTAssertGreaterThan(try XCTUnwrap(second["position"] as? Double), time)
         XCTAssertEqual(second["item"] as? String, first["item"] as? String)
+        XCTAssertEqual(second["naturalStopID"] as? Int, 2)
     }
 }
 
@@ -605,9 +610,37 @@ extension PlaybackTests {
         let ended = try await waitFor(player) { $0["state"] as? String == "ended" }
         XCTAssertEqual(ended["key"] as? String, "A")
         XCTAssertEqual(ended["fenced"] as? Bool, true)
+        XCTAssertEqual(ended["naturalStopID"] as? Int, 0)
         player.revise(session: session, revision: 1, folder: [], tracks: [tracks[0], tracks[2]])
         _ = try await waitFor(player) { $0["key"] as? String == "C" && $0["state"] as? String == "playing" }
         XCTAssertEqual(player.snapshot["fenced"] as? Bool, false)
+        XCTAssertEqual(player.snapshot["naturalStopID"] as? Int, 0)
+    }
+
+    func testPlayAdmissionSurvivesAdvanceAndReportsStopAfterRemoteResume() async throws {
+        let (player, tracks) = try liveQueue()
+        defer { player.stop() }
+        let start = try XCTUnwrap(player.start(tracks: Array(tracks.prefix(2)), delaySeconds: 0, nearEnd: false,
+            forceRefresh: false, initialMode: .all))
+        let incoming = try await waitFor(player) { $0["key"] as? String == "B" && $0["state"] as? String == "playing" }
+        XCTAssertEqual(incoming["session"] as? String, start.session)
+        XCTAssertEqual(incoming["targetRevision"] as? Int, start.targetRevision)
+        XCTAssertEqual(incoming["naturalStopID"] as? Int, start.naturalStopID)
+        let ended = try await waitFor(player) { $0["state"] as? String == "ended" }
+        XCTAssertEqual(ended["naturalStopID"] as? Int, start.naturalStopID + 1)
+        XCTAssertTrue(try player.applyRemote("play"))
+        let resumed = try await waitFor(player) { $0["state"] as? String == "playing" }
+        XCTAssertEqual(resumed["session"] as? String, start.session)
+        XCTAssertEqual(resumed["naturalStopID"] as? Int, start.naturalStopID + 1)
+
+        // A fenced final held recording only counts as a stop when revision confirms no successor.
+        let session = try XCTUnwrap(resumed["session"] as? String)
+        player.fence(session: session, revision: 1)
+        _ = try await waitFor(player) { $0["state"] as? String == "ended" }
+        XCTAssertEqual(player.snapshot["naturalStopID"] as? Int, start.naturalStopID + 1)
+        player.revise(session: session, revision: 1, folder: [], tracks: [])
+        XCTAssertNil(player.snapshot["item"])
+        XCTAssertEqual(player.snapshot["naturalStopID"] as? Int, start.naturalStopID + 2)
     }
 }
 

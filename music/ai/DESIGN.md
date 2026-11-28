@@ -102,6 +102,17 @@ The motive this design is
 
 If there's no playback folder, then we'll hide the entire playback area.
 
+### When the player expands and collapses
+
+Some listeners want the wheel and play mode visible while listening and more room for the list while browsing. Others usually want the compact player and open the wheel when they need it. The same drawer gestures serve both preferences, with no extra control in Settings.
+
+- The internal `auto-expand` preference starts on. Manually opening the drawer turns it on. Manually closing the drawer turns it off. A listener who opens it to change mode can close it afterward to return to compact starts.
+- With `auto-expand` on, a deliberate Play gesture opens the drawer once the player has a track to play. This includes tapping a track, pressing folder Play, or pressing Play or Resume in the footer. Automatic advance, recovery from buffering, and system resume leave the drawer as it is.
+- Browsing collapses the drawer while playback continues. This includes scrolling the folder list and tapping a folder or breadcrumb. Entering Search, Settings, or Select also collapses it. The navigation gesture still carries out its usual action.
+- A natural stop collapses the drawer when it happens. This includes the track ending in **One**, the queue ending in **All**, and **Timer** reaching its stopping point. A manual pause leaves the drawer as it is. The listener can reopen it after a stop and use the mode control.
+- Automatic changes preserve `auto-expand`. Remember both the preference and the actual drawer size on reopen. A drawer that collapsed during browsing reopens compact and can expand again at the next Play gesture.
+- On manual or automatic expansion, keep the listener in the same folder. If the playing indicator was visible there just before expansion and the drawer covers it, scroll only as far as needed to reveal it when space permits. A full-height landscape drawer leaves no space for a reveal. Scrolling to reveal the indicator leaves the drawer open.
+
 ## Relationship between Playlist, Playback Controls, and "Playback folder"
 
 This section introduces the notion of "playback folder".

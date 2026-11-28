@@ -137,15 +137,8 @@ async function setFakeNow(page, nowMs) {
 
 /** Ensures playback expansion is visible, then cycles mode to target text. */
 async function setPlaybackMode(page, targetMode) {
-    await page.evaluate(() => {
-        const footer = document.getElementById("footer");
-        if (!(footer instanceof HTMLElement)) return;
-        footer.classList.add("expanded");
-        const expansion = footer.querySelector(".expansion");
-        if (expansion instanceof HTMLElement) {
-            expansion.style.maxHeight = expansion.scrollHeight + "px";
-        }
-    });
+    const gripper = page.getByRole('button', {name: 'Player controls'});
+    if (await gripper.getAttribute('aria-expanded') !== 'true') await gripper.click();
     const label = page.locator(".mode-label");
     await label.waitFor({ state: "visible", timeout: 3000 });
     for (let i = 0; i < 8; i++) {

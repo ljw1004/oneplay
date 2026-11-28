@@ -253,7 +253,8 @@ module.exports = {
         const firstFile = await findFirstFileRow(page);
         assert(firstFile, "Expected at least one playable track row");
         await clickTrackAndWaitForPlaybackReady(page, firstFile);
-        await page.locator("#footer .footer-gripper").click();
+        const gripper = page.getByRole('button', {name: 'Player controls'});
+        if (await gripper.getAttribute('aria-expanded') !== 'true') await gripper.click();
         await page.waitForFunction(
             () => document.getElementById("footer")?.classList.contains("expanded") === true,
             undefined,

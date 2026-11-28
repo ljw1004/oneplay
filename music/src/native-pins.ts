@@ -320,7 +320,12 @@ export function createOfflinePins(backend: NativeLibrary | Downloads, render: (p
             return previewProgress('folder:' + JSON.stringify([path, folder.itemId]), folder);
         },
         async publishOwners(favorites: readonly Favorite[], pins: readonly FolderPin[], roots: RootsMap, denied: ReadonlySet<string>, favoritesKnown: boolean, sharesKnown: boolean) {
-            if (!favoritesKnown) return;
+            if (!favoritesKnown) {
+                // Offline playback can read cached files while their owners are unknown.
+                // Incomplete membership leaves every cached file eligible for retention.
+                if (browser && !latest) await browser.setPinnedKeys(new Set(), new Set(), false);
+                return;
+            }
             // Tree rendering recreates root wrappers. Only source folder identity, reindexing,
             // denial and favorite edits can invalidate physical membership.
             const physical: RootsMap = new Map([...roots].filter(([, r]) => r.type === 'share' || isWalkableRoot(r)));

@@ -75,7 +75,7 @@ module.exports = {
                 members: Array(100).fill(member) });
             const folder = ["OnePlay Music", "fav:" + id];
             const track = [...folder, "m:79"];
-            window._testPlayback.restoreVisualState(folder, track, "all", false, 0, id);
+            window._testPlayback.restoreVisualState(folder, track, "all", 0, id);
             return track;
         }, fixture);
         const chevron = page.locator(".footer-indicator");
@@ -300,8 +300,8 @@ module.exports = {
 
     // -- Expanded controls ----------------------------------------------------
 
-    /** Footer is visible after clicking a track but has no .expanded class. */
-    async "expanded: not expanded initially"(page) {
+    /** Admitted track Play opens the drawer by default. */
+    async "expanded: a track opens the drawer by default"(page) {
         await clickAccount(page);
         const file = await findFirstFileRow(page);
         if (!file) return;
@@ -314,7 +314,7 @@ module.exports = {
             };
         });
         assert(state.visible, "Footer should be visible after clicking a track");
-        assert(!state.expanded, "Footer should not have .expanded class initially");
+        assert(state.expanded, "Track Play should expand the footer");
     },
 
     /** Expansion DOM contains all required elements: shell, wheel, text, thumb,
@@ -349,12 +349,8 @@ module.exports = {
         const file = await findFirstFileRow(page);
         if (!file) return;
         await clickTrackAndWaitForPlaybackReady(page, file);
-        await page.evaluate(() => {
-            const footer = document.getElementById("footer");
-            const expansion = footer.querySelector(".expansion");
-            footer.classList.add("expanded");
-            expansion.style.maxHeight = expansion.scrollHeight + "px";
-        });
+        const gripper = page.getByRole('button', {name: 'Player controls'});
+        if (await gripper.getAttribute('aria-expanded') !== 'true') await gripper.click();
         await page.waitForFunction(() => {
             const expansion = document.getElementById("footer")?.querySelector(".expansion");
             return !!expansion && expansion.getBoundingClientRect().height > 100;
@@ -450,6 +446,7 @@ module.exports = {
 
     /** Same-path re-render (entering select mode) preserves live scroll position. */
     async "select: entering mode preserves live scroll position"(page) {
+        await page.setViewportSize({width: 390, height: 460});
         const prevFlipSeq = await getTestSeq(page, "_testTreeFlipSeq");
         await clickAccount(page);
         await waitForFlipSettled(page, prevFlipSeq);
@@ -457,11 +454,24 @@ module.exports = {
             // Normalize layout so footer visibility changes don't affect this test.
             const footer = document.getElementById("footer");
             if (footer instanceof HTMLElement) {
-                footer.classList.remove("expanded");
-                footer.classList.remove("visible");
+                window._testPlayback.stop();
             }
             const children = document.getElementById("children");
             if (!(children instanceof HTMLElement)) return { ok: false, reason: "missing #children" };
+            if (children.scrollHeight - children.clientHeight < 80) {
+                // Live accounts don't necessarily overflow at their top level.
+                const tree = window._testTree;
+                const pending = [...tree.getRoots()].filter(([, root]) => root.type === 'onedrive')
+                    .map(([key, root]) => [root.folder, ['OnePlay Music', key]]);
+                while (pending.length) {
+                    const [folder, path] = pending.pop();
+                    const entries = Object.entries(folder.children);
+                    if (entries.length >= 16) { tree.setSelectedPath(path); break; }
+                    for (const [name, entry] of entries) {
+                        if (entry.children) pending.push([entry, [...path, name]]);
+                    }
+                }
+            }
             const maxScroll = Math.max(0, children.scrollHeight - children.clientHeight);
             if (maxScroll < 80) return { ok: false, reason: `insufficient overflow (${maxScroll})` };
 

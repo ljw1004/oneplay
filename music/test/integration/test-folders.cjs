@@ -164,10 +164,12 @@ module.exports = {
         await child('Books').click();
         await page.locator('.footer-indicator').click();
         assert.equal(await names.count(), 1);
-        assert(await track.evaluate(row => {
+        await page.waitForFunction(path => {
+            const row = document.querySelector(`#children .tree-row[data-path="${CSS.escape(path)}"]`);
+            if (!row) return false;
             const bounds = row.getBoundingClientRect(), list = row.parentElement.getBoundingClientRect();
             return bounds.top >= list.top && bounds.bottom <= list.bottom;
-        }));
+        }, await track.getAttribute('data-path'));
         await choose(child('Books'), add);
         await home.locator('.offline-badge.partial').waitFor();
         await child('Jazz').click();

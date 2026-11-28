@@ -9,6 +9,7 @@ import type { EvidenceState } from './auth.js';
 import type { BrowserMedia } from './provider.js';
 import { type TimerDuration } from './settings.js';
 import {
+    type DrawerView,
     type PlaybackUiController,
     createPlaybackUi,
     timeString,
@@ -92,15 +93,13 @@ export interface Playback {
     /** Restore visual state without eagerly loading audio on startup. */
     restoreVisualState(
         folder: FolderPath, track: FolderPath, mode: PlaybackMode,
-        expandedState: boolean, time: number,
+        time: number,
         favId?: string, accounts?: AccountsMap, bookmark?: Partial<GlobalPlaybackSave>,
     ): Promise<boolean>;
     /** Called when user clicks the footer chevron indicator. Wired by index.ts. */
     onChevronClick: () => void;
     /** Called after every playback state change. Wired by index.ts → tree.setPlaybackInfo. */
     onPlaybackChange: (info: PlaybackInfo | undefined, advanced?: boolean) => void;
-    /** Called when expanded state changes. Wired by index.ts to persist oneplay_music_view. */
-    onExpandedChange: (expanded: boolean) => void;
     /** Called when folder play is user-triggered but no playable tracks exist. */
     onPlayBlockedNoPlayableTracks: (path: FolderPath) => void;
 }
@@ -129,6 +128,7 @@ export function createPlayback(
     migrateLegacyFavorite?: (id: string) => Promise<void>,
     storage: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> = localStorage,
     database = {dbGet, dbPut},
+    drawer?: DrawerView,
 ): Playback {
     // -----------------------------------------------------------------------
     // State
@@ -247,6 +247,7 @@ export function createPlayback(
         log(`timer: fired (${reason}) track=${trackName} at=${audioEl.currentTime.toFixed(2)}s`);
         clearTimerDeadline(`expire:${reason}`);
         pausePlayback();
+        ui.collapseAfterStop();
         updateFooter();
         view.onPlaybackChange(getInfo()!);
     };
@@ -333,16 +334,17 @@ export function createPlayback(
     };
     // -- Playback controls ---------------------------------------------------
     /** Starts playback without toggling pause state. */
-    function doPlay(playErrorTag = 'play-on-play'): void {
+    function doPlay(playErrorTag = 'play-on-play', drawerRevision?: number): void {
         playRequested = true;
         // Cold-start: visual state may be restored while audio has no src.
         // First explicit play resolves URL and seeks to restored position.
         if (audioEl.paused && !audioEl.src && current) {
-            playNext(current, currentTrackIdx, true, restoredCurrentTime);
+            playNext(current, currentTrackIdx, true, restoredCurrentTime, false, drawerRevision).catch(logCatch(playErrorTag));
             return;
         }
         if (!audioEl.paused) return;
         audioEl.play().catch(logCatch(playErrorTag));
+        if (current && drawerRevision !== undefined) ui.updateDrawerAfterPlay(drawerRevision);
     }
 
     /** Record the pause even if a loading or failed media element emits no pause event. */
@@ -357,7 +359,7 @@ export function createPlayback(
         const idx = held ? heldNeighbor('before') : computePrevIdx(playbackMode, currentTrackIdx, trackList, isPlayable);
         if (idx === undefined) return;
         rearmTimerFromUserInteractionIfPlaying('prev');
-        playNext(trackList[idx], idx, true);
+        playNext(trackList[idx], idx, true).catch(logCatch('play previous'));
     }
 
     /** Manual Next may leave One and end-of-track Timer, including a removed song. */
@@ -373,7 +375,7 @@ export function createPlayback(
         }
         if (idx === undefined) { if (held) clearSession(); return; }
         if (reason === 'next') rearmTimerFromUserInteractionIfPlaying('next');
-        playNext(trackList[idx], idx, true, 0, true);
+        playNext(trackList[idx], idx, true, 0, true).catch(logCatch('play next'));
     }
 
     /** Streams and unloaded sources may have an infinite or unknown duration. */
@@ -408,6 +410,7 @@ export function createPlayback(
     // playback-ui owns DOM and gesture mechanics; this module supplies policy callbacks.
     const ui: PlaybackUiController = createPlaybackUi({
         footerEl,
+        drawer,
         getMode: () => playbackMode,
         getDuration,
         onScrubStart: () => {
@@ -459,18 +462,19 @@ export function createPlayback(
             saveMmPlayback();
             if (activeFavId) await favoritesRef?.setMode(activeFavId, playbackMode).catch(logCatch('playback:save-mode'));
         },
-        onExpandedChange: (expanded) => {
+        onLayoutChange: (expanded) => {
             if (expanded && phase !== 'loading' && !ui.isScrubbing()) showCurrentTime();
-            view.onExpandedChange(expanded);
         },
         onChevronClick: () => { if (!held) view.onChevronClick(); },
         onFooterPlayPauseClick: () => {
-            if (audioEl.paused) doPlay('play-on-playpause');
+            const drawerRevision = ui.beginPlaybackAction();
+            if (audioEl.paused) doPlay('play-on-playpause', drawerRevision);
             else pausePlayback();
         },
         onCenterTapToggle: () => {
+            ui.beginPlaybackAction();
             if (audioEl.paused && !audioEl.src && current) {
-                playNext(current, currentTrackIdx, true, restoredCurrentTime);
+                playNext(current, currentTrackIdx, true, restoredCurrentTime).catch(logCatch('play-on-center-tap'));
                 return 'play';
             }
             const willPlay = audioEl.paused;
@@ -488,7 +492,6 @@ export function createPlayback(
         titleEl,
         scrubberTextEl,
         scrubberTimeEl,
-        expansionEl,
     } = ui;
 
     // Drive play/pause affordance from media events, never optimistically.
@@ -512,7 +515,8 @@ export function createPlayback(
         if (audioEl.paused && !audioEl.error && phase !== 'loading') playRequested = false;
         ui.setPlayPausePlaying(false);
         if (playbackMode === 'timer') {
-            if (!suppressTimerPauseClear) {
+            // EOF can queue pause before ended. Keep its deadline for the natural boundary decision.
+            if (!suppressTimerPauseClear && !audioEl.ended) {
                 clearTimerDeadline('pause-event');
             }
         } else {
@@ -549,7 +553,7 @@ export function createPlayback(
     // Backstop: if timers expired while backgrounded, reconcile on visibility.
     document.addEventListener('visibilitychange', () => {
         if (document.visibilityState !== 'visible' || playbackMode !== 'timer') return;
-        if (!isTimerExpiredNow(Date.now())) return;
+        if (audioEl.ended || !isTimerExpiredNow(Date.now())) return;
         if (!audioEl.paused) {
             expireTimerAndPauseInPlace('visibilitychange');
             return;
@@ -557,13 +561,13 @@ export function createPlayback(
         clearTimerDeadline('visibilitychange-paused');
     });
     /** Syncs footer DOM with current playback state. */
-    const updateFooter = (): void => {
+    const updateFooter = (): boolean => {
         const visible = !!current;
         indicatorSvg.setAttribute('aria-disabled', String(!!held));
-        footerEl.classList.toggle('visible', visible);
+        const firstTarget = ui.setTargetVisible(visible);
         if (!visible) {
             updateMediaSession();
-            return;
+            return false;
         }
 
         titleEl.textContent = current?.title ?? '';
@@ -572,6 +576,7 @@ export function createPlayback(
         scrubberTextEl.classList.toggle('loading', phase === 'loading');
         if (phase === 'loading') scrubberTimeEl.textContent = '';
         updateMediaSession();
+        return firstTarget;
     };
     const updateMediaSession = (): void => {
         if (!('mediaSession' in navigator)) return;
@@ -629,6 +634,7 @@ export function createPlayback(
         if (playbackMode === 'timer') {
             if (timerMs === undefined) {
                 clearTimerDeadline('ended-end-of-track');
+                ui.collapseAfterStop();
                 if (held) clearSession();
                 log('ENDED: end-of-track reached, stopping');
                 return;
@@ -637,6 +643,7 @@ export function createPlayback(
                 const deadlineAtCatch = timerDeadlineMs;
                 clearTimerDeadline('ended-expired');
                 const lagMs = deadlineAtCatch === undefined ? undefined : Math.max(0, Date.now() - deadlineAtCatch);
+                ui.collapseAfterStop();
                 if (held) clearSession();
                 logError(`ENDED: missed expiry caught at ended, stopping (lagMs=${lagMs ?? 'unknown'})`);
                 return;
@@ -649,6 +656,8 @@ export function createPlayback(
             nextIdx = computeFirstPlayableIdxAfterReshuffle(trackList, isPlayable);
         }
         if (nextIdx === undefined) {
+            clearTimerDeadline('ended-no-successor');
+            ui.collapseAfterStop();
             if (held) clearSession();
             return;
         }
@@ -682,7 +691,7 @@ export function createPlayback(
         } else {
             // Async fallback reuses full `playNext` pipeline with race guards.
             logError('ENDED: async fallback');
-            playNext(next, nextIdx, true, 0, true);
+            playNext(next, nextIdx, true, 0, true).catch(logCatch('play after ended'));
         }
     }
 
@@ -710,7 +719,7 @@ export function createPlayback(
 
     // Throttled persistence + near-end prefetch.
     audioEl.addEventListener('timeupdate', () => {
-        if (playbackMode === 'timer' && isTimerExpiredNow(Date.now())) {
+        if (playbackMode === 'timer' && !audioEl.paused && !audioEl.ended && isTimerExpiredNow(Date.now())) {
             expireTimerAndPauseInPlace('timeupdate');
             return;
         }
@@ -747,7 +756,8 @@ export function createPlayback(
      * INVARIANT: every call increments asyncCounter; stale async completions
      * from older transitions are ignored.
      */
-    async function playNext(entry: QueueEntry, idx: number, shouldPlay: boolean, startTime?: number, advanced = false): Promise<void> {
+    async function playNext(entry: QueueEntry, idx: number, shouldPlay: boolean, startTime?: number, advanced = false,
+        drawerRevision?: number): Promise<void> {
         log('PLAYNEXT...');
         cancelSeekDebounce();
         suppressTimerPauseClear = false;
@@ -781,9 +791,10 @@ export function createPlayback(
         lastSavedTimeBucket = -1;
         currentTrackIdx = idx;
         phase = 'loading';
-        updateFooter();
+        const firstTarget = updateFooter();
         bumpTestPlaybackSeq();
         view.onPlaybackChange(getInfo()!, advanced);
+        if (drawerRevision !== undefined) ui.updateDrawerAfterPlay(drawerRevision, firstTarget);
         saveMmPlayback();
 
         saveMmTime();
@@ -952,6 +963,7 @@ export function createPlayback(
      * A concurrent edit reprojects the selected folder and tapped occurrence by their original keys. */
     async function selectQueue(path: FolderPath, accounts: AccountsMap, tapped: boolean): Promise<void> {
         const intent = ++selection;
+        const drawerRevision = ui.beginPlaybackAction();
         accountsRef = accounts;
         // Let Safari authorize this element in the initiating gesture, before a large walk yields.
         if (!audioEl.src && navigator.userActivation?.isActive) audioEl.load();
@@ -1033,7 +1045,8 @@ export function createPlayback(
         boundary = undefined;
         const idx = !tapped && playbackMode === 'shuffle' ? findFirstPlayableIdxInList(trackList, isPlayable)!
             : trackList.findIndex(t => t.key === target.key);
-        await playNext(trackList[idx], idx, true, resume && Number.isFinite(saved?.time) ? Math.max(0, saved!.time) : 0);
+        await playNext(trackList[idx], idx, true, resume && Number.isFinite(saved?.time) ? Math.max(0, saved!.time) : 0,
+            false, drawerRevision);
     }
 
     // -- Public API ----------------------------------------------------------
@@ -1057,7 +1070,7 @@ export function createPlayback(
             footerEl.removeAttribute('aria-busy');
             clearSession();
         },
-        collapse() { ui.setExpanded(false); },
+        collapse() { ui.collapseForBrowsing(); },
 
         setContext(favorites, roots, denied = new Set(), known = true) {
             ++libraryRevision;
@@ -1131,10 +1144,9 @@ export function createPlayback(
 
         onChevronClick: () => {},
         onPlaybackChange: () => {},
-        onExpandedChange: () => {},
         onPlayBlockedNoPlayableTracks: () => {},
 
-        async restoreVisualState(folder, track, mode, expandedState, time, favId, accounts, bookmark) {
+        async restoreVisualState(folder, track, mode, time, favId, accounts, bookmark) {
             // Restore once from the matching revision and never displace an explicit selection.
             if (selection) return true;
             if (accounts) accountsRef = accounts;
@@ -1173,12 +1185,10 @@ export function createPlayback(
             saveMmPlayback();
             saveMmTime();
             updateFooter();
+            ui.restoreDrawer();
             ui.setModeLabelText(playbackMode);
             bumpTestPlaybackSeq();
             view.onPlaybackChange(getInfo());
-            expansionEl.style.transition = 'none';
-            ui.setExpanded(expandedState);
-            requestAnimationFrame(() => { expansionEl.style.transition = ''; });
             return true;
         },
     };

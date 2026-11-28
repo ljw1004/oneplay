@@ -30,13 +30,7 @@ module.exports = {
         const firstTrack = page.locator("#children .tree-row.file").first();
         if (await firstTrack.count() === 0) return;
         await clickTrackAndWaitForPlaybackReady(page, firstTrack);
-        // Expand the footer to see mode label
-        await page.evaluate(() => {
-            const footer = document.getElementById("footer");
-            footer.classList.add("expanded");
-            const expansion = footer.querySelector(".expansion");
-            expansion.style.maxHeight = expansion.scrollHeight + "px";
-        });
+        await setPlaybackMode(page, 'all');
         await page.locator(".mode-label").waitFor({ state: "visible", timeout: 3000 });
         // Expected cycle: all → repeat → shuffle → one → timer → all
         const expected = ["repeat", "shuffle", "one", "timer", "all"];
@@ -60,13 +54,7 @@ module.exports = {
         const firstTrack = page.locator("#children .tree-row.file").first();
         if (await firstTrack.count() === 0) return;
         await clickTrackAndWaitForPlaybackReady(page, firstTrack);
-        // Expand
-        await page.evaluate(() => {
-            const footer = document.getElementById("footer");
-            footer.classList.add("expanded");
-            const expansion = footer.querySelector(".expansion");
-            expansion.style.maxHeight = expansion.scrollHeight + "px";
-        });
+        await setPlaybackMode(page, 'all');
         await page.locator(".mode-label").waitFor({ state: "visible", timeout: 3000 });
         const size = await page.evaluate(() => {
             const label = document.querySelector(".mode-label");

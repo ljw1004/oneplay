@@ -237,12 +237,36 @@ module.exports = {
             const {dbPut} = await import('./dist/db.js');
             localStorage.account_info = JSON.stringify({driveId:'personal', displayName:'OneDrive'});
             localStorage.access_token = 'fixture-token';
+            const folder = ['OnePlay Music', 'personal'];
+            localStorage.oneplay_music_playback = JSON.stringify({folder, track:[...folder, 'Personal song.mp3'], mode:'all'});
             await dbPut('index:personal', {kind:'MusicData', count:1, folder:{id:'root',
                 children:{'Personal song.mp3':{id:'track'}}}});
         });
         try {
             await page.goto(url);
             await started;
+            await page.getByRole('button', {name:'Open settings'}).click();
+            await page.getByRole('button', {name:'Player controls'}).click();
+            await page.evaluate(() => {
+                const favorites = window._testFavorites;
+                const flush = favorites.whenLocalWritesComplete;
+                favorites.whenLocalWritesComplete = () => new Promise((_, reject) => {
+                    window.failCleanup = () => {
+                        favorites.whenLocalWritesComplete = flush;
+                        reject(new Error('Fixture cleanup failure'));
+                    };
+                });
+            });
+            await page.getByRole('button', {name:'Sign out', exact:true}).click();
+            await page.waitForFunction(() => typeof window.failCleanup === 'function');
+            const tree = page.locator('#tree-container');
+            assert.equal(await tree.evaluate(el => el.inert), true);
+            await page.setViewportSize({width:844, height:390});
+            assert.equal(await tree.evaluate(el => el.inert), true);
+            await page.evaluate(() => window.failCleanup());
+            await page.waitForFunction(() => !document.getElementById('footer').inert);
+            assert.equal(await tree.evaluate(el => el.inert), false);
+            assert.equal(await page.locator('#settings-container').evaluate(el => el.inert), false);
             await page.getByRole('button', {name:'Open settings'}).click();
             await page.getByRole('button', {name:'Sign out', exact:true}).click();
             await explore(page).waitFor({timeout:5000});

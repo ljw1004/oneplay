@@ -168,7 +168,7 @@ body{background:var(--bg-header);height:100%;display:flex;flex-direction:column;
 @keyframes spin{from{transform:rotate(0deg);}
 to{transform:rotate(360deg);}
 }
-#footer{display:none;flex-direction:column;width:100%;background:var(--bg-footer);border-top:1px solid var(--border-footer);flex-shrink:0;position:relative;z-index:1;}
+#footer{display:none;flex-direction:column;width:100%;background:var(--bg-footer);border-top:1px solid var(--border-footer);flex-shrink:0;position:relative;z-index:1;touch-action:none;}
 #footer.visible:not([hidden]){display:flex;}
 #footer.expanded{background:linear-gradient(to right,var(--footer-edge-highlight),rgba(255,255,255,0)) 10px 0/24px 100% no-repeat,linear-gradient(to right,var(--footer-edge-shadow),rgba(0,0,0,0)) 0/10px 100% no-repeat,linear-gradient(to left,var(--footer-edge-shadow),rgba(0,0,0,0)) 100%/10px 100% no-repeat,var(--bg-footer);}
 /* Cast the shadow onto the list, including the screen edges outside the landscape safe area. */
@@ -179,8 +179,13 @@ to{transform:rotate(360deg);}
     background:linear-gradient(to top,var(--player-cast-shadow),30%,transparent);
 }
 .footer-bar{display:grid;grid-template-columns:auto 1fr auto;gap:4px;align-items:center;padding:4px 12px;padding-bottom:calc(4px + env(safe-area-inset-bottom) / 2);}
-.footer-gripper{display:flex;justify-content:center;padding:6px 0 2px;}
+.footer-grip-row{position:relative;height:13px;flex-shrink:0;touch-action:none;}
+/* Keep the 44 px button clear of the wheel, which starts 24 px below this row. */
+#footer.expanded .footer-grip-row{height:20px;}
+.footer-gripper{position:absolute;z-index:1;top:0;left:50%;transform:translateX(-50%);display:flex;justify-content:center;align-items:flex-start;width:44px;height:44px;padding:6px 0 0;border:0;background:none;cursor:pointer;touch-action:none;}
 .footer-gripper::before{content:'';width:36px;height:5px;border-top:2px solid var(--border-footer);border-bottom:2px solid var(--border-footer);}
+.compact-gripper-reach{position:absolute;left:0;right:0;bottom:100%;touch-action:none;}
+#footer.expanded .compact-gripper-reach{display:none;}
 .expansion{max-height:0;overflow:hidden;transition:max-height 300ms ease;}
 #footer.expanded .expansion{max-height:var(--drawer-content-height);}
 .expansion-inner{position:relative;display:flex;align-items:center;justify-content:center;flex:1 1 auto;min-height:0;}
@@ -205,7 +210,8 @@ to{transform:rotate(360deg);}
  * sizes itself to the remaining space. The mode button sits beside the wheel. */
 @media (orientation:landscape) and (max-height:500px){
     #footer.expanded{position:fixed;inset:env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);width:auto;}
-    #footer.expanded .footer-gripper{padding-block:12px;}
+    #footer.expanded .footer-grip-row{height:44px;}
+    #footer.expanded .footer-gripper{padding-top:12px;}
     #footer.expanded .expansion{display:flex;flex-direction:column;flex:1;min-height:0;max-height:none;}
     #footer.expanded .expansion-inner{container-type:size;}
     #footer.expanded .scrubber-shell{width:min(100cqh,calc(100cqw - 100px));margin:0;}

@@ -13,6 +13,7 @@ import {
 } from './indexer.js';
 import { createTree, type TreeView } from './tree.js';
 import { createPlayback, type Playback, isValidMode } from './playback.js';
+import type { DrawerState, DrawerView } from './playback-ui.js';
 import { isPathDeniedByShare } from './roots.js';
 import { createFavorites, type Favorite, type Favorites } from './favorites.js';
 import { createSelect, type Select } from './select.js';
@@ -140,7 +141,7 @@ const clearM10State = (): void => {
 
 // Restored M10 state, read synchronously at the top of onBodyLoad().
 // Module-scoped so showTree and wireFavoritesUi can access them.
-let restoredView: { path: string[]; expanded: boolean } | undefined;
+let viewState: { path?: readonly string[] } & DrawerState;
 let restoredScroll: Record<string, {top: number}> | undefined;
 let restoredPlayback: GlobalPlaybackSave | undefined;
 let restoredTime: number | undefined;
@@ -845,6 +846,11 @@ function closeSettingsPage(): void {
     document.getElementById('tree-container')!.hidden = false;
 }
 
+/** Give foreground browsing precedence over pending Play and keep both players using the same drawer policy. */
+function collapseDrawerForBrowsing(): void {
+    (playback ?? nativePlayer)?.collapse();
+}
+
 /**
  * Switches the UI from status/sign-in view to the tree view.
  * Creates the tree and playback components on first call; updates data on subsequent calls.
@@ -883,11 +889,24 @@ function wireAndRenderTree(info: AccountInfo | undefined, folder: MusicFolder, r
     accountData.set(driveId, { folder, driveId });
 
     if (!tree) {
-        tree = createTree(document.getElementById('tree-container')!, restoredView?.path, restoredScroll,
+        const treeEl = document.getElementById('tree-container')!;
+        const settingsEl = document.getElementById('settings-container')!;
+        tree = createTree(treeEl, viewState.path, restoredScroll,
             SW_DEBUG ? DEPLOY_COUNTER : '', scroll => {
                 if (!personalLibraryClosed) localStorage.setItem(profileKey('scroll'), JSON.stringify(scroll));
             });
-        settings = createSettings(document.getElementById('settings-container')!);
+        settings = createSettings(settingsEl);
+        const saveView = (next: typeof viewState): void => {
+            viewState = next;
+            if (personalLibraryClosed) return;
+            try { localStorage.setItem(profileKey('view'), JSON.stringify(viewState)); } catch { /* quota */ }
+        };
+        const drawer: DrawerView = {
+            initial: viewState,
+            onStateChange: state => saveView({...state, path: tree!.getSelectedPath()}),
+            captureMarkerReveal: tree.captureMarkerReveal,
+            coveredViews: {tree: treeEl, settings: settingsEl},
+        };
         if (browserAuth) {
             const storageKey = (key: string) => isDemo() ? 'demo_' + key : key;
             playback = createPlayback(
@@ -905,6 +924,7 @@ function wireAndRenderTree(info: AccountInfo | undefined, folder: MusicFolder, r
                     },
                 },
                 isDemo() ? demoDb : {dbGet, dbPut: putPersonalLibraryData},
+                drawer,
             );
             playback.setTimerDuration(timerDuration);
 
@@ -967,7 +987,7 @@ function wireAndRenderTree(info: AccountInfo | undefined, folder: MusicFolder, r
                     tree!.setPlaybackInfo, path => {
                         if (settings?.isOpen()) closeSettingsPage();
                         tree!.revealTrack(path);
-                    }, showToastMessage, describe, () => !isDemo() && shares?.hasLoadedMembership?.() ? shares.getAll().map(s => s.rootKey) : undefined, async (folder, mode) => {
+                    }, showToastMessage, drawer, describe, () => !isDemo() && shares?.hasLoadedMembership?.() ? shares.getAll().map(s => s.rootKey) : undefined, async (folder, mode) => {
                         const favorite = favorites?.getAll().find(f => folder[1] === 'fav:' + f.id);
                         if (favorite) await favorites!.setMode(favorite.id, mode);
                     }, favoriteSettings, isDemo() ? async () => {} : migratePrivateSpots, () => !isDemo() && restoredPlayback && Array.isArray(restoredPlayback.folder)
@@ -1010,28 +1030,16 @@ function wireAndRenderTree(info: AccountInfo | undefined, folder: MusicFolder, r
             tree.onPlayClick = path => playAlbum(path);
         }
 
-        // M10: persist view state on path or expanded changes
-        tree.onPathChange = (path) => {
-            if (personalLibraryClosed) return;
-            try {
-                const exp = playback?.getInfo() ? (document.getElementById('footer')!.classList.contains('expanded')) : false;
-                localStorage.setItem(profileKey('view'), JSON.stringify({ path, expanded: exp }));
-            } catch { /* quota */ }
-        };
+        tree.onPathChange = path => saveView({...viewState, path});
+        tree.onBrowse = collapseDrawerForBrowsing;
         tree.onFavoriteRootTap = () => showFavoriteCustomizeToastOnce();
-        if (playback) playback.onExpandedChange = (exp) => {
-            if (personalLibraryClosed) return;
-            const path = tree!.getSelectedPath();
-            try {
-                localStorage.setItem(profileKey('view'), JSON.stringify({ path, expanded: exp }));
-            } catch { /* quota */ }
+        tree.onSettingsClick = tree.onShareWithoutDataTap = () => {
+            collapseDrawerForBrowsing();
+            openSettingsPage();
         };
-        tree.onSettingsClick = () => openSettingsPage();
-        tree.onShareWithoutDataTap = () => openSettingsPage();
         tree.onSearchOpen = () => {
             if (select?.isActive()) select.exitSelectMode();
-            playback?.collapse();
-            nativePlayer?.collapse();
+            collapseDrawerForBrowsing();
             searchOpen = true;
             tree!.openSearchMode(searchQuery, searchScrollTop);
             runSearchAndPushIntoTree('open');
@@ -1049,6 +1057,7 @@ function wireAndRenderTree(info: AccountInfo | undefined, folder: MusicFolder, r
             runSearchAndPushIntoTree('query-change');
         };
         tree.onSearchResultClick = (result: SearchResult) => {
+            if (result.kind !== 'track') collapseDrawerForBrowsing();
             tree!.closeSearchMode();
             if (result.kind === 'track') {
                 // Search opens the parent at its normal offset. The footer chevron explicitly reveals the row.
@@ -1236,8 +1245,7 @@ function wireFavoritesUi(): void {
         };
 
         select.onEnterSelect = () => {
-            playback?.collapse();
-            nativePlayer?.collapse();
+            collapseDrawerForBrowsing();
             document.body.classList.add('select-mode');
             treeEl.querySelector<HTMLInputElement>('.search-input:focus')?.blur();
         };
@@ -1391,7 +1399,7 @@ function restorePlaybackState(): Promise<void> {
                 localStorage.setItem(profileKey('playback'), JSON.stringify(saved));
                 localStorage.setItem(profileKey('time'), JSON.stringify({generation: saved.generation, time: restoredTime ?? 0}));
             }
-            if (await player.restoreVisualState(saved.folder, saved.track, mode, restoredView?.expanded ?? false,
+            if (await player.restoreVisualState(saved.folder, saved.track, mode,
                 restoredTime ?? 0, saved.favId, accountData, saved)) {
                 if (restoredPlayback === saved) restoredPlayback = undefined;
             }
@@ -1444,7 +1452,12 @@ async function startupInner(): Promise<void> {
 
     // M10: Read persisted UI state synchronously before first render.
     // These are module-scoped so showTree() can pass them to createTree().
-    restoredView = readJson<{ path: string[]; expanded: boolean }>(profileKey('view'));
+    const savedView = readJson<{path?: unknown; expanded?: unknown; autoExpand?: unknown}>(profileKey('view'));
+    viewState = {
+        path: Array.isArray(savedView?.path) && savedView.path.every(part => typeof part === 'string') ? savedView.path : undefined,
+        expanded: savedView?.expanded === true,
+        autoExpand: savedView?.autoExpand !== false,
+    };
     restoredScroll = readJson<Record<string, {top: number}>>(profileKey('scroll'));
     restoredPlayback = parseGlobalPlaybackSave(readJson(profileKey('playback')));
     restoredTime = parseGlobalPlaybackTime(localStorage.getItem(profileKey('time')), restoredPlayback);

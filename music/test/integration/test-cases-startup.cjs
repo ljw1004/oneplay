@@ -134,6 +134,35 @@ async function holdTokenBody(page) {
 }
 
 module.exports = {
+    /** Offline audio admission can use the local inventory while favorites have never loaded. */
+    async 'startup: offline Resume uses cached audio independent of favorites' (page) {
+        await page.route(URL + 'seed-resume', r => r.fulfill({contentType:'text/html', body:'<title>Seed</title>'}));
+        await page.route(URL + 'resume.wav', r => r.fulfill({contentType:'audio/wav', body:silentWav()}));
+        await page.goto(URL + 'seed-resume');
+        await page.evaluate(async () => {
+            const {dbPut, audioPut} = await import('./dist/db.js');
+            const folder = ['OnePlay Music', 'drive'];
+            await dbPut('index:drive', {kind:'MusicData', count:2, size:2, folder:{id:'root', children:{'Uncached.wav':{id:'a'}, 'Pinned.wav':{id:'b'}}}});
+            await audioPut('drive:b', await (await fetch('resume.wav')).blob());
+            localStorage.account_info = JSON.stringify({driveId:'drive', displayName:'Music'});
+            localStorage.oneplay_music_playback = JSON.stringify({folder, track:[...folder,'Uncached.wav'], mode:'all'});
+        });
+        await page.addInitScript(() => Object.defineProperty(navigator, 'onLine', {get: () => false}));
+        await page.goto(URL);
+        const unavailable = page.locator('#children .file.unavailable').filter({hasText:'Uncached'});
+        const grip = page.getByRole('button', {name:'Player controls'});
+        await unavailable.waitFor();
+        assert(await page.evaluate(() => !window._testFavorites.hasLoadedMembership()), 'The fixture has no saved favorites');
+        await page.locator('.footer-playpause').click();
+        assert(await grip.getAttribute('aria-expanded') === 'false', 'Offline Resume of an uncached target leaves the drawer compact');
+        assert(await page.locator('audio').evaluate(el => el.paused), 'The unavailable target stays paused');
+        await page.locator('#children .file').filter({hasText:'Pinned'}).click();
+        await page.waitForFunction(() => {
+            const audio = document.querySelector('audio');
+            return !audio.paused && audio.currentSrc.startsWith('blob:') && document.getElementById('footer').classList.contains('expanded');
+        });
+    },
+
     /** A cold launch upgrades both old stores before an edit can reuse a playlist row. */
     async "startup: browser bookmarks follow shifted rows and reject removed recordings"(page) {
         await page.route(URL + "seed-bookmarks", r => r.fulfill({contentType: "text/html", body: "<title>Seed</title>"}));

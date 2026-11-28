@@ -264,6 +264,7 @@ to prevent events from the previous track.
 Both players use the same time-sliced projection of offline favorites and explicit folder pins. Unmarked folders and favorites are counted only while their offline dialog is open. A partially marked folder’s dialog shows the number of explicitly marked descendants and their unique downloaded recordings. Each owner has a deduplicated set of physical track keys. An inventory delta updates counts for the owners of that track. Rows and dialogs read these counts. A physical folder arrow shows coverage from physical pins alone. An ancestor’s dotted arrow completes when its pinned descendants finish. The breadcrumb trail shows only its rightmost offline arrow. A deeper solid or dotted arrow suppresses earlier dots.
 
 - **Browser retention.** Both folder pins and unpaused offline favorites contribute active keys. Paused owners also contribute retained keys. The downloader shares its local file-size map with playback and the folder dialog. It fetches missing active keys and deletes unowned blobs in one IndexedDB transaction when the retained set is nonempty and all surviving owners resolve against the local library. Storage reconciliation follows the local pin save in the background. An empty retained set preserves the existing browser cache.
+- Until the favorites document is available, the browser reads its audio inventory without starting downloads or deleting files. Playback and Search use the inventory with current connectivity evidence.
 - **Evidence state machine**: tracks connectivity as `no-evidence`,
   `evidence:signed-in`, `evidence:signed-out`, or `evidence:not-online`.
   Personal downloads pump with signed-in evidence. Demo can try a queued public recording on an uncertain route, subject to its transfer backoff. Error classification consults
@@ -302,6 +303,25 @@ On startup, the app reads persisted state and applies it visually without
 loading audio. The audio element has no `src`. The first user tap triggers
 `playNext()`, which fetches the URL and seeks to `restoredCurrentTime`. The
 restored value is kept until the action fully succeeds (not consumed eagerly).
+
+### Player drawer
+
+The profile-scoped view record stores `{path, expanded, autoExpand}`. The shared
+drawer owns both booleans and only manual open and close gestures change
+`autoExpand`. A restored target uses the saved layout without a reveal. A
+foreground Play uses the latest drawer action revision after the player admits
+its target and publishes the playing marker. A browse gesture invalidates
+pending openings and collapses the drawer. A confirmed natural stop collapses
+it without invalidating an in-flight selection of another recording.
+
+The native render lock records the latest natural stop and hands its ID to
+the next run. Swift captures the session, target revision and stop ID at
+Play admission. A delayed bridge reply opens the drawer only if the latest
+painted snapshot still matches those values and is starting or playing. The
+bridge identifies the session this document started, so a delayed first push
+can distinguish foreground Play from resumed or migrated playback. The first
+snapshot in each document establishes its stop baseline. Reattaching
+WebKit leaves Swift's playback checkpoints and transport alone.
 
 
 ## Roots model

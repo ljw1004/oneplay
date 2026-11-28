@@ -137,6 +137,7 @@ final class NativePlayback: @unchecked Sendable {
     private var session = ""
     private var revision = 0
     private var targetRevision = 0
+    private var retiredNaturalStopID = 0
     private var fencedRevision: Int?
     private var continueAfterFence = false
     // Slot numbers are stable within a session, including while its queue is edited.
@@ -363,9 +364,19 @@ final class NativePlayback: @unchecked Sendable {
     /// A fresh document samples the running node without restarting the decoder.
     var snapshot: [String: Any] { snapshot(lookups: nil) }
 
+    struct PlayAdmission {
+        let session: String
+        let targetRevision: Int
+        let naturalStopID: Int
+
+        var bridgeValue: [String: Any] {
+            ["session": session, "targetRevision": targetRevision, "naturalStopID": naturalStopID]
+        }
+    }
+
     func snapshot(lookups: [IndexedTrack]?, pinSizes: [String: Int] = [:], includeDenied: Bool = false) -> [String: Any] {
         lock.withLock {
-            var result = active?.snapshot(lookups: lookups, pinSizes: pinSizes) ?? [:]
+            var result = active?.snapshot(lookups: lookups, pinSizes: pinSizes) ?? ["naturalStopID": retiredNaturalStopID]
             result["accessRevision"] = accessRevision
             if includeDenied { result["denied"] = Array(deniedRoots) }
             result["hasHistory"] = hasHistory
@@ -382,19 +393,19 @@ final class NativePlayback: @unchecked Sendable {
         }
     }
 
-    func start(tracks: [IndexedTrack], startIndex: Int = 0, delaySeconds: Int, nearEnd: Bool, forceRefresh: Bool,
-               folder: [String] = [], folderKey: String = "", selected: Bool = true, timer: String? = nil, initialMode: QueueMode? = nil, favorite: String? = nil, legacyPosition: Double? = nil) throws {
+    @discardableResult func start(tracks: [IndexedTrack], startIndex: Int = 0, delaySeconds: Int, nearEnd: Bool, forceRefresh: Bool,
+               folder: [String] = [], folderKey: String = "", selected: Bool = true, timer: String? = nil, initialMode: QueueMode? = nil, favorite: String? = nil, legacyPosition: Double? = nil) throws -> PlayAdmission? {
         guard legacyPosition.map(Self.validPosition) != false, tracks.indices.contains(startIndex), [0,5,10].contains(delaySeconds),
               tracks.allSatisfy({ !$0.driveId.isEmpty && !$0.itemId.isEmpty }) else {
             throw PlaybackError("Invalid playback request")
         }
-        try lock.withLock {
+        return try lock.withLock {
             let allowed = tracks.indices.filter { !blocked(tracks[$0].sourceRootKey ?? "") }
             let eligible = offlineKeys.map { keys in allowed.filter { keys.contains(tracks[$0].fileKey) } } ?? allowed
             guard let first = eligible.first, !selected || eligible.contains(startIndex) else {
                 throw offlineKeys == nil ? NativeAccountError.forbidden : .unavailableOffline
             }
-            if legacyPosition != nil && (hasHistory || active != nil) { return }
+            if legacyPosition != nil && (hasHistory || active != nil) { return nil }
             saveCheckpoint()
             if let timer { try setTimerSetting(timer) }
             let startingMode = initialMode ?? mode
@@ -424,24 +435,26 @@ final class NativePlayback: @unchecked Sendable {
             if mode != .shuffle { order = eligible }
             else if selected { order = [initial] + shuffledStart(eligible.filter { $0 != initial }) }
             else { order = shuffledStart(eligible) }
-            replaceRun(cursor: PlayCursor(order: order, slot: selected || bookmarked != nil ? order.firstIndex(of: initial)! : 0),
+            let stopID = replaceRun(cursor: PlayCursor(order: order, slot: selected || bookmarked != nil ? order.firstIndex(of: initial)! : 0),
                        position: .seconds(legacyPosition ?? (bookmarked != nil ? bookmark!.seconds : 0)), paused: legacyPosition != nil,
                        delaySeconds: delaySeconds, nearEnd: nearEnd, forceRefresh: forceRefresh)
             armTimer(playing: legacyPosition == nil)
             saveCheckpoint()
+            return legacyPosition == nil ? PlayAdmission(session: session, targetRevision: targetRevision, naturalStopID: stopID) : nil
         }
     }
 
     /// Called under the player lock. The serial worker drains the retiring run before decoding its replacement.
-    private func replaceRun(cursor: PlayCursor, advanced: Bool = false, position: PlaybackRun.Position = .seconds(0), paused: Bool = false,
+    @discardableResult private func replaceRun(cursor: PlayCursor, advanced: Bool = false, position: PlaybackRun.Position = .seconds(0), paused: Bool = false,
                             seekItem: String? = nil, duration: MP3RangeDecoder.Length = .unknown, admitted: MediaLocation? = nil, budget: MediaRanges.Budget = .init(),
                             delaySeconds: Int = 0, nearEnd: Bool = false, forceRefresh: Bool = false,
-                            issuedAt: Double = ProcessInfo.processInfo.systemUptime, restoredNext: PlayCursor? = nil) {
+                            issuedAt: Double = ProcessInfo.processInfo.systemUptime, restoredNext: PlayCursor? = nil) -> Int {
         // Keep the descriptor across a seek or resume even if the last pin was removed.
         let carry = active?.lease(for: catalog[cursor.index].fileKey)
-        active?.cancel()
+        retiredNaturalStopID = active?.cancel() ?? retiredNaturalStopID
+        let stopID = retiredNaturalStopID
         let run = PlaybackRun(tracks: catalog, cursor: cursor, restoredNext: restoredNext, advanced: advanced, mode: mode, nextPolicy: nextPolicy(for: mode), position: position, paused: paused, seekItem: seekItem, duration: duration,
-                              admitted: admitted, pinStore: store, lease: carry, lookup: lookup, captureURL: destination, diagnostics: diagnostics, pool: pool, budget: budget) { [weak self] debugOnly in
+                              admitted: admitted, pinStore: store, lease: carry, lookup: lookup, captureURL: destination, diagnostics: diagnostics, pool: pool, budget: budget, naturalStopID: stopID) { [weak self] debugOnly in
             DispatchQueue.main.async { [weak self] in
                 if !debugOnly { self?.checkpoint() }
                 self?.onChange?(debugOnly)
@@ -485,6 +498,7 @@ final class NativePlayback: @unchecked Sendable {
             }
             releaseIdleAudioSession()
         }
+        return stopID
     }
 
     /// Take focus only after the first chunk has decoded. A paused cold restore never activates.
@@ -519,27 +533,32 @@ final class NativePlayback: @unchecked Sendable {
     /// A command belongs to the item that the listener touched, including a repeated play of the same URL.
     @discardableResult
     func apply(_ action: String, item: String, seconds: Double?) throws -> Bool {
+        try applyFromPage(action, item: item, seconds: seconds).applied
+    }
+
+    /// The command result is captured at admission, before a bridge checkpoint wait samples the live player again.
+    func applyFromPage(_ action: String, item: String, seconds: Double?) throws -> (applied: Bool, play: PlayAdmission?) {
         try lock.withLock { try applyLocked(action, item: item, seconds: seconds) }
     }
 
     /// Remote transport keys address the audible occurrence even while WebKit is suspended.
     func applyRemote(_ command: String, seconds: Double? = nil, displayedItem: String? = nil) throws -> Bool {
-        try lock.withLock { try applyLocked(command, item: displayedItem, seconds: seconds) }
+        try lock.withLock { try applyLocked(command, item: displayedItem, seconds: seconds).applied }
     }
 
-    @discardableResult private func applyLocked(_ action: String, item: String?, seconds: Double?, automaticResume: Bool = false) throws -> Bool {
+    @discardableResult private func applyLocked(_ action: String, item: String?, seconds: Double?, automaticResume: Bool = false) throws -> (applied: Bool, play: PlayAdmission?) {
         let issuedAt = ProcessInfo.processInfo.systemUptime
-        guard let run = active else { return false }
-        if fencedRevision != nil && (action == "next" || action == "previous") { return false }
+        guard let run = active else { return (false, nil) }
+        if fencedRevision != nil && (action == "next" || action == "previous") { return (false, nil) }
         defer { saveCheckpoint() }
         if action == "cycleMode" {
             let next = mode.following
-            guard configure(run, mode: next, item: item) else { return false }
+            guard configure(run, mode: next, item: item) else { return (false, nil) }
             armTimer(playing: active?.wantsPlay == true)
-            return true
+            return (true, nil)
         }
         guard let result = try run.apply(action, item: item, seconds: seconds, interruptedItem: interruptedItem,
-                                         offlineKeys: offlineKeys, resumeBefore: automaticResume ? deadline : nil) else { return false }
+                                         offlineKeys: offlineKeys, resumeBefore: automaticResume ? deadline : nil) else { return (false, nil) }
         interruptedItem = nil
         if let restart = result.restart {
             // A seek can keep the occurrence. Only a newly accepted target supersedes its wait.
@@ -549,7 +568,8 @@ final class NativePlayback: @unchecked Sendable {
         }
         if fencedRevision != nil { continueAfterFence = result.playing }
         if !automaticResume || deadline == nil { armTimer(playing: result.playing) }
-        return true
+        let play = action == "play" ? PlayAdmission(session: session, targetRevision: targetRevision, naturalStopID: result.stopID) : nil
+        return (true, play)
     }
 
     /// A compatible revision keeps the decoder, node and prepared bytes. Only a different
@@ -562,6 +582,7 @@ final class NativePlayback: @unchecked Sendable {
         mode = newMode
         if updated.revoked {
             interruptedItem = nil
+            retiredNaturalStopID = run.cancel()
             active = nil
             armTimer(playing: false)
         } else if let point = updated.restart {
@@ -742,7 +763,15 @@ final class NativePlayback: @unchecked Sendable {
         }
     }
 
-    func stop() { lock.withLock { interruptedItem = nil; active?.cancel(); active = nil; armTimer(playing: false); saveCheckpoint() } }
+    func stop() {
+        lock.withLock {
+            interruptedItem = nil
+            retiredNaturalStopID = active?.cancel() ?? retiredNaturalStopID
+            active = nil
+            armTimer(playing: false)
+            saveCheckpoint()
+        }
+    }
 
     func cancelWiFiReadsIfMetered() { lock.withLock { pool.cancelWiFiReadsIfMetered() } }
 
@@ -759,7 +788,7 @@ final class NativePlayback: @unchecked Sendable {
 
     /// Logout drains all in-flight bytes before removing the diagnostic recording. Retrying cleanup is safe.
     func stopAndDrain() async throws {
-        lock.withLock { interruptedItem = nil; ticker?.cancel(); ticker = nil; store = nil; accessRevision = 0; accessDirty = false; spots.removeAll(); hasHistory = false; savedPoint = nil; savedCursor = nil; structureDirty = true; favorite = nil; folder = []; folderKey = ""; active?.cancel(); active = nil; catalog = []; canonical = []; slots = [:]; connectedShares = nil; deniedRoots = []; mode = .all; armTimer(playing: false); pool = MediaPool(unmeteredWiFi: pool.unmeteredWiFi) }
+        lock.withLock { interruptedItem = nil; ticker?.cancel(); ticker = nil; store = nil; accessRevision = 0; accessDirty = false; spots.removeAll(); hasHistory = false; savedPoint = nil; savedCursor = nil; structureDirty = true; favorite = nil; folder = []; folderKey = ""; active?.cancel(); active = nil; retiredNaturalStopID = 0; catalog = []; canonical = []; slots = [:]; connectedShares = nil; deniedRoots = []; mode = .all; armTimer(playing: false); pool = MediaPool(unmeteredWiFi: pool.unmeteredWiFi) }
         await withCheckedContinuation { continuation in writer.async { self.pendingWrites.removeAll(); continuation.resume() } }
         await withCheckedContinuation { continuation in worker.async { continuation.resume() } }
         do { try FileManager.default.removeItem(at: destination) }
@@ -838,6 +867,10 @@ private final class PlaybackRun: @unchecked Sendable {
     private var successor: Anchor?
     private var terminal: String?
     private var lastPosition: Double = 0
+    // The render lock serializes EOF and Timer with Play admission. A replacement
+    // inherits the ID from its cancelled predecessor, even if no page sampled it.
+    private var naturalStopID: Int
+    private var deferredNaturalEnd = false
 
     private func audibleAnchor(at frame: Int64) -> Anchor {
         if let successor, frame > successor.nodeFrame { return successor }
@@ -894,15 +927,17 @@ private final class PlaybackRun: @unchecked Sendable {
             let frame = min(rendered, scheduled)
             let entry = audibleAnchor(at: frame)
             let track = tracks[entry.index]
-            guard let path = track.path else { return [:] }
-            if entry.cursor.held != nil && terminal == "ended" { return [:] }
+            guard let path = track.path, entry.cursor.held == nil || terminal != "ended" else {
+                return ["naturalStopID": naturalStopID]
+            }
             let needsPCM = !started || rendered >= scheduled
             let playing = !needsPCM && engine.isRunning && node.isPlaying
             let showWait = needsPCM && waitingInputs.contains(requiredInput) && !cachedStarts.contains(requiredInput)
             let state = terminal ?? (paused ? "paused" : playing ? "playing" : showWait ? "buffering" : "positioning")
             let seconds = started ? Double(entry.fileFrame + max(0, frame - entry.nodeFrame)) / Double(rate) : lastPosition
             var result: [String: Any] = ["item": entry.item, "advanced": entry.advanced, "title": track.title ?? path.last ?? "", "key": track.key ?? track.itemId, "path": path, "state": state,
-                    "album": track.album ?? "", "position": seconds, "duration": Double(entry.duration.frames) / Double(rate), "message": message]
+                    "album": track.album ?? "", "position": seconds, "duration": Double(entry.duration.frames) / Double(rate), "message": message,
+                    "naturalStopID": naturalStopID]
             result["systemTitle"] = track.systemTitle
             result["canPrevious"] = nextPolicy != .fenced && (entry.cursor.held.map { $0.previous != nil } ?? (entry.cursor.slot > 0 || mode == .repeat || mode == .shuffle))
             result["canNext"] = nextPolicy != .fenced && (entry.next != nil || entry.cursor.held != nil)
@@ -913,7 +948,7 @@ private final class PlaybackRun: @unchecked Sendable {
         }
     }
 
-    init(tracks: [IndexedTrack], cursor: PlayCursor, restoredNext: PlayCursor?, advanced: Bool, mode: QueueMode, nextPolicy: NextPolicy, position: Position, paused: Bool, seekItem: String?, duration: MP3RangeDecoder.Length, admitted: MediaLocation?, pinStore: PlaybackStore?, lease: LocalMP3?, lookup: @escaping NativePlayback.Lookup, captureURL: URL, diagnostics: NativeDiagnostics?, pool: MediaPool, budget: MediaRanges.Budget, signalChange: @escaping @Sendable (Bool) -> Void) {
+    init(tracks: [IndexedTrack], cursor: PlayCursor, restoredNext: PlayCursor?, advanced: Bool, mode: QueueMode, nextPolicy: NextPolicy, position: Position, paused: Bool, seekItem: String?, duration: MP3RangeDecoder.Length, admitted: MediaLocation?, pinStore: PlaybackStore?, lease: LocalMP3?, lookup: @escaping NativePlayback.Lookup, captureURL: URL, diagnostics: NativeDiagnostics?, pool: MediaPool, budget: MediaRanges.Budget, naturalStopID: Int, signalChange: @escaping @Sendable (Bool) -> Void) {
         self.admitted = admitted
         self.signalChange = signalChange
         self.budget = budget
@@ -936,9 +971,11 @@ private final class PlaybackRun: @unchecked Sendable {
         self.diagnostics = diagnostics
         self.lookup = lookup
         self.captureURL = captureURL
+        self.naturalStopID = naturalStopID
         if startsAtEnd {
             terminal = paused ? nil : "ended"
             message = paused ? "Paused at end of track" : "Finished \(tracks.count) track(s)"
+            if !paused { recordNaturalEnd() }
         }
     }
     private func debugBars(at entry: Anchor, lookups: [IndexedTrack], pinSizes: [String: Int]) -> [[String: Any]] {
@@ -1016,6 +1053,7 @@ private final class PlaybackRun: @unchecked Sendable {
                     cancelLocked()
                     return (true, false, (next, .seconds(0), false, nil, .unknown, nil, true))
                 }
+                if deferredNaturalEnd && policy != .fenced { recordNaturalEnd() }
                 if !changed || terminal != nil || startsAtEnd { return (true, false, nil) }
                 let seconds = started ? Double(entry.fileFrame + max(0, frame - entry.nodeFrame)) / Double(rate) : lastPosition
                 let location = sources.last { $0.occurrence == current + 1 }?.admission ?? (current == startIndex ? admitted : nil)
@@ -1037,11 +1075,18 @@ private final class PlaybackRun: @unchecked Sendable {
         _ = renderedFrame()
         if started { node.pause() }
         paused = true
+        naturalStopID += 1
         signalChange(false)
     }
 
+    /// An edit fence can park EOF until its replacement queue decides whether to advance.
+    private func recordNaturalEnd() {
+        deferredNaturalEnd = nextPolicy == .fenced
+        if !deferredNaturalEnd { naturalStopID += 1 }
+    }
+
     /// Sample and stop the touched occurrence in one critical section, before its successor can be scheduled.
-    func apply(_ command: String, item expected: String?, seconds: Double?, interruptedItem: String?, offlineKeys: Set<String>?, resumeBefore: ContinuousClock.Instant?) throws -> (restart: Point?, playing: Bool)? {
+    func apply(_ command: String, item expected: String?, seconds: Double?, interruptedItem: String?, offlineKeys: Set<String>?, resumeBefore: ContinuousClock.Instant?) throws -> (restart: Point?, playing: Bool, stopID: Int)? {
         try lock.withLock {
             expireIfDue()
             let frame = min(renderedFrame(), scheduled)
@@ -1076,27 +1121,27 @@ private final class PlaybackRun: @unchecked Sendable {
                 if target == duration && terminal != nil { return nil }
                 if paused || relative || target < duration {
                     cancelLocked()
-                    return ((entry.cursor, !relative && target == duration ? .end : .seconds(target), paused, item, entry.duration, admission(entry.index), entry.advanced), !paused)
+                    return ((entry.cursor, !relative && target == duration ? .end : .seconds(target), paused, item, entry.duration, admission(entry.index), entry.advanced), !paused, naturalStopID)
                 }
                 // Releasing at EOF during playback completes the touched occurrence immediately.
                 fallthrough
             case "play" where startsAtEnd && terminal == nil:
                 cancelLocked()
                 if nextPolicy == .automatic, let next = entry.next {
-                    return ((next, .seconds(0), false, nil, .unknown, admission(next.index), true), true)
+                    return ((next, .seconds(0), false, nil, .unknown, admission(next.index), true), true, naturalStopID)
                 }
-                return ((entry.cursor, .end, false, item, entry.duration, admission(entry.index), entry.advanced), false)
+                return ((entry.cursor, .end, false, item, entry.duration, admission(entry.index), entry.advanced), false, naturalStopID)
             case "next", "previous":
                 guard let next = action == "previous" ? entry.cursor.neighbor(-1, mode: mode) : entry.next else {
                     if entry.cursor.held != nil && action == "next" {
                         cancelLocked()
                         terminal = "ended"
-                        return (nil, false)
+                        return (nil, false, naturalStopID)
                     }
                     return nil
                 }
                 cancelLocked()
-                return ((next, .seconds(0), false, nil, .unknown, action == "previous" ? nil : admission(next.index), action == "next"), true)
+                return ((next, .seconds(0), false, nil, .unknown, action == "previous" ? nil : admission(next.index), action == "next"), true, naturalStopID)
             case "pause", "play":
                 if terminal == nil {
                     if paused && action == "play" {
@@ -1108,11 +1153,11 @@ private final class PlaybackRun: @unchecked Sendable {
                     if started {
                         if paused { node.pause() } else if !node.isPlaying { try node.playAudio() }
                     }
-                    return (nil, !paused)
+                    return (nil, !paused, naturalStopID)
                 }
                 guard action == "play" else { return nil }
                 cancelLocked()
-                return ((entry.cursor, .seconds(0), false, nil, .unknown, nil, false), true)
+                return ((entry.cursor, .seconds(0), false, nil, .unknown, nil, false), true, naturalStopID)
             default: throw NativeAccountError.invalidRequest
             }
         }
@@ -1142,7 +1187,9 @@ private final class PlaybackRun: @unchecked Sendable {
         }
     }
 
-    func cancel() { lock.withLock { cancelLocked() } }
+    @discardableResult func cancel() -> Int {
+        lock.withLock { cancelLocked(); return naturalStopID }
+    }
 
     /// The item comparison and the stop share the same critical section as successor scheduling.
     private func cancelLocked() {
@@ -1535,8 +1582,14 @@ private final class PlaybackRun: @unchecked Sendable {
                     lock.withLock { drainingFinal = true }
                     window.changed.signal()
                     try drainAudio()
-                    // The manual Next worker can still be waiting on Graph or a decoder scan.
-                    if nextIndex != nil { cancel() }
+                    // Confirm EOF before cancelling any unused manual Next worker. A run
+                    // superseded during drain cannot report a stop for its replacement.
+                    lock.withLock {
+                        guard !cancelled else { return }
+                        if !paused { recordNaturalEnd() }
+                        if nextIndex != nil { cancelLocked() }
+                        terminal = "ended"
+                    }
                     return
                 }
 

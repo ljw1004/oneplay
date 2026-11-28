@@ -1,6 +1,377 @@
 const assert = require('node:assert/strict');
 
 module.exports = {
+    /** Use the real offline shell, normal player controls, and enough rows to clip a playing marker. */
+    async 'wheel: drawer follows Play, browsing and saved preference offline'(page) {
+        const url = globalThis.__ONEPLAY_TEST_URL;
+        const folder = ['OnePlay Music', 'fixture', 'Album'];
+        page.setDefaultTimeout(5000);
+        await page.setViewportSize({width: 390, height: 844});
+        await page.route(url + 'drawer-seed', r => r.fulfill({contentType: 'text/html', body: '<title>Seed</title>'}));
+        await page.route(url + 'drawer.wav', r => r.fulfill({contentType: 'audio/wav', body: silentWav()}));
+        await page.goto(url + 'drawer-seed');
+        await page.evaluate(async folder => {
+            const {dbPut, audioPut} = await import('./dist/db.js');
+            const tracks = Object.fromEntries(Array.from({length: 70}, (_, i) =>
+                [`Track ${String(i + 1).padStart(2, '0')}.mp3`, {id: String(i)}]));
+            await dbPut('index:fixture', {kind: 'MusicData', schemaVersion: 1, count: 71, size: 710,
+                folder: {id: 'root', children: {Album: {id: 'album', children: tracks},
+                    Empty: {id: 'empty', children: {}}, Other: {id: 'other', children: {'Uncached.mp3': {id: 'other-file'}}}}}});
+            await dbPut('favorites', {updatedAt: 1, version: 1, favorites: [], folderPins: [
+                {sourceRootKey: 'fixture', driveId: 'fixture', itemId: 'album', path: ['Album'], isFolder: true},
+            ]});
+            const blob = await (await fetch('drawer.wav')).blob();
+            for (const id of ['0', '30', '34', '35', '36', '69']) await audioPut('fixture:' + id, blob);
+            localStorage.account_info = JSON.stringify({driveId: 'fixture', displayName: 'Fixture'});
+            localStorage.oneplay_music_view = JSON.stringify({path: folder, expanded: false}); // Legacy record.
+            localStorage.demo_oneplay_music_view = JSON.stringify({path: ['OnePlay Music'], expanded: true, autoExpand: false});
+        }, folder);
+        await page.addInitScript(() => Object.defineProperty(navigator, 'onLine', {get: () => false}));
+        await page.goto(url);
+        const list = page.locator('#children');
+        const rows = list.locator('.tree-row.file');
+        const grip = page.getByRole('button', {name: 'Player controls'});
+        const play = page.locator('.footer-playpause');
+        const mode = page.locator('.mode-label');
+        const active = () => page.evaluate(() => document.activeElement?.className);
+        const stored = () => page.evaluate(() => JSON.parse(localStorage.oneplay_music_view));
+        const layout = async expanded => {
+            await page.waitForFunction(expanded => document.querySelector('.footer-gripper')?.getAttribute('aria-expanded') === String(expanded), expanded);
+            await page.locator('.expansion').evaluate(async panel => {
+                await Promise.allSettled(panel.getAnimations().map(animation => animation.finished));
+            });
+            assert.equal(await page.locator('.expansion').evaluate(el => el.inert), !expanded);
+        };
+        const playing = () => page.waitForFunction(() => {
+            const audio = document.querySelector('audio');
+            return !audio.paused && audio.readyState >= 2 && Number.isFinite(audio.duration) && audio.currentSrc.startsWith('blob:');
+        });
+        const measure = locator => locator.evaluate(el => {
+            const list = document.querySelector('#children');
+            const bounds = list.getBoundingClientRect();
+            const marker = (el.querySelector('.track-indicator') ?? el).getBoundingClientRect();
+            return {scroll: list.scrollTop, top: marker.top, bottom: marker.bottom, viewportBottom: bounds.bottom};
+        });
+        const nearBottom = async (row, clearance = 18) => row.evaluate((el, clearance) => {
+            const list = document.getElementById('children');
+            list.scrollTop += el.getBoundingClientRect().bottom - list.getBoundingClientRect().bottom + clearance;
+        }, clearance);
+        assert.equal(await grip.count(), 0, 'No target leaves the footer hidden');
+        await rows.nth(34).waitFor();
+        await page.waitForFunction(() => window._testDownloads.getSnapshot().files.has('fixture:36'));
+        assert.equal(await rows.count(), 70);
+        await nearBottom(rows.nth(34), 95);
+        const before = await measure(rows.nth(34));
+        const initiated = Date.now();
+        await rows.nth(34).click();
+        await layout(true);
+        await playing();
+        const openedMs = Date.now() - initiated;
+        const after = await measure(rows.nth(34));
+        assert.equal(JSON.stringify((await stored()).path), JSON.stringify(folder));
+        assert.ok(after.scroll > before.scroll && Math.abs(after.bottom - after.viewportBottom) <= 1, JSON.stringify({before, after}));
+        emit(`    70 rows, Play to settled drawer and audio ${openedMs}ms, marker and list ${JSON.stringify({before, after})}`);
+
+        await list.evaluate(el => { el.scrollTop += 20; });
+        await layout(true);
+        await page.mouse.move(140, after.viewportBottom - 10);
+        await page.mouse.wheel(60, 0);
+        await layout(true);
+        await page.mouse.wheel(0, 60);
+        await layout(false);
+        assert.equal((await stored()).autoExpand, true);
+        await playing();
+        await page.reload();
+        await layout(false);
+        assert.equal((await stored()).autoExpand, true);
+        await play.click();
+        await layout(true);
+        await playing();
+        await play.click();
+        await layout(true);
+        await page.mouse.move(140, after.viewportBottom - 10);
+        await page.mouse.wheel(0, 30);
+        await layout(false);
+        await nearBottom(rows.nth(34));
+        await play.focus();
+        await grip.evaluate(button => button.click());
+        await layout(true);
+        assert.equal(await active(), 'footer-playpause');
+        const manual = await measure(rows.nth(34));
+        assert.ok(Math.abs(manual.bottom - manual.viewportBottom) <= 1);
+        await mode.click();
+        await grip.click();
+        await layout(false);
+        const accessibility = await page.context().newCDPSession(page);
+        const {nodes} = await accessibility.send('Accessibility.getFullAXTree');
+        await accessibility.detach();
+        const accessibleButtons = nodes.filter(node => !node.ignored && node.role?.value === 'button').map(node => node.name?.value);
+        assert.ok(accessibleButtons.includes('Player controls'));
+        assert.ok(!['repeat', '+30s', '-15s'].some(name => accessibleButtons.includes(name)));
+        await grip.focus();
+        await page.keyboard.press('Tab');
+        assert.equal(await active(), 'footer-playpause');
+        await rows.nth(35).click();
+        await layout(false);
+        assert.equal((await stored()).autoExpand, false);
+        await page.reload();
+        await layout(false);
+        assert.equal((await stored()).autoExpand, false);
+        assert.equal(await page.locator('audio').evaluate(el => el.paused), true);
+        await play.click();
+        await playing();
+        await layout(false);
+
+        // Preserve compact swipe reach, while a deliberate down swipe inside the drawer opts out.
+        const swipe = async (selector, dy) => {
+            const box = await page.locator(selector).boundingBox();
+            await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+            await page.mouse.down();
+            await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2 + dy, {steps: 5});
+            await page.mouse.up();
+        };
+        await swipe('.compact-gripper-reach', -45);
+        await layout(true);
+        await swipe('.footer-gripper', 45);
+        await layout(false);
+        assert.equal((await stored()).autoExpand, false);
+        await grip.click();
+        await layout(true);
+        await page.locator('.expansion-inner').click({position: {x: 8, y: 85}});
+        await layout(false);
+        assert.equal((await stored()).autoExpand, false);
+        await grip.click();
+        await layout(true);
+        await page.reload();
+        await layout(true);
+        assert.equal(await page.locator('audio').evaluate(el => el.paused), true);
+        assert.equal((await stored()).autoExpand, true);
+
+        await page.getByRole('button', {name: 'Search music'}).focus();
+        await page.setViewportSize({width: 844, height: 390});
+        await page.waitForFunction(() => document.querySelector('#tree-container').inert);
+        assert.equal(await active(), 'footer-gripper');
+        assert.equal((await grip.boundingBox()).height, 44);
+        await page.setViewportSize({width: 390, height: 844});
+        await page.waitForFunction(() => !document.querySelector('#tree-container').inert);
+        await page.getByRole('button', {name: 'Search music'}).click();
+        await layout(false);
+        await page.getByRole('searchbox').fill('Track 37');
+        await list.locator('.tree-row.file').filter({hasText: 'Track 37'}).click({timeout: 3000});
+        await layout(true);
+        await playing();
+        await page.getByRole('button', {name: 'Open settings'}).click();
+        await layout(false);
+        await playing();
+        assert.equal((await stored()).autoExpand, true);
+        assert.equal(await page.evaluate(() => JSON.parse(localStorage.demo_oneplay_music_view).expanded), true);
+
+        await page.getByRole('button', {name: 'Close settings'}).click();
+        await page.locator('#breadcrumbs .tree-row').first().locator('.row-name').click();
+        await page.getByRole('button', {name: 'Search music'}).click();
+        await page.getByRole('searchbox').fill('Album');
+        await grip.click();
+        await layout(true);
+        await list.locator('.tree-row.folder').filter({hasText: 'Album'}).click();
+        await layout(false);
+        assert.equal((await stored()).autoExpand, true);
+        await playing();
+        await page.setViewportSize({width: 844, height: 390});
+        const folderPlay = page.getByRole('button', {name: 'Play Album'});
+        await folderPlay.focus();
+        await page.keyboard.press('Enter');
+        await layout(true);
+        assert.equal(await active(), 'footer-gripper', 'Keyboard folder Play hands off covered focus');
+        await page.setViewportSize({width: 390, height: 844});
+        await page.waitForFunction(() => !document.querySelector('#tree-container').inert);
+
+        await setPlaybackMode(page, 'one');
+        await mode.focus();
+        const audio = page.locator('audio');
+        const finish = async name => {
+            await page.waitForFunction(name => window._testPlayback.getInfo()?.track.at(-1) === name, name);
+            await playing();
+            await audio.evaluate(el => { el.currentTime = el.duration; });
+        };
+        await finish('Track 01.mp3');
+        await layout(false);
+        assert.equal(await active(), 'footer-gripper');
+        assert.equal((await stored()).autoExpand, true);
+        await page.keyboard.press('Enter');
+        await layout(true);
+        await setPlaybackMode(page, 'all');
+        await rows.nth(34).click();
+        await finish('Track 35.mp3');
+        await page.waitForFunction(() => window._testPlayback.getInfo().track.at(-1) === 'Track 36.mp3');
+        await layout(true);
+        await rows.nth(69).click();
+        await finish('Track 70.mp3');
+        await layout(false);
+        assert.equal((await stored()).autoExpand, true);
+
+        await rows.nth(34).click();
+        await playing();
+        await setFakeNow(page, 10_000);
+        await setPlaybackMode(page, 'timer');
+        await page.evaluate(() => {
+            window._testNowMs += 31 * 60_000;
+            document.querySelector('.footer-playpause').click();
+        });
+        await audio.evaluate(el => new Promise(resolve => {
+            if (el.paused) requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+            else el.addEventListener('pause', resolve, {once: true});
+        }));
+        await layout(true); // A paused timeupdate at the same deadline belongs to manual Pause.
+        const startAndWait = async button => {
+            await page.evaluate(() => {
+                window.resumed = new Promise(resolve => document.querySelector('audio').addEventListener('playing', () => resolve(), {once: true}));
+            });
+            await button.click();
+            await page.evaluate(() => window.resumed);
+        };
+        await startAndWait(play);
+        await playing();
+        await page.evaluate(() => {
+            window._testNowMs += 31 * 60_000;
+            const audio = document.querySelector('audio');
+            audio.currentTime = audio.duration;
+        });
+        await layout(false);
+        assert.equal(await page.evaluate(() => window._testPlayback.getInfo().track.at(-1)), 'Track 35.mp3');
+        assert.equal(await audio.evaluate(el => el.paused), true);
+
+        await startAndWait(rows.nth(69));
+        await page.evaluate(() => { window._testNowMs += 20 * 60_000; });
+        await finish('Track 70.mp3');
+        await layout(false);
+        await startAndWait(play);
+        await page.evaluate(() => { window._testNowMs += 11 * 60_000; });
+        await dispatchAudioTimeupdate(page);
+        assert.equal(await audio.evaluate(el => el.paused), false, 'Replay after the last track starts a fresh Timer');
+        await layout(true);
+    },
+
+    /** A command receipt proves which run accepted Play, even when the live sample arrives first. */
+    async 'wheel: native admission survives a join and rejects a delayed Play after a stop'(page) {
+        const url = globalThis.__ONEPLAY_TEST_URL;
+        await page.route(url, r => r.fulfill({contentType: 'text/html', body:
+            '<link rel="stylesheet" href="index.css"><div id="footer"></div>'}));
+        const open = async (restoring = false, rejecting = false) => {
+            await page.goto(url);
+            await page.evaluate(async ({restoring, rejecting}) => {
+                const {attachNativePlayback} = await import('./dist/native-playback.js');
+                const folder = ['OnePlay Music', 'demo', 'Album'];
+                const tracks = ['a', 'b'].map(itemId => ({path: [...folder, itemId], key: itemId,
+                    itemId, driveId: 'demo', sourceRootKey: 'demo', title: itemId, album: 'Album'}));
+                const footer = document.getElementById('footer');
+                const acceptedPlay = {session: 'session', targetRevision: 1, naturalStopID: 4};
+                let sequence = 0;
+                let sample = {naturalStopID: 4};
+                window.publish = (item, stopID, state = 'playing', foregroundStart = true, session = acceptedPlay.session) => {
+                    sample = {...acceptedPlay, ...(foregroundStart && {foregroundStart}), naturalStopID: stopID,
+                        session, item, title: item, folder, path: item ? [...folder, item] : undefined, folderKey: 'album', state};
+                    window.dispatchEvent(new CustomEvent('oneplay-playback', {detail: {sequence: ++sequence, snapshot: sample}}));
+                };
+                const initial = {expanded: true, autoExpand: true};
+                const native = {async playback(action) {
+                    if (action === 'snapshot' && restoring) {
+                        await new Promise(resolve => { window.releaseRestore = resolve; });
+                    }
+                    const reply = {sequence: ++sequence, snapshot: sample};
+                    if (action === 'intent') return {...reply, base: ''};
+                    if (action === 'start') {
+                        if (rejecting) throw new Error('unavailableOffline');
+                        const old = {...reply, snapshot: {...sample, ...acceptedPlay, foregroundStart:true, item: 'a', state: 'positioning'}};
+                        await new Promise(resolve => { window.releasePlay = resolve; });
+                        return {...old, acceptedPlay};
+                    }
+                    return reply;
+                }};
+                const drawer = attachNativePlayback(native, footer,
+                    info => { window.paintedTrack = info?.track.at(-1); }, () => {}, () => {}, {
+                        initial, onStateChange: state => { window.savedDrawer = state; },
+                        captureMarkerReveal: () => { window.revealedTrack = window.paintedTrack; },
+                    });
+                window.browse = drawer.collapse;
+                window.start = () => { window.started = drawer.start({folder, tracks, folderKey: 'album'}, 0, true, '30m'); };
+                window.beginNewSelection = drawer.beginSelection;
+                window.rejectSelection = drawer.cancelSelection;
+            }, {restoring, rejecting});
+        };
+        const isExpanded = () => page.locator('.footer-gripper').getAttribute('aria-expanded');
+        for (const outcome of ['advance', 'stop', 'browse', 'pause', 'superseded', 'late-paint', 'during-cancel']) {
+            await open();
+            await page.evaluate(() => window.start());
+            await page.waitForFunction(() => !!window.releasePlay, undefined, {timeout: 3000});
+            await page.evaluate(async outcome => {
+                if (outcome === 'late-paint' || outcome === 'during-cancel') window.beginNewSelection();
+                const cancelling = outcome === 'during-cancel' ? window.rejectSelection() : undefined;
+                window.publish('a', 4, 'positioning');
+                if (outcome === 'advance') window.publish('b', 4);
+                if (outcome === 'stop') window.publish('a', 5); // Timer and remote Resume can keep the target revision.
+                if (outcome === 'browse') window.browse();
+                if (outcome === 'pause') window.publish('a', 4, 'paused');
+                await cancelling;
+            }, outcome);
+            assert.equal(await isExpanded(), 'false');
+            if (outcome === 'superseded') await page.evaluate(() => window.beginNewSelection());
+            if (outcome === 'superseded' || outcome === 'late-paint') await page.evaluate(() => window.rejectSelection());
+            await page.evaluate(async () => { window.releasePlay(); await window.started; });
+            assert.equal(await isExpanded(), String(outcome === 'advance'));
+            assert.equal(await page.evaluate(() => window.revealedTrack), outcome === 'advance' ? 'b' : undefined);
+            if (outcome !== 'advance') assert.equal(await page.evaluate(() => window.savedDrawer.expanded), false);
+            if (outcome === 'advance') {
+                await page.evaluate(() => {
+                    window.publish(undefined, 4, 'ended'); // A held track at a fenced boundary has no target row.
+                    window.publish('b', 4);
+                });
+                assert.equal(await isExpanded(), 'true', 'A fenced continuation restores the existing layout');
+                await page.evaluate(() => window.publish('b', 5)); // A live view missed the stop before remote Play.
+                assert.equal(await isExpanded(), 'false');
+                await page.locator('.footer-gripper').click();
+                await page.evaluate(() => window.publish('b', 5));
+                assert.equal(await isExpanded(), 'true', 'The stop collapses once');
+            }
+        }
+        for (const browse of [false, true]) {
+            await open(true);
+            await page.evaluate(browse => {
+                if (browse) window.browse();
+                window.publish('a', 5, 'paused', false);
+                window.releaseRestore();
+            }, browse);
+            assert.equal(await isExpanded(), String(!browse));
+            assert.equal(await page.evaluate(() => window.revealedTrack), undefined);
+        }
+
+        await open(false, true);
+        await page.evaluate(async () => {
+            window.start();
+            await window.started;
+            window.beginNewSelection();
+            await window.rejectSelection();
+            window.publish('a', 4, 'paused', false); // Legacy restore after blocked selections.
+        });
+        assert.equal(await isExpanded(), 'true');
+        assert.equal(await page.evaluate(() => window.savedDrawer), undefined);
+        assert.equal(await page.evaluate(() => window.revealedTrack), undefined);
+
+        await open();
+        await page.evaluate(() => window.start());
+        await page.waitForFunction(() => !!window.releasePlay);
+        await page.evaluate(() => window.publish('old', 4, 'paused', false, 'restored-session'));
+        assert.equal(await isExpanded(), 'true', 'A delayed restored target uses the saved layout immediately');
+        await page.evaluate(async () => {
+            window.publish('a', 4, 'positioning');
+            window.beginNewSelection();
+            await window.rejectSelection();
+            window.releasePlay();
+            await window.started;
+        });
+        assert.equal(await isExpanded(), 'true');
+        assert.equal(await page.evaluate(() => window.revealedTrack), undefined);
+    },
+
     /** Rotating an open phone player must leave its wheel and two-line title fully usable. */
     async 'wheel: landscape fits the wheel, mode and wrapped title after rotation'(page) {
         const url = globalThis.__ONEPLAY_TEST_URL;
@@ -21,7 +392,7 @@ module.exports = {
         await page.evaluate(async title => {
             const folder = ['OnePlay Music','show'];
             window._testTree.setSelectedPath(folder);
-            await window._testPlayback.restoreVisualState(folder, [...folder,title], 'all', false, 0);
+            await window._testPlayback.restoreVisualState(folder, [...folder,title], 'all', 0);
         }, title);
         await page.locator('.footer-gripper').click();
         await page.setViewportSize({width:844, height:390});
@@ -93,7 +464,7 @@ module.exports = {
                 if (!favs.getAll().length) await favs.add({kind: 'playlist', id: 'show', name: 'Show',
                     hasPrivatePlayback: false, members: ['A', 'B', 'C', 'D', 'archive'].map(member)});
                 const saved = JSON.parse(localStorage.getItem('oneplay_music_playback'));
-                if (saved) await p.restoreVisualState(saved.folder, saved.track, saved.mode, true,
+                if (saved) await p.restoreVisualState(saved.folder, saved.track, saved.mode,
                     parseGlobalPlaybackTime(localStorage.oneplay_music_time, saved), saved.favId, accounts, saved);
                 document.querySelector('#start').onclick = () => p.playFolder(root, accounts);
                 window.removeAt = i => favs.removeMembers('show', [i]);
@@ -147,6 +518,7 @@ module.exports = {
         assert.equal(await page.locator('.footer-title').textContent(), 'A');
         await page.evaluate(async () => { window.holdWrite = false; window.releaseWrite(); await window.editDone; await window.ack(); });
         await audible('C');
+        assert.equal(await page.locator('.footer-gripper').getAttribute('aria-expanded'), 'true');
         assert.equal(await page.evaluate(() => window.info().track.at(-1)), 'm:1');
         // Commit a second edit that removes C, then lose the page before its revised queue is acknowledged.
         await page.evaluate(() => { window.releaseWrite = undefined; window.holdWrite = true; window.editDone = window.removeAt(1); });
@@ -403,8 +775,7 @@ module.exports = {
             await player.playFolder(root, accounts);
             tree.setSelectedPath([...root, 'A']);
             window.pick = name => player.playTrack([...root, 'A', name], accounts);
-            window.pick('25');
-            document.querySelector('.footer-gripper').click();
+            await window.pick('25');
             await Promise.all(document.querySelector('.expansion').getAnimations().map(a => a.finished));
         });
         const state = () => page.evaluate(() => {
@@ -481,7 +852,9 @@ module.exports = {
         await audio.evaluate(el => el.pause());
         await seekTo(65);
         const opening = await page.evaluate(() => {
-            document.querySelector('.footer-gripper').click();
+            const gripper = document.querySelector('.footer-gripper');
+            if (gripper.getAttribute('aria-expanded') === 'true') gripper.click();
+            gripper.click();
             return document.querySelector('.scrubber-text span').textContent;
         });
         assert.equal(opening, '1:05 / 2:00');
@@ -523,9 +896,19 @@ module.exports = {
         await setFakeNow(page, base + 31 * 60000);
         await dispatchAudioTimeupdate(page);
         assert.equal(await isPaused(), false, 'valid release must extend the original 30-minute deadline');
+        await dragFrom(10);
         await setFakeNow(page, base + 51 * 60000);
         await dispatchAudioTimeupdate(page);
         assert.equal(await isPaused(), true, 'the rearmed deadline must still expire');
+        assert.equal(await shell.evaluate(el => el.hasPointerCapture(window.wheelTestPointerId)), false);
+        const stoppedAt = await time();
+        await page.mouse.up();
+        assert.equal(await isPaused(), true, 'late release must leave Timer paused');
+        assert.equal(await time(), stoppedAt);
+        await page.locator('.footer-gripper').click();
+        await page.locator('.expansion').evaluate(async el => {
+            await Promise.allSettled(el.getAnimations().map(animation => animation.finished));
+        });
 
         await pause();
         await dragFrom(10);
@@ -581,6 +964,10 @@ module.exports = {
         await setFakeNow(page, base + 82 * 60000);
         await dispatchAudioTimeupdate(page);
         assert.equal(await isPaused(), true, 'stale release must not extend the successor deadline');
+        await page.locator('.footer-gripper').click();
+        await page.locator('.expansion').evaluate(async el => {
+            await Promise.allSettled(el.getAnimations().map(animation => animation.finished));
+        });
 
         // Source and counter can change independently. Check each on move and up.
         for (const [changePlay, moveBeforeUp] of [[true, true], [false, true], [false, false]]) {

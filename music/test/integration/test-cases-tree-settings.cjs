@@ -626,27 +626,22 @@ module.exports = {
         await page.waitForFunction(() => !!window._testPlayback);
         await page.evaluate(() => window._testAuth.transition("evidence:signed-in"));
         await openSettingsPage(page);
-        const signedInLabel = await page.locator("#settings-container .settings-section", { hasText: "OneDrive" })
-            .locator("button").first().textContent();
+        const accountButton = page.locator("#settings-container .settings-section", {
+            has: page.getByRole("heading", { name: "OneDrive", exact: true }),
+        }).getByRole("button", { name: /^(Sign out|Reconnect\.\.\.)$/ });
+        const signedInLabel = await accountButton.textContent();
         assert((signedInLabel || "").includes("Sign out"), `Expected Sign out button, got "${signedInLabel}"`);
         await closeSettingsPage(page);
 
         await page.evaluate(() => window._testAuth.transition("evidence:signed-out"));
         await openSettingsPage(page);
-        const signedOutLabel = await page.locator("#settings-container .settings-section", { hasText: "OneDrive" })
-            .locator("button").first().textContent();
+        const signedOutLabel = await accountButton.textContent();
         assert((signedOutLabel || "").includes("Reconnect"), `Expected Reconnect button, got "${signedOutLabel}"`);
-        const reconnectStyle = await page.evaluate(() => {
-            const section = Array.from(document.querySelectorAll("#settings-container .settings-section"))
-                .find((el) => (el.textContent || "").includes("OneDrive"));
-            const btn = section ? section.querySelector("button") : null;
-            if (!(btn instanceof HTMLButtonElement)) return { className: "", color: "", beforeBg: "" };
-            return {
-                className: btn.className,
-                color: getComputedStyle(btn).color,
-                beforeBg: getComputedStyle(btn, "::before").backgroundColor,
-            };
-        });
+        const reconnectStyle = await accountButton.evaluate(btn => ({
+            className: btn.className,
+            color: getComputedStyle(btn).color,
+            beforeBg: getComputedStyle(btn, "::before").backgroundColor,
+        }));
         const reconnectTextRgb = (reconnectStyle.color.match(/\d+/g) || []).map(Number);
         const reconnectBgRgb = (reconnectStyle.beforeBg.match(/\d+/g) || []).map(Number);
         assert(reconnectStyle.className.includes("settings-pill-reconnect"),
@@ -1031,7 +1026,17 @@ module.exports = {
             });
         });
         await openSettingsPage(page);
-        const refreshBtn = page.locator("#settings-container button", { hasText: "Refresh now" }).first();
+        const settings = page.locator("#settings-container");
+        const headings = await settings.locator(".settings-section h3").allTextContents();
+        assert(headings.join("|") === "Theme|Duration of Timer mode|Shared with you|OneDrive|Debug",
+            `Unexpected Settings order: ${headings.join(", ")}`);
+        const oneDrive = settings.locator(".settings-section", {
+            has: page.getByRole("heading", { name: "OneDrive", exact: true }),
+        });
+        const refreshBtn = oneDrive.getByRole("button", { name: "Refresh now" });
+        const actions = await oneDrive.getByRole("button").allTextContents();
+        assert(actions[0] === "Refresh now" && /^(Sign out|Reconnect\.\.\.)$/.test(actions[1]),
+            `Unexpected OneDrive actions: ${actions.join(", ")}`);
         // Force deterministic idle status so this test doesn't wait on
         // background startup pull timing.
         await page.evaluate(() => {
@@ -1074,7 +1079,7 @@ module.exports = {
                 lastIndexUpdatedAt: Date.now() - 60_000,
             });
         });
-        const progressLine = await page.locator("#settings-container .settings-index-line").textContent();
+        const progressLine = await oneDrive.locator(".settings-index-line").textContent();
         assert((progressLine || "").includes("OneDrive: 42%"),
             `Expected live progress line, got \"${progressLine}\"`);
         const progressSpinner = await page.locator("#settings-container .settings-index-line .sync-spinner").count();
@@ -1140,7 +1145,7 @@ module.exports = {
         const refreshClassAfterClear = await refreshBtn.getAttribute("class");
         assert(refreshVisibleAfter, "Refresh button should be visible after pull completion");
         assert(refreshEnabledAfter, "Refresh button should be enabled after pull completion");
-        assert((idleLine || "").includes("Last updated"), `Expected idle last-updated line, got "${idleLine}"`);
+        assert((idleLine || "").includes("Last updated <1 min ago"), `Expected fresh last-updated line, got "${idleLine}"`);
         assert(idleSpinner === 0, `Expected no spinner in idle state, got ${idleSpinner}`);
         assert(!(refreshClassAfterClear || "").includes("settings-pill-refresh-urgent"),
             `Expected urgent CTA class to clear after failure clears, got class="${refreshClassAfterClear}"`);

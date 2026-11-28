@@ -80,6 +80,8 @@ body{background:var(--bg-header);height:100%;display:flex;flex-direction:column;
 .settings-body{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:12px;background:var(--bg-surface);}
 .settings-section{margin-bottom:20px;}
 .settings-section h3{margin:0 0 8px;font-size:0.9rem;font-weight:var(--font-weight-bold);color:var(--text-secondary);}
+.settings-info-links{display:flex;flex-wrap:wrap;gap:0 18px;}
+.settings-info-links a{display:inline-flex;align-items:center;min-height:44px;color:var(--text-primary);}
 .settings-pill{appearance:none;border:none;background:transparent;color:var(--text-heading);border-radius:8px;font-size:15px;padding:0 20px;min-height:44px;cursor:pointer;white-space:nowrap;display:inline-flex;align-items:center;justify-content:center;position:relative;z-index:0;}
 .settings-pill::before{content:'';position:absolute;inset:6px 0;border-radius:8px;background:var(--bg-control);z-index:-1;}
 .settings-pill:active::before{background:var(--bg-control-active);}

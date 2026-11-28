@@ -23,6 +23,32 @@ async function serveDemo(page) {
 }
 
 module.exports = {
+    async 'demo: Settings info links open separate live pages'(page) {
+        await serveDemo(page);
+        await page.goto(url);
+        await explore(page).click();
+        await page.getByRole('button', {name:'Settings, demo library'}).click();
+        const settings = page.locator('#settings-container');
+        assert.deepEqual(await settings.getByRole('heading').allTextContents(),
+            ['Theme', 'Duration of Timer mode', 'Demo library']);
+        const info = settings.getByRole('navigation', {name:'Help and privacy'});
+        for (const [label, path, heading] of [
+            ['Privacy policy', 'privacy.html', 'OnePlay Music Privacy Policy'],
+            ['Support', 'support.html', 'OnePlay Music Support'],
+        ]) {
+            const [popup] = await Promise.all([
+                page.waitForEvent('popup'),
+                info.getByRole('link', {name:label, exact:true}).click(),
+            ]);
+            await popup.getByRole('heading', {name:heading, exact:true}).waitFor();
+            assert.equal(popup.url(), 'https://unto.me/oneplay/' + path);
+            assert.equal(await popup.evaluate(() => window.opener), null);
+            assert.equal(page.url(), url);
+            assert(await settings.isVisible());
+            await popup.close();
+        }
+    },
+
     async 'demo: offline sign-out returns to the chooser and keeps pinned audio and position'(page) {
         await serveDemo(page);
         let graph = 0;

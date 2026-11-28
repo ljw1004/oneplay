@@ -151,6 +151,7 @@ export function createNativeLibrary(handler: ReplyHandler) {
         cancelDemoOpen: (attempt: string) => post({op: 'demoCancelOpen', attempt}),
         demoCatalog: (refresh: boolean) => post({op: 'demoCatalog', refresh}),
         openDemoCredits: () => post({op: 'demoCredits'}),
+        openInfoPage: (file: string) => post({op: 'openInfoPage', file}),
         saveDeviceTheme: (theme: string) => post({op: 'deviceTheme', theme}),
         signOut: (theme: string) => post({ op: 'signOut', theme }),
         fetch: request,

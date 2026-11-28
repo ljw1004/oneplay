@@ -85,7 +85,7 @@ The browser keeps Demo library state in a distinct IndexedDB database and localS
 - **src/select.ts** — Select mode state machine/orchestrator. Owns selection mode transitions and action-bar flow.
   - **src/select-dialogs.ts** — Select dialog/domain helpers. Resolves selected paths into playlist member refs and related select-dialog data transforms.
   - **src/modal.ts** — Shared modal primitives. Reusable modal/dropdown/input helpers consumed by select/settings UIs.
-- **src/settings.ts** — Settings page component. KISS model: `open()` builds DOM fresh, `close()` destroys it, `updateIndexSection()` live-updates the indexing row while open. Sections: OneDrive auth, shared-with-you, timer duration, indexing status + refresh, debug toggle.
+- **src/settings.ts** — Settings builds controls on open and updates the OneDrive status in place. It shows Theme, timer duration, shared folders, OneDrive refresh and account actions, then Debug. Privacy and Support link to static pages outside the PWA scope. The bundled iOS shell opens only those two Settings destinations in the system browser.
 - **src/downloads.ts** — Background download engine for offline audio. Manages a queue of `driveId:itemId` keys, two concurrent download slots, quota enforcement, and evidence-based connectivity tracking.
 - **src/logger.ts** — Environment-agnostic `log`/`logError`/`logCatch`. Swappable impl.
 - **src/logger-web.ts** — Browser quad-write impl (console, window array, DOM panel, localStorage). Initialized by `src/index.ts` at startup.

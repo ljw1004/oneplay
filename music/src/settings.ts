@@ -41,6 +41,7 @@ interface OpenOptions {
         readonly creditsHref?: string;
         readonly openNativeCredits?: () => void;
     };
+    readonly onOpenInfoPage?: (file: string) => void;
     readonly evidence: EvidenceState;
     readonly timerDuration: TimerDuration;
     readonly debugEnabled: boolean;
@@ -91,7 +92,7 @@ const TIMER_OPTIONS: ReadonlyArray<{ value: TimerDuration; label: string }> = [
 /** Same delete glyph used by the action-bar right button in select mode. */
 const ACTION_DELETE_ICON_SVG = '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h14M7 5V4a1 1 0 011-1h4a1 1 0 011 1v1M5 5v12a1 1 0 001 1h8a1 1 0 001-1V5"/><path d="M8 9v5M12 9v5"/></svg>';
 
-/** Formats a saved refresh timestamp as relative time ("5 mins ago", "just now"). */
+/** Formats a saved refresh timestamp as relative time ("5 mins ago", "<1 min ago"). */
 function formatLastUpdated(at: number | undefined): string {
     if (at === undefined || !Number.isFinite(at)) return 'Last updated never';
     const mins = Math.floor((Date.now() - at) / 60_000);
@@ -155,7 +156,6 @@ export function createSettings(container: HTMLElement): SettingsView {
     };
 
     let indexLinesEl: HTMLElement | undefined;
-    let indexHeadingEl: HTMLElement | undefined;
     let refreshButton: HTMLButtonElement | undefined;
 
     const renderIndexSection = (): void => {
@@ -163,9 +163,6 @@ export function createSettings(container: HTMLElement): SettingsView {
         const checkingForUpdates = indexStatus.checkingForUpdates;
         const hasShareBuild = (indexStatus.shareRows ?? []).some((row) => row.progress !== undefined);
         const indexingActive = checkingForUpdates || indexStatus.indexProgress !== undefined || hasShareBuild;
-        if (indexHeadingEl) {
-            indexHeadingEl.textContent = indexingActive ? 'Indexing\u2026' : 'Index';
-        }
 
         indexLinesEl.replaceChildren();
         if (checkingForUpdates) {
@@ -184,8 +181,7 @@ export function createSettings(container: HTMLElement): SettingsView {
             }
         }
 
-        if (!checkingForUpdates && !indexStatus.indexProgress
-            && (indexStatus.shareRows ?? []).every((row) => row.progress === undefined)) {
+        if (!indexingActive) {
             const line = document.createElement('div');
             line.className = 'settings-index-line-row';
             if (indexStatus.latestFailure) {
@@ -206,7 +202,6 @@ export function createSettings(container: HTMLElement): SettingsView {
             container.replaceChildren();
             openState = true;
             indexLinesEl = undefined;
-            indexHeadingEl = undefined;
             refreshButton = undefined;
             indexStatus = {
                 checkingForUpdates: false,
@@ -255,6 +250,42 @@ export function createSettings(container: HTMLElement): SettingsView {
                 return s;
             };
 
+            const themeSec = section('Theme');
+            const themeSelect = document.createElement('select');
+            themeSelect.className = 'settings-theme-select';
+            for (const opt of [
+                { value: 'light', label: 'Light' },
+                { value: 'dark', label: 'Dark' },
+                { value: 'auto', label: 'Auto (system)' },
+            ] as const) {
+                const optEl = document.createElement('option');
+                optEl.value = opt.value;
+                optEl.textContent = opt.label;
+                themeSelect.appendChild(optEl);
+            }
+            themeSelect.value = initial.theme;
+            themeSelect.addEventListener('change', () => {
+                initial.onThemeChange(themeSelect.value as ThemePreference);
+            });
+            themeSec.appendChild(themeSelect);
+            body.appendChild(themeSec);
+
+            const timer = section('Duration of Timer mode');
+            const timerSelect = document.createElement('select');
+            timerSelect.className = 'settings-timer-select';
+            for (const opt of TIMER_OPTIONS) {
+                const optEl = document.createElement('option');
+                optEl.value = opt.value;
+                optEl.textContent = opt.label;
+                timerSelect.appendChild(optEl);
+            }
+            timerSelect.value = initial.timerDuration;
+            timerSelect.addEventListener('change', () => {
+                initial.onTimerChange(timerSelect.value as TimerDuration);
+            });
+            timer.appendChild(timerSelect);
+            body.appendChild(timer);
+
             authButton = undefined;
             if (initial.demo) {
                 const demo = section('Demo library');
@@ -286,21 +317,6 @@ export function createSettings(container: HTMLElement): SettingsView {
                 demo.append(summary, signOut);
                 body.appendChild(demo);
             } else {
-                const oneDrive = section('OneDrive');
-                authButton = document.createElement('button');
-                authButton.type = 'button';
-                authButton.className = 'settings-pill';
-                updateAuthAction(initial.evidence);
-                authButton.addEventListener('click', () => {
-                    initial.onClose();
-                    runMaybeAsyncUiAction(
-                        () => reconnect ? initial.onReconnect() : initial.onSignOut(),
-                        'settings auth action',
-                    );
-                });
-                oneDrive.appendChild(authButton);
-                body.appendChild(oneDrive);
-
                 const shared = section('Shared with you');
                 const shareList = document.createElement('div');
                 shareList.className = 'settings-share-list';
@@ -419,27 +435,8 @@ export function createSettings(container: HTMLElement): SettingsView {
                 shareList.appendChild(addShareBtn);
                 shared.appendChild(shareList);
                 body.appendChild(shared);
-            }
 
-            const timer = section('Duration of Timer mode');
-            const timerSelect = document.createElement('select');
-            timerSelect.className = 'settings-timer-select';
-            for (const opt of TIMER_OPTIONS) {
-                const optEl = document.createElement('option');
-                optEl.value = opt.value;
-                optEl.textContent = opt.label;
-                timerSelect.appendChild(optEl);
-            }
-            timerSelect.value = initial.timerDuration;
-            timerSelect.addEventListener('change', () => {
-                initial.onTimerChange(timerSelect.value as TimerDuration);
-            });
-            timer.appendChild(timerSelect);
-            body.appendChild(timer);
-
-            if (!initial.demo) {
-                const indexing = section('Index');
-                indexHeadingEl = indexing.querySelector('h3')!;
+                const oneDrive = section('OneDrive');
                 indexLinesEl = document.createElement('div');
                 indexLinesEl.className = 'settings-index-line';
                 refreshButton = document.createElement('button');
@@ -451,30 +448,21 @@ export function createSettings(container: HTMLElement): SettingsView {
                     renderIndexSection();
                     runMaybeAsyncUiAction(() => initial.onRefreshNow(), 'settings refresh');
                 });
-                indexing.append(indexLinesEl, refreshButton);
-                body.appendChild(indexing);
+                authButton = document.createElement('button');
+                authButton.type = 'button';
+                authButton.className = 'settings-pill';
+                updateAuthAction(initial.evidence);
+                authButton.addEventListener('click', () => {
+                    initial.onClose();
+                    runMaybeAsyncUiAction(
+                        () => reconnect ? initial.onReconnect() : initial.onSignOut(),
+                        'settings auth action',
+                    );
+                });
+                oneDrive.append(indexLinesEl, refreshButton, ' ', authButton);
+                body.appendChild(oneDrive);
                 renderIndexSection();
             }
-
-            const themeSec = section('Theme');
-            const themeSelect = document.createElement('select');
-            themeSelect.className = 'settings-theme-select';
-            for (const opt of [
-                { value: 'light', label: 'Light' },
-                { value: 'dark', label: 'Dark' },
-                { value: 'auto', label: 'Auto (system)' },
-            ] as const) {
-                const optEl = document.createElement('option');
-                optEl.value = opt.value;
-                optEl.textContent = opt.label;
-                themeSelect.appendChild(optEl);
-            }
-            themeSelect.value = initial.theme;
-            themeSelect.addEventListener('change', () => {
-                initial.onThemeChange(themeSelect.value as ThemePreference);
-            });
-            themeSec.appendChild(themeSelect);
-            body.appendChild(themeSec);
 
             if (!initial.demo) {
                 const debug = section('Debug');
@@ -532,6 +520,25 @@ export function createSettings(container: HTMLElement): SettingsView {
                 }
             }
 
+            // These pages sit outside the installed web app's navigation scope.
+            const infoLinks = document.createElement('nav');
+            infoLinks.className = 'settings-info-links';
+            infoLinks.setAttribute('aria-label', 'Help and privacy');
+            for (const [label, file] of [['Privacy policy', 'privacy.html'], ['Support', 'support.html']]) {
+                const link = document.createElement('a');
+                link.href = `https://unto.me/oneplay/${file}`;
+                link.target = '_blank';
+                link.rel = 'noopener noreferrer';
+                link.textContent = label;
+                const openInfoPage = initial.onOpenInfoPage;
+                if (openInfoPage) link.addEventListener('click', event => {
+                    event.preventDefault();
+                    openInfoPage(file);
+                });
+                infoLinks.appendChild(link);
+            }
+            body.appendChild(infoLinks);
+
             root.append(header, body);
             container.replaceChildren(root);
         },
@@ -542,7 +549,6 @@ export function createSettings(container: HTMLElement): SettingsView {
             authButton = undefined;
             container.replaceChildren();
             indexLinesEl = undefined;
-            indexHeadingEl = undefined;
             refreshButton = undefined;
         },
 

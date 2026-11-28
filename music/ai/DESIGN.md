@@ -379,29 +379,28 @@ Just like Search, Settings will also remember the exact tree state (selected-fol
 Search doesn't re-use the "currently selected folder" styling because that's not how iPhone does it, and because it's not a currently selected folder. Likewise Settings won't re-use it. We'll just rely on styling of "Settings" to make it look like a heading. However the Settings title itself will have the same row height as the existing tree, just like Search does.
 
 ```
-+----------------------+
-| Settings         (X) |
-|                      |
-| OneDrive             |
-| [Sign out]|[Reconnect...] | <-- only one or the other
-|                      |
-| Shared with you      |
-|   share1 [Rename...][Remove...] |
-|   share2 [Rename...][Remove...] |
-|   Add [+...] |
-|                      |
-| Duration of Timer mode |
-| [30]mins             |
-|                      |
-| Index|Indexing...    |
-| OneDrive: 50% ⟳      |
-| share1: 20% ⟳        |
-| OR: Last updated 5mins ago ✓ |
-| [Refresh now]        |
-|                      |
-| Debug                |
-| [turn on]|[turn off] | <-- only on or the other
-+----------------------+
++-------------------------------------+
+| Settings                        (×) |
+|                                     |
+| Theme                               |
+| [Light]                             |
+|                                     |
+| Duration of Timer mode              |
+| [30m]                               |
+|                                     |
+| Shared with you                     |
+| share1 [Rename] [Disconnect]        |
+| Add share URL...                    |
+|                                     |
+| OneDrive                            |
+| Last updated <1 min ago ✓           |
+| [Refresh now] [Sign out]            |
+|                                     |
+| Debug                               |
+| [Turn on]                           |
+|                                     |
+| Privacy policy   Support            |
++-------------------------------------+
 ```
 
 Reconnect? That's because if you've failed Entra, then you need an explicit interactive signin. The hamburger ☰ will have gained a warning badge dot, and you'll have to do an explicit interactive signin. This is similar to existing iPhone apps where you navigate to the Accounts page and it shows accounts that have problems and need to be signed in again. Both buttons dismiss Settings. Sign out returns to the provider chooser. Reconnect starts the existing OneDrive sign-in flow. The other buttons leave it open.
@@ -410,7 +409,9 @@ The shared-with-you buttons (Rename..., Remove..., Add...) both bring up modals:
 
 Bedtime timer will be a popup for a pre-made list of options, 15m, 30m, 45m, 60m, end-of-track. There is no option for "Off". The meaning of this is that if playback mode is set to "timer" then it will be used.
 
-Index? This is the only place where people can see the progress of a long-running background index, which might take up to two minutes. Also, the Refresh button will kick off a background check. The Index will normally just be "up to date" if everything is up to date. But if anything is in progress, then it will be a list of all in-progress things, followed by our conventional spinner. It will say "Indexing..." when doing the probe (merkle size check) or settings sync with the words "Checking for updates ⟳", as well as when doing actual indexing using the notation described in the diagram above, a list of "Name: % ⟳" for each index that's currently ongoing. If a probe or settings sync concurrent with any indexing work, then it will prefer the "Checking for udpates" wording.
+The OneDrive section shows the progress of a long-running background index, which might take up to two minutes. **Refresh now** starts a background check and is disabled during the check or a rebuild. The status shows “Checking for updates...” with a spinner during probes and sync. During a rebuild it shows a percentage and spinner for each active library. A completed check shows the last-updated time or the latest error. The OneDrive heading stays in place.
+
+Privacy policy and Support open browser pages outside OnePlay and leave Settings in place. Demo Settings shows Theme, Duration of Timer mode, Demo library, and both links.
 
 Bedtime timer and debug flags will persist to localStorage.
 
@@ -421,7 +422,7 @@ There's zero benefit to having some debug features turned on and off, and the li
 
 Shares appear in the tree view as peers underneath the OneDrive icon.
 
-You add them by going to the main settings page which has a button "Add share...". This brings up an "add share" modal. In it, you paste a share-url that someone has provided to you and click Add. When you click OK then it will make a network call to verify that the share is reachable, and show a spinner "adding...". Once complete we'll dismiss the modal. If there was failure, we'll leave the modal up and show the error so the user can edit the URL and try again; if success, then the share will be added to the Settings page, and the tree, and we'll have kicked off a background index that will in time update the "Indexing" section of the settings page.
+You add them by going to the main settings page which has a button "Add share...". This brings up an "add share" modal. In it, you paste a share-url that someone has provided to you and click Add. When you click OK then it will make a network call to verify that the share is reachable, and show a spinner "adding...". Once complete we'll dismiss the modal. If there was failure, we'll leave the modal up and show the error so the user can edit the URL and try again; if success, then the share will be added to the Settings page, and the tree, and we'll have kicked off a background index that will in time update the refresh status under OneDrive in Settings.
 
 The add-share modal has informative text "Other people can use their OneDrive app to share their music folders with you. Have them message you the URL, and paste it here".
 

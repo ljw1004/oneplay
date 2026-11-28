@@ -614,6 +614,11 @@ import WebKit
                 case "demoCredits":
                     guard demoActive, let url = demo.catalog?.credits else { throw NativeAccountError.invalidRequest }
                     reply = await UIApplication.shared.open(url)
+                case "openInfoPage":
+                    // A Settings link selects a published page. The bridge never accepts an arbitrary URL.
+                    guard let file = args["file"] as? String, ["privacy.html", "support.html"].contains(file),
+                          let url = URL(string: "https://unto.me/oneplay/\(file)") else { throw NativeAccountError.invalidRequest }
+                    reply = await UIApplication.shared.open(url)
                 case "deviceTheme":
                     guard let theme = args["theme"] as? String, ["light", "dark", "auto"].contains(theme) else {
                         throw NativeAccountError.invalidRequest

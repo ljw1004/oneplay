@@ -714,6 +714,7 @@ function openSettingsPage(): void {
             creditsHref: demoCatalog?.credits,
             openNativeCredits: native ? () => { native.openDemoCredits().catch(logCatch('open demo credits')); } : undefined,
         } : undefined,
+        onOpenInfoPage: native ? file => { native.openInfoPage(file).catch(logCatch('open app information')); } : undefined,
         evidence: getLibraryEvidence(),
         timerDuration,
         debugEnabled,

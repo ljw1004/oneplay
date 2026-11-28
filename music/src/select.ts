@@ -4,7 +4,7 @@
  * Manages multi-select for favorites CRUD: long-press / right-click enters
  * select mode, a three-zone action bar (share · summary text · more) offers
  * actions via popup menus. Modals handle user input for each action.
- * The right button manages one favorite or one physical subfolder, or deletes a selection.
+ * The right button manages one favorite or one physical subfolder, or removes selected items.
  *
  * STATE MODEL:
  * - active: whether select mode is currently engaged.
@@ -79,7 +79,7 @@ interface AvailableActions {
     folder?: FolderPin;
     shortcut: boolean;
     playlist: boolean;       // existing playlists to add to
-    delete: boolean;
+    remove: boolean;
     moreMemory: boolean;     // exactly 1 top-level favorite → show its icon
 }
 
@@ -110,7 +110,7 @@ export function createSelect(
 
     // -- Action bar DOM (three-zone layout, built once) -----------------------
     // Left: share circle button. Center: selection summary text. Right: dynamic icon.
-    // The right button shows ☆/♫ for a single favorite, a trash icon for multi-delete,
+    // The right button shows ☆/♫ for a single favorite, a trash icon for direct removal,
     // or is hidden when no actions apply. visibility:hidden (not display:none) keeps
     // center text centered via flex layout.
 
@@ -185,12 +185,12 @@ export function createSelect(
      *
      * Right button:
      * - moreMemory: exactly 1 top-level favorite → show ☆/♫ icon, fav dropdown on tap.
-     * - delete (without moreMemory): multiple deletable items → show trash, delete modal on tap.
+     * - remove (without moreMemory): show trash, removal dialog on tap.
      */
     const computeAvailableActions = (): AvailableActions => {
         const paths = Array.from(selectedPaths).map(classifyPath);
         if (paths.length === 0) {
-            return { shortcut: false, playlist: false, delete: false, moreMemory: false };
+            return { shortcut: false, playlist: false, remove: false, moreMemory: false };
         }
 
         // Shortcut: exactly 1 selected, it's a folder in the OneDrive index
@@ -210,11 +210,10 @@ export function createSelect(
         const playlistOk = favorites.getAll().some(f =>
             f.kind === 'playlist' && f.id !== browsingFavId);
 
-        // Delete: all top-level favorites, or all members of same playlist
+        // Remove: all top-level favorites, or all members of the same playlist.
         const allFavRoots = paths.every(p => p.isFavRoot);
         const allSamePlaylist = paths.every(p => p.isPlaylistMember)
             && new Set(paths.map(p => p.favId)).size === 1;
-        const deleteOk = allFavRoots || allSamePlaylist;
 
         // Memory: exactly 1 top-level favorite selected (shows the fav icon
         // on the right button, with the full fav dropdown on tap).
@@ -224,7 +223,7 @@ export function createSelect(
             folder,
             shortcut: shortcutOk,
             playlist: playlistOk,
-            delete: deleteOk,
+            remove: allFavRoots || allSamePlaylist,
             moreMemory,
         };
     };
@@ -233,7 +232,7 @@ export function createSelect(
      * Updates action bar: selection summary text and right button icon/mode.
      *
      * Summary text: "N Tracks" / "N Folders" / "N Selected" / "Select Items".
-     * Right button: ☆/♫ for single favorite, trash for multi-delete, hidden otherwise.
+     * Right button: ☆/♫ for single favorite, trash for direct removal, hidden otherwise.
      */
     const syncActionBar = (): HTMLButtonElement => {
         const count = selectedPaths.size;
@@ -277,9 +276,9 @@ export function createSelect(
                 label: offlineTitle(coverage !== 'none'),
                 onClick: () => showOfflineModal(folder),
             }]);
-        } else if (actions.delete) {
+        } else if (actions.remove) {
             rightBtn.innerHTML = '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h14M7 5V4a1 1 0 011-1h4a1 1 0 011 1v1M5 5v12a1 1 0 001 1h8a1 1 0 001-1V5"/><path d="M8 9v5M12 9v5"/></svg>';
-            rightBtn.setAttribute('aria-label', 'Delete selected items');
+            rightBtn.setAttribute('aria-label', 'Remove selected items');
         }
         if (toggleRightMenu) {
             if (!rightBtn.hasAttribute('aria-expanded')) rightBtn.setAttribute('aria-expanded', 'false');
@@ -287,9 +286,9 @@ export function createSelect(
             if (rightBtn.getAttribute('aria-expanded') === 'true') dismissActionDropdown();
             rightBtn.removeAttribute('aria-expanded');
         }
-        rightBtn.onclick = toggleRightMenu ?? (actions.delete ? showDeleteModal : null);
+        rightBtn.onclick = toggleRightMenu ?? (actions.remove ? showRemoveModal : null);
         rightBtn.classList.toggle('hidden', !rightBtn.onclick);
-        // A playlist member can have a direct Delete button. Entry opens only menus.
+        // A playlist member can have a direct removal button. Entry opens only menus.
         return toggleRightMenu ? rightBtn : shareBtn;
     };
 
@@ -444,20 +443,21 @@ export function createSelect(
         }, undefined, true);
     };
 
-    /** Delete confirmation modal. Context-aware text. */
-    const showDeleteModal = (): void => {
+    /** Confirms removal of top-level favorites or selected members of one playlist. */
+    const showRemoveModal = (): void => {
         const paths = Array.from(selectedPaths).map(classifyPath);
         const allFavRoots = paths.every(p => p.isFavRoot);
         const allPlaylistMembers = paths.every(p => p.isPlaylistMember);
 
         const itemCount = paths.length;
+        const favoriteKind = allFavRoots && itemCount === 1
+            ? favorites.getAll().find(f => f.id === paths[0].favId)?.kind ?? 'favorite'
+            : undefined;
         const title = allFavRoots
-            ? (itemCount === 1 ? 'Delete favorite?' : `Delete ${itemCount} favorites?`)
+            ? (favoriteKind ? 'Remove favorite?' : `Remove ${itemCount} favorites?`)
             : 'Remove from playlist?';
         const desc = allFavRoots
-            ? (itemCount === 1
-                ? 'This shortcut or playlist will be removed.'
-                : `${itemCount} favorites will be removed.`)
+            ? (favoriteKind ? `This ${favoriteKind} will be removed.` : `${itemCount} favorites will be removed.`)
             : `${itemCount} item${itemCount > 1 ? 's' : ''} will be removed from the playlist.`;
 
         showModal(title, (modal, close) => {
@@ -465,7 +465,7 @@ export function createSelect(
             p.textContent = desc;
             modal.appendChild(p);
 
-            addModalActions(modal, close, 'Delete', async () => {
+            addModalActions(modal, close, 'Remove', async () => {
                 if (allFavRoots) {
                     for (const cp of paths) {
                         if (cp.favId) await favorites.remove(cp.favId);
@@ -539,17 +539,8 @@ export function createSelect(
             });
         }
 
-        items.push({
-            label: 'Delete…',
-            danger: true,
-            onClick: () => {
-                // INVARIANT: this popup is only shown in `moreMemory` mode.
-                // `moreMemory` means exactly one selected top-level favorite, so
-                // the shared delete modal naturally renders the single-favorite
-                // confirmation variant for this action.
-                showDeleteModal();
-            },
-        });
+        // This menu is available only for one top-level favorite.
+        items.push({ label: 'Remove…', danger: true, onClick: showRemoveModal });
 
         return items;
     };

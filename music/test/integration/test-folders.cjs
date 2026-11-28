@@ -309,7 +309,7 @@ module.exports = {
         const member = page.locator('#children .tree-row').first();
         await member.click({button:'right'});
         assert.equal(await share.getAttribute('aria-expanded'), 'true');
-        assert.ok(await page.getByRole('button', {name:'Delete selected items'}).isVisible());
+        assert.ok(await page.getByRole('button', {name:'Remove selected items'}).isVisible());
         await page.locator('#select-cancel').click();
         await page.locator('#breadcrumbs .tree-row').first().locator('.row-name').click();
         await child('OneDrive').click();
@@ -326,6 +326,75 @@ module.exports = {
         await menu.getByRole('button', {name:/Put in new playlist/}).waitFor();
         await page.locator('#select-cancel').click();
         assert.equal(await menu.count(), 0);
+    },
+
+    async 'folders: remove favorites and playlist items with context-specific confirmation'(page) {
+        const {child} = await seedFolderDevice(page);
+        await page.evaluate(async () => {
+            const favorites = window._testFavorites;
+            const source = {driveId:'drive', sourceRootKey:'drive'};
+            const disc = ['Books', 'Dune', 'Disc'];
+            await favorites.add({id:'disc', kind:'shortcut', name:'Disc', hasPrivatePlayback:false,
+                target:{...source, itemId:'disc', path:disc, isFolder:true}});
+            await favorites.add({id:'reading', kind:'playlist', name:'Reading list', hasPrivatePlayback:false,
+                members:[
+                    {...source, itemId:'first', path:[...disc, 'Opening.wav'], isFolder:false},
+                    {...source, itemId:'second', path:[...disc, 'Ending.wav'], isFolder:false},
+                ]});
+        });
+
+        const origin = globalThis.__ONEPLAY_TEST_URL.includes('localhost') ? 'local' : 'production';
+        const screenshot = name => page.screenshot({path:`/tmp/oneplay-remove-${origin}-${name}.png`, animations:'disabled'});
+        const menu = page.locator('.action-dropdown');
+        const menuRemove = menu.getByRole('button', {name:'Remove…', exact:true});
+        const modal = page.locator('.modal');
+        const directRemove = page.getByRole('button', {name:'Remove selected items', exact:true});
+        const checkConfirmation = async (screen, title, description, button) => {
+            assert.equal(await modal.locator('h3').textContent(), title);
+            assert.deepEqual(await modal.locator('p').allTextContents(), [description]);
+            const confirm = modal.getByRole('button', {name:'Remove', exact:true});
+            assert.ok(await confirm.evaluate(el => el.classList.contains('modal-danger')));
+            await screenshot(screen);
+            await modal.getByRole('button', {name:button, exact:true}).click();
+            await modal.waitFor({state:'hidden'});
+        };
+
+        await child('Disc').click({button:'right'});
+        await menuRemove.waitFor();
+        await screenshot('menu');
+        await menuRemove.click();
+        await checkConfirmation('shortcut', 'Remove favorite?', 'This shortcut will be removed.', 'Remove');
+        await child('Disc').waitFor({state:'detached'});
+
+        const playlist = child('Reading list');
+        await playlist.click({button:'right'});
+        await menuRemove.click();
+        await checkConfirmation('playlist', 'Remove favorite?', 'This playlist will be removed.', 'Cancel');
+        await page.locator('#select-cancel').click();
+        await playlist.click();
+
+        const opening = child('Opening.wav');
+        const ending = child('Ending.wav');
+        await opening.click({button:'right'});
+        await directRemove.click();
+        await checkConfirmation('one-item', 'Remove from playlist?', '1 item will be removed from the playlist.', 'Cancel');
+        await ending.click();
+        await directRemove.click();
+        await checkConfirmation('two-items', 'Remove from playlist?', '2 items will be removed from the playlist.', 'Remove');
+        await opening.waitFor({state:'detached'});
+        await ending.waitFor({state:'detached'});
+
+        await page.locator('#breadcrumbs .tree-row').first().locator('.row-name').click();
+        await playlist.click({button:'right'});
+        await child('Keep').click();
+        await directRemove.click();
+        await checkConfirmation('two-favorites', 'Remove 2 favorites?', '2 favorites will be removed.', 'Remove');
+        await playlist.waitFor({state:'detached'});
+        await child('Keep').waitFor({state:'detached'});
+
+        for (const folder of ['OneDrive', 'Books', 'Dune', 'Disc']) await child(folder).click();
+        await opening.waitFor();
+        await ending.waitFor();
     },
 
     /** Exercise production UI and storage against an isolated library with an overlapping playlist and album. */

@@ -117,6 +117,7 @@
 - **Long-press gestures should suppress the synthetic follow-up click.** Otherwise release can immediately undo the long-press action.
 - **Toggle the popup on repeated clicks of the same anchor.**
 - **Clamp fixed-position popups to all viewport edges.**
+- **Measure a row popup after the controls change the layout.** Reveal the pressed row if the new bar covers it. Dismiss on a changed list scroll offset so a queued layout-induced scroll event cannot immediately close the popup.
 - **Defer outside-click listener installation to avoid immediate self-close on open event.**
 - **Live-updated views must not rebuild active controls.** Update text/state nodes in place to preserve focus and open native UI.
 - **Use one validation predicate for both disabled state and submit guard.**

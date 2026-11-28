@@ -1040,10 +1040,12 @@ function wireAndRenderTree(info: AccountInfo | undefined, folder: MusicFolder, r
             searchOpen = false;
             searchQuery = query;
             searchScrollTop = scrollTop;
+            select?.exitSelectMode();
         };
         tree.onSearchQueryChange = (query) => {
             searchQuery = query;
             searchScrollTop = 0;
+            select?.exitSelectMode();
             runSearchAndPushIntoTree('query-change');
         };
         tree.onSearchResultClick = (result: SearchResult) => {
@@ -1237,6 +1239,7 @@ function wireFavoritesUi(): void {
             playback?.collapse();
             nativePlayer?.collapse();
             document.body.classList.add('select-mode');
+            treeEl.querySelector<HTMLInputElement>('.search-input:focus')?.blur();
         };
         select.onExitSelect = () => {
             document.body.classList.remove('select-mode');

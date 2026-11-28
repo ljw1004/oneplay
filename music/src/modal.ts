@@ -155,44 +155,54 @@ export function addModalActions(
     return confirmBtn;
 }
 
-/** Only one action-bar dropdown can be open, including during an anchor switch. */
+export interface ActionDropdownItem {
+    label: string;
+    danger?: boolean;
+    onClick: () => void;
+}
+
+/** The row is measured in the tree after entering selection. */
+interface RowActionAnchor {
+    getRow: () => Element | null;
+    actionBar: HTMLElement;
+    scroller: HTMLElement;
+}
+
+/** Only one dropdown can be open, including during an anchor switch. */
 let closeOpenDropdown: (() => void) | undefined;
 
 export function dismissActionDropdown(): void {
     closeOpenDropdown?.();
 }
 
-/** Mount beside the button so the caret and animation follow it through layout changes. */
+/** Mount next to a bar button or at the pressed row in the visible tree. */
 export function toggleActionDropdown(
-    anchor: HTMLButtonElement,
-    items: Array<{ label: string; danger?: boolean; chevron?: boolean; onClick: () => void }>,
+    anchor: HTMLButtonElement | RowActionAnchor,
+    items: ActionDropdownItem[],
+    dividerBefore = 0,
 ): void {
-    const wasOpen = anchor.getAttribute('aria-expanded') === 'true';
+    const button = anchor instanceof HTMLButtonElement ? anchor : undefined;
+    const wasOpen = button?.getAttribute('aria-expanded') === 'true';
     dismissActionDropdown();
     if (wasOpen) return;
 
     const dropdown = document.createElement('div');
     dropdown.className = 'action-dropdown';
-
-    // The anchor owns its click, including taps on its SVG. Every other outside
-    // press dismisses without consuming the tap that selects the next row.
-    const dismissOutside = (e: PointerEvent): void => {
-        const target = e.target as Node;
-        if (!dropdown.contains(target) && !anchor.contains(target)) dismissActionDropdown();
-    };
+    const lifetime = new AbortController();
+    const {signal} = lifetime;
     closeOpenDropdown = () => {
-        document.removeEventListener('pointerdown', dismissOutside, true);
-        anchor.setAttribute('aria-expanded', 'false');
+        lifetime.abort();
+        button?.setAttribute('aria-expanded', 'false');
         dropdown.remove();
         closeOpenDropdown = undefined;
     };
 
-    for (const item of items) {
+    for (const [index, item] of items.entries()) {
+        if (index > 0 && index === dividerBefore) dropdown.append(document.createElement('hr'));
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.textContent = item.label;
         if (item.danger) btn.classList.add('danger');
-        if (item.chevron) btn.classList.add('chevron');
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
             dismissActionDropdown();
@@ -201,7 +211,62 @@ export function toggleActionDropdown(
         dropdown.appendChild(btn);
     }
 
-    anchor.after(dropdown);
-    anchor.setAttribute('aria-expanded', 'true');
-    document.addEventListener('pointerdown', dismissOutside, true);
+    if (anchor instanceof HTMLButtonElement) {
+        anchor.after(dropdown);
+        anchor.setAttribute('aria-expanded', 'true');
+    } else {
+        dropdown.classList.add('row-action-dropdown');
+        document.body.append(dropdown);
+        const position = (): void => {
+            const row = anchor.getRow();
+            if (row) positionRowActionDropdown(dropdown, anchor, row.getBoundingClientRect());
+            else dismissActionDropdown();
+        };
+        position();
+        const openedAtScrollTop = anchor.scroller.scrollTop;
+        // Entering selection can queue a scroll event before the menu opens.
+        anchor.scroller.addEventListener('scroll', () => {
+            if (anchor.scroller.scrollTop !== openedAtScrollTop) dismissActionDropdown();
+        }, {signal});
+        window.addEventListener('resize', position, {signal});
+        window.visualViewport?.addEventListener('resize', position, {signal});
+        window.visualViewport?.addEventListener('scroll', position, {signal});
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) dismissActionDropdown();
+        }, {signal});
+    }
+    // Leave outside taps to their targets. A bar button still owns toggling its own menu.
+    document.addEventListener('pointerdown', event => {
+        const target = event.target as Node;
+        if (!dropdown.contains(target) && !button?.contains(target)) dismissActionDropdown();
+    }, {capture: true, signal});
+    document.addEventListener('keydown', event => {
+        if (event.key === 'Escape') dismissActionDropdown();
+    }, {signal});
+}
+
+/** Keep the menu within the safe area and the bottom bar tappable, even in landscape. */
+function positionRowActionDropdown(dropdown: HTMLElement, {actionBar, scroller}: RowActionAnchor, row: DOMRect): void {
+    const viewportInset = 8;
+    const rowGap = 4;
+    const bar = actionBar.getBoundingClientRect();
+    const viewport = window.visualViewport;
+    const viewportLeft = viewport?.offsetLeft ?? 0;
+    const viewportTop = viewport?.offsetTop ?? 0;
+    const left = Math.max(bar.left, viewportLeft) + viewportInset;
+    const right = Math.min(bar.right, viewportLeft + (viewport?.width ?? window.innerWidth)) - viewportInset;
+    const top = Math.max(scroller.parentElement!.getBoundingClientRect().top, viewportTop) + viewportInset;
+    const bottom = Math.min(bar.top, viewportTop + (viewport?.height ?? window.innerHeight)) - viewportInset;
+    const above = Math.max(0, Math.min(bottom, row.top - rowGap) - top);
+    const below = Math.max(0, bottom - Math.max(top, row.bottom + rowGap));
+    dropdown.style.maxWidth = `${right - left}px`;
+    const {offsetWidth, scrollHeight} = dropdown;
+    // Use the larger side only when the full menu cannot open below.
+    const opensAbove = scrollHeight > below && above > below;
+    const available = opensAbove ? above : below;
+    dropdown.style.maxHeight = `${available}px`;
+    dropdown.style.setProperty('--row-menu-min-left', `${left}px`);
+    dropdown.style.setProperty('--row-menu-max-left', `${right - offsetWidth}px`);
+    dropdown.style.top = `${opensAbove ? top + above - Math.min(scrollHeight, available) : bottom - below}px`;
+    dropdown.classList.toggle('opens-above', opensAbove);
 }

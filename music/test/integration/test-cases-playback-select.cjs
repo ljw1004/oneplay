@@ -469,7 +469,11 @@ module.exports = {
             const targetTop = Math.min(maxScroll, Math.max(40, maxScroll - 10));
             children.scrollTop = targetTop;
 
-            const row = children.querySelector(".tree-row[data-path]");
+            const listBounds = children.getBoundingClientRect();
+            const row = [...children.querySelectorAll(".tree-row.selectable[data-path]")].find(el => {
+                const bounds = el.getBoundingClientRect();
+                return bounds.top >= listBounds.top && bounds.bottom < listBounds.bottom - 70;
+            });
             if (!(row instanceof HTMLElement)) return { ok: false, reason: "missing row" };
             const rect = row.getBoundingClientRect();
             row.dispatchEvent(new MouseEvent("contextmenu", {

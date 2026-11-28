@@ -2,8 +2,8 @@
  * Select mode module for OnePlay Music.
  *
  * Manages multi-select for favorites CRUD: long-press / right-click enters
- * select mode, a three-zone action bar (share · summary text · more) offers
- * actions via popup menus. Modals handle user input for each action.
+ * select mode and opens a popup beside the pressed row. The action bar offers
+ * the same actions for the current selection. Modals handle input for each action.
  * The right button manages one favorite or one physical subfolder, or removes selected items.
  *
  * STATE MODEL:
@@ -15,8 +15,7 @@
  * - Selectable rows exclude app root and account roots (OneDrive).
  * - In select mode, selectable breadcrumb clicks toggle selection.
  * - In select mode, non-selectable rows (OnePlay Music, OneDrive) are no-ops.
- * - Modals opened from the single-favorite action-bar menu exit SELECT first.
- * - Other modals: Modal Cancel → stays in SELECT. Select Cancel → exits to NORMAL.
+ * - Rename and favorite offline details exit SELECT first. Select Cancel always exits to NORMAL.
  * - Share button always visible (at minimum "New Playlist" is available).
  * - More (⋯) button hidden via visibility:hidden when no actions apply,
  *   preserving flex layout centering of the summary text.
@@ -38,6 +37,7 @@ import {
     dismissActionDropdown,
     focusTextInput,
     configureNameTextInput,
+    type ActionDropdownItem,
 } from './modal.js';
 
 // ---------------------------------------------------------------------------
@@ -58,7 +58,6 @@ export interface Select {
     isActive(): boolean;
     getSelectedPaths(): ReadonlySet<string>;
     toggle(path: FolderPath): void;
-    enterSelectModeWithRow(path: FolderPath): void;
     exitSelectMode(): void;
     setRoots(roots: RootsMap): void;
     onEnterSelect: () => void;
@@ -77,10 +76,11 @@ export interface Select {
 /** Which actions are available based on selection state. */
 interface AvailableActions {
     folder?: FolderPin;
+    folderOfflineLabel?: string;
     shortcut: boolean;
     playlist: boolean;       // existing playlists to add to
     remove: boolean;
-    moreMemory: boolean;     // exactly 1 top-level favorite → show its icon
+    favorite?: Favorite;     // exactly 1 top-level favorite → show its icon
 }
 
 // ---------------------------------------------------------------------------
@@ -184,13 +184,13 @@ export function createSelect(
      * - "New Playlist" is always shown (not tracked here — always present).
      *
      * Right button:
-     * - moreMemory: exactly 1 top-level favorite → show ☆/♫ icon, fav dropdown on tap.
-     * - remove (without moreMemory): show trash, removal dialog on tap.
+     * - Single favorite or an editable physical folder → management menu.
+     * - Other removable selections → direct removal dialog.
      */
     const computeAvailableActions = (): AvailableActions => {
         const paths = Array.from(selectedPaths).map(classifyPath);
         if (paths.length === 0) {
-            return { shortcut: false, playlist: false, remove: false, moreMemory: false };
+            return { shortcut: false, playlist: false, remove: false };
         }
 
         // Shortcut: exactly 1 selected, it's a folder in the OneDrive index
@@ -215,16 +215,17 @@ export function createSelect(
         const allSamePlaylist = paths.every(p => p.isPlaylistMember)
             && new Set(paths.map(p => p.favId)).size === 1;
 
-        // Memory: exactly 1 top-level favorite selected (shows the fav icon
-        // on the right button, with the full fav dropdown on tap).
-        const moreMemory = paths.length === 1 && allFavRoots;
+        const favorite = paths.length === 1 && allFavRoots
+            ? favorites.getAll().find(f => f.id === paths[0].favId) : undefined;
+        const coverage = folder ? tree.getFolderOfflineState(folder).coverage : 'covered';
 
         return {
             folder,
+            folderOfflineLabel: coverage === 'covered' ? undefined : offlineTitle(coverage !== 'none'),
             shortcut: shortcutOk,
             playlist: playlistOk,
             remove: allFavRoots || allSamePlaylist,
-            moreMemory,
+            favorite,
         };
     };
 
@@ -234,7 +235,7 @@ export function createSelect(
      * Summary text: "N Tracks" / "N Folders" / "N Selected" / "Select Items".
      * Right button: ☆/♫ for single favorite, trash for direct removal, hidden otherwise.
      */
-    const syncActionBar = (): HTMLButtonElement => {
+    const syncActionBar = (actions = computeAvailableActions()): void => {
         const count = selectedPaths.size;
         if (count === 0) {
             actionText.textContent = 'Select Items';
@@ -258,38 +259,26 @@ export function createSelect(
                 : `${count} Selected`;
         }
 
-        const actions = computeAvailableActions();
-
-        const folder = actions.folder;
-        const coverage = folder ? tree.getFolderOfflineState(folder).coverage : 'none';
-        let toggleRightMenu: (() => void) | undefined;
-        if (actions.moreMemory) {
-            const favId = classifyPath([...selectedPaths][0]).favId!;
-            const fav = favorites.getAll().find(f => f.id === favId);
-            rightBtn.textContent = fav?.kind === 'playlist' ? '♫' : '☆';
+        const hasMenu = !!(actions.favorite || actions.folderOfflineLabel);
+        if (actions.favorite) {
+            rightBtn.textContent = actions.favorite.kind === 'playlist' ? '♫' : '☆';
             rightBtn.setAttribute('aria-label', 'Favorite actions');
-            toggleRightMenu = () => toggleActionDropdown(rightBtn, buildFavItems(favId));
-        } else if (folder && coverage !== 'covered') {
+        } else if (actions.folderOfflineLabel) {
             rightBtn.innerHTML = '<svg aria-hidden="true" width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M2 5a1 1 0 011-1h5l2 2h7a1 1 0 011 1v8a1 1 0 01-1 1H3a1 1 0 01-1-1z"/></svg>';
             rightBtn.setAttribute('aria-label', 'Folder actions');
-            toggleRightMenu = () => toggleActionDropdown(rightBtn, [{
-                label: offlineTitle(coverage !== 'none'),
-                onClick: () => showOfflineModal(folder),
-            }]);
         } else if (actions.remove) {
             rightBtn.innerHTML = '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h14M7 5V4a1 1 0 011-1h4a1 1 0 011 1v1M5 5v12a1 1 0 001 1h8a1 1 0 001-1V5"/><path d="M8 9v5M12 9v5"/></svg>';
             rightBtn.setAttribute('aria-label', 'Remove selected items');
         }
-        if (toggleRightMenu) {
+        if (hasMenu) {
             if (!rightBtn.hasAttribute('aria-expanded')) rightBtn.setAttribute('aria-expanded', 'false');
         } else {
             if (rightBtn.getAttribute('aria-expanded') === 'true') dismissActionDropdown();
             rightBtn.removeAttribute('aria-expanded');
         }
-        rightBtn.onclick = toggleRightMenu ?? (actions.remove ? showRemoveModal : null);
+        rightBtn.onclick = hasMenu ? () => toggleActionDropdown(rightBtn, buildManagementItems(actions))
+            : actions.remove ? showRemoveModal : null;
         rightBtn.classList.toggle('hidden', !rightBtn.onclick);
-        // A playlist member can have a direct removal button. Entry opens only menus.
-        return toggleRightMenu ? rightBtn : shareBtn;
     };
 
     // -- Modals ---------------------------------------------------------------
@@ -481,10 +470,9 @@ export function createSelect(
         });
     };
 
-    /** Share popup: shortcut, add to playlist, new playlist. */
-    const showSharePopup = (): void => {
-        const actions = computeAvailableActions();
-        const items: Array<{ label: string; danger?: boolean; chevron?: boolean; onClick: () => void }> = [];
+    /** Actions that add the selection to a shortcut or playlist. */
+    const buildShareItems = (actions: AvailableActions): ActionDropdownItem[] => {
+        const items: ActionDropdownItem[] = [];
 
         if (actions.shortcut && actions.folder) {
             const folder = actions.folder;
@@ -499,15 +487,16 @@ export function createSelect(
             onClick: () => showCreatePlaylistModal(buildMembersFromSelection()),
         });
 
-        toggleActionDropdown(shareBtn, items);
+        return items;
     };
 
-    /** Builds the dropdown items for a single favorite shown from the action bar. */
-    const buildFavItems = (favId: string): Array<{ label: string; danger?: boolean; chevron?: boolean; onClick: () => void }> => {
-        const fav = favorites.getAll().find(f => f.id === favId);
-        if (!fav) return [];
+    /** The bar and row menu share the same single-item actions and handlers. */
+    const buildManagementItems = ({favorite: fav, folder, folderOfflineLabel}: AvailableActions): ActionDropdownItem[] => {
+        if (!fav) return folder && folderOfflineLabel
+            ? [{ label: folderOfflineLabel, onClick: () => showOfflineModal(folder) }] : [];
+        const favId = fav.id;
 
-        const items: Array<{ label: string; danger?: boolean; chevron?: boolean; onClick: () => void }> = [];
+        const items: ActionDropdownItem[] = [];
 
         items.push({
             label: fav.hasPrivatePlayback ? 'Remember my spot \u2713' : 'Remember my spot',
@@ -802,16 +791,39 @@ export function createSelect(
         longPressPointerId = undefined;
     };
 
-    const isSelectablePath = (path: FolderPath): boolean =>
-        path.length > 1 && !(path.length === 2 && !path[1].startsWith(FAV_PREFIX));
-
-    const pathFromTreeEventTarget = (target: EventTarget | null): FolderPath | undefined => {
+    /** Only selecting the row itself opens its menu. Its Play button stays independent. */
+    const rowFromTreeEventTarget = (target: EventTarget | null): HTMLElement | undefined => {
         const element = target instanceof Element ? target : null;
         if (element?.closest('.play-btn')) return undefined;
-        const row = element?.closest<HTMLElement>(
-            '#children .tree-row[data-path], #breadcrumbs .tree-row[data-path]',
-        );
-        return row?.dataset.path ? JSON.parse(row.dataset.path) : undefined;
+        return element?.closest<HTMLElement>('.tree-row.selectable[data-path]') ?? undefined;
+    };
+
+    /** Same-path repainting can replace a row while the touch is held. */
+    const findRow = (list: Element, pathKey: string): Element | null =>
+        list.querySelector(`.tree-row.selectable[data-path="${CSS.escape(pathKey)}"]`);
+
+    /** Enter with one checked row. Tree rendering replaces the original gesture target. */
+    const enterSelectModeWithRow = (list: Element, pathKey: string): void => {
+        active = true;
+        selectedPaths.add(pathKey);
+        select.onEnterSelect();
+        const actions = computeAvailableActions();
+        syncActionBar(actions);
+        tree.setSelectMode(true, selectedPaths);
+        const getRow = () => findRow(list, pathKey);
+        const checked = getRow();
+        if (checked) {
+            // The bar may have taken space from the row that was under the finger.
+            if (list.id === 'children') checked.scrollIntoView({block: 'nearest'});
+            const items = buildManagementItems(actions);
+            if (!actions.favorite && actions.remove) {
+                items.push({ label: 'Remove from playlist…', danger: true, onClick: showRemoveModal });
+            }
+            toggleActionDropdown({
+                getRow, actionBar: actionBarEl, scroller: treeContainer.querySelector<HTMLElement>('#children')!,
+            }, [...items, ...buildShareItems(actions)], items.length);
+        }
+        log(`select: entered with ${pathKey}`);
     };
 
     // JS hardening: suppress text selection app-wide. CSS user-select:none
@@ -844,8 +856,10 @@ export function createSelect(
         suppressContextMenu = false;
         if (e.button !== 0) return;
         if (active) return; // already in select mode
-        const path = pathFromTreeEventTarget(e.target);
-        if (!path || !isSelectablePath(path)) return;
+        const row = rowFromTreeEventTarget(e.target);
+        const pathKey = row?.dataset.path;
+        const list = row?.closest('#children, #breadcrumbs');
+        if (!pathKey || !list) return;
 
         cancelLongPress();
         longPressPointerId = e.pointerId;
@@ -855,11 +869,12 @@ export function createSelect(
         longPressTimer = setTimeout(() => {
             longPressTimer = undefined;
             longPressPointerId = undefined;
+            if (active || !findRow(list, pathKey)) return;
             suppressContextMenu = true;
             suppressLongPressClick = true;
             lastLongPressEnterAt = performance.now();
-            lastLongPressEnteredPath = path;
-            select.enterSelectModeWithRow(path);
+            lastLongPressEnteredPath = JSON.parse(pathKey);
+            enterSelectModeWithRow(list, pathKey);
         }, LONG_PRESS_MS);
     });
 
@@ -878,6 +893,10 @@ export function createSelect(
         if (e.pointerId === longPressPointerId) cancelLongPress();
     });
 
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) cancelLongPress();
+    });
+
     // -- Right-click detection ------------------------------------------------
 
     treeContainer.addEventListener('contextmenu', (e) => {
@@ -886,17 +905,19 @@ export function createSelect(
             e.preventDefault();
             return;
         }
-        const path = pathFromTreeEventTarget(e.target);
-        if (!path || !isSelectablePath(path)) return;
+        const row = rowFromTreeEventTarget(e.target);
+        const pathKey = row?.dataset.path;
+        const list = row?.closest('#children, #breadcrumbs');
+        if (!pathKey || !list) return;
         e.preventDefault();
         if (!active) {
-            select.enterSelectModeWithRow(path);
+            enterSelectModeWithRow(list, pathKey);
         }
     });
 
     // -- Action bar button handlers -------------------------------------------
 
-    shareBtn.addEventListener('click', () => showSharePopup());
+    shareBtn.addEventListener('click', () => toggleActionDropdown(shareBtn, buildShareItems(computeAvailableActions())));
     // -- Cancel button --------------------------------------------------------
 
     cancelBtn.addEventListener('click', () => select.exitSelectMode());
@@ -921,18 +942,6 @@ export function createSelect(
                 return;
             }
             syncActionBar();
-        },
-
-        enterSelectModeWithRow(path) {
-            if (active) return;
-            active = true;
-            selectedPaths.clear();
-            selectedPaths.add(JSON.stringify(path));
-            select.onEnterSelect();
-            const menuButton = syncActionBar();
-            tree.setSelectMode(true, selectedPaths);
-            menuButton.click();
-            log(`select: entered with ${JSON.stringify(path)}`);
         },
 
         exitSelectMode() {
@@ -960,7 +969,10 @@ export function createSelect(
 
         setRoots(newRoots) {
             roots = newRoots;
-            if (active) syncActionBar();
+            if (active) {
+                dismissActionDropdown();
+                syncActionBar();
+            }
         },
 
         onEnterSelect: () => {},

@@ -62,7 +62,7 @@ Current behavior for owner review, November 25, 2026. The hosted PWA and bundled
 
 | Action or event | Visible result |
 | --- | --- |
-| Long-press or right-click an eligible row | Enters Select with that row checked and the player collapsed. Tap eligible children or breadcrumbs to change the selection. The action bar shows “Select Items”, a folder/track count, or “N Selected”. **Cancel** exits. Available actions depend on the selected items and their scope. |
+| Long-press or right-click an eligible row | Enters Select with that row checked and the player collapsed. A menu beside the press shows item actions and actions that add it elsewhere, with one divider when both groups are present. Tapping a row or a bar button dismisses the menu and carries out that tap. Blank space or scrolling closes the menu and keeps the selection. Deselecting the last row or tapping **Cancel** exits. |
 | Tap the share/action button | Depending on selection, offers “Add as Shortcut ☆”, “Add to existing playlist ♫”, or “Put in new playlist ♫”. This menu organizes OnePlay favorites. |
 | Create a shortcut or playlist | “Add new shortcut” shows the folder name and “Remember my spot”. “Create playlist” takes “Playlist name” and offers the same checkbox. Confirm with **Create** or cancel. Blank and duplicate playlist names disable submission. |
 | Add to an existing playlist | “Add to playlist” lists eligible destinations. Tapping one adds the selection. Duplicate/cyclic additions can be skipped silently. |

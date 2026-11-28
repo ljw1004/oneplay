@@ -36,7 +36,7 @@ module.exports = {
         await folder.waitFor();
         assert.equal(await page.evaluate(() => document.activeElement?.id), 'tree-container');
         await folder.click({button:'right'});
-        await page.locator('.action-dropdown').getByRole('button').click();
+        await page.locator('.action-dropdown').getByRole('button', {name:'Make available offline', exact:true}).click();
         await page.locator('.modal').getByRole('button',{name:'Make available offline', exact:true}).click();
         await folder.locator('.offline-badge.complete').waitFor();
         await page.addInitScript(() => Object.defineProperty(navigator, 'onLine', {get: () => false}));
@@ -89,7 +89,7 @@ module.exports = {
             document.dispatchEvent(new Event('visibilitychange'));
         });
         await folder.click({button:'right'});
-        await page.locator('.action-dropdown').getByRole('button').click();
+        await page.locator('.action-dropdown').getByRole('button', {name:'Make available offline', exact:true}).click();
         await page.locator('.modal').getByRole('button',{name:'Make available offline', exact:true}).click();
         await folder.locator('.offline-badge.paused').waitFor();
         await page.unroute(manifestUrl);

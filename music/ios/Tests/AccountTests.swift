@@ -534,10 +534,11 @@ private final class HeldDemoCatalog: URLProtocol {
                 }
                 document.dispatchEvent(new PointerEvent('pointerup', touch));
                 if (!document.body.classList.contains('select-mode')) throw Error('Touch release cleared selection');
-                const menu = [...document.querySelectorAll('.action-dropdown button')];
+                const menu = document.querySelector('.row-action-dropdown');
                 const status = action === 'Make available offline' ? 'Make available offline' : 'Available offline…';
-                if (menu.length !== 1 || menu[0].textContent !== status) throw Error('Unexpected folder status menu');
-                menu[0].click();
+                const offline = [...menu.querySelectorAll('button')].find(b => b.textContent === status);
+                if (!offline || !menu.querySelector('hr')) throw Error('Unexpected folder status menu');
+                offline.click();
                 const modal = document.querySelector('.modal');
                 const choices = [...modal.querySelectorAll('button')];
                 choices.find(b => b.textContent.trim() === action).click();

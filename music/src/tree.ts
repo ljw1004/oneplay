@@ -291,12 +291,27 @@ export function createTree(
     const pathEquals = (a: FolderPath, b: FolderPath): boolean =>
         a.length === b.length && a.every((s, i) => s === b[i]);
 
+    /** Tree rows and search results show the same selection marker. */
+    const addSelectionMarker = (row: HTMLElement): void => {
+        row.classList.add('selectable');
+        if (!selectModeActive) return;
+        const isChecked = selectModePaths.has(row.dataset.path!);
+        const check = document.createElement('span');
+        check.className = 'select-check' + (isChecked ? ' checked' : '');
+        check.setAttribute('aria-hidden', 'true');
+        row.setAttribute('role', 'checkbox');
+        row.setAttribute('aria-checked', String(isChecked));
+        check.textContent = isChecked ? '\u2713' : '';
+        row.prepend(check);
+    };
+
     /** Builds one search-result row using existing tree row classes. */
     const makeSearchResultRow = (result: SearchResult): HTMLElement => {
         const isFolder = result.kind === 'favorite' || result.kind === 'folder';
         const row = document.createElement('div');
         row.className = `tree-row ${isFolder ? 'folder' : 'file'}`;
         row.dataset.path = JSON.stringify(result.path);
+        addSelectionMarker(row);
 
         const name = document.createElement('span');
         name.className = 'row-name';
@@ -311,7 +326,10 @@ export function createTree(
             row.appendChild(favIcon);
         }
 
-        row.addEventListener('click', () => view.onSearchResultClick(result));
+        row.addEventListener('click', () => {
+            if (selectModeActive) view.onSelectToggle(result.path);
+            else view.onSearchResultClick(result);
+        });
         return row;
     };
 
@@ -497,7 +515,10 @@ export function createTree(
         setSelectMode(active, paths) {
             selectModeActive = active;
             selectModePaths = paths;
-            render();
+            if (searchModeOpen) {
+                searchResultsScrollTop = childrenEl.scrollTop;
+                renderSearchResultsRows();
+            } else render();
         },
         onTrackClick: (_path) => {},
         onPlayClick: (_path) => {},
@@ -658,16 +679,12 @@ export function createTree(
     ): void => {
         if (isUnavailable) {
             el.classList.add('unavailable');
-            return;
         }
         if (selectModeActive && isSelectableRow) {
             el.addEventListener('click', () => view.onSelectToggle(opts.path));
             return;
         }
-        if (selectModeActive && !isSelectableRow) {
-            el.addEventListener('click', () => {});
-            return;
-        }
+        if (selectModeActive || isUnavailable) return;
         if (opts.isFolder) {
             if (isShareWithoutData) {
                 el.addEventListener('click', () => view.onShareWithoutDataTap(opts.path));
@@ -738,18 +755,7 @@ export function createTree(
         // Select mode checkbox: shown on selectable rows only.
         // Non-selectable rows are app root and account roots.
         const isSelectableRow = !isAppRoot && !isAccount && !isShareRoot;
-        if (isSelectableRow) el.classList.add('selectable');
-        if (selectModeActive && isSelectableRow) {
-            const pathKey = JSON.stringify(opts.path);
-            const isChecked = selectModePaths.has(pathKey);
-            const check = document.createElement('span');
-            check.className = 'select-check' + (isChecked ? ' checked' : '');
-            check.setAttribute('aria-hidden', 'true');
-            el.setAttribute('role', 'checkbox');
-            el.setAttribute('aria-checked', String(isChecked));
-            check.textContent = isChecked ? '\u2713' : '';
-            el.prepend(check);
-        }
+        if (isSelectableRow) addSelectionMarker(el);
 
         // Current track SVG indicator: chevron > (loaded) or spinner ⟳ (loading).
         // Prepended before text so it appears at the row's left edge.
@@ -925,7 +931,7 @@ export function createTree(
         // Click handler: in select mode, selectable rows toggle selection.
         // Non-selectable rows (OnePlay Music + account roots) are explicit no-ops.
         // Track greying: when signed-out or not-online, non-cached tracks are
-        // unavailable (grey, no click handler — the track genuinely can't play).
+        // unavailable for playback. Selection and its local actions still work.
         const isUnavailableFromDeniedShare = !opts.isFolder && isPathDeniedByShare(opts.path, deniedRootKeys, roots);
         const isUnavailableFromEvidence = !opts.isFolder && !opts.isBreadcrumb
             && (evidence === 'evidence:signed-out' || evidence === 'evidence:not-online')

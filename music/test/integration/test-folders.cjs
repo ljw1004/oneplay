@@ -1,6 +1,24 @@
 const assert = require('node:assert/strict');
 const add = 'Make available offline', remove = 'Make unavailable offline';
 
+/** The popup clears the selected row and shadows away from it on either side. */
+async function assertRowMenuPlacement(menu, above) {
+    const geometry = await menu.evaluate(async el => {
+        await Promise.all(el.getAnimations().map(animation => animation.finished));
+        const row = document.querySelector('#children .tree-row[aria-checked="true"]');
+        const label = row.querySelector('.row-name').getBoundingClientRect();
+        const target = row.getBoundingClientRect();
+        const popup = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        const [shadowX, shadowY] = style.boxShadow.match(/-?[\d.]+px/g).map(parseFloat);
+        return {aboveGap:target.top - popup.bottom, belowGap:popup.top - target.bottom,
+            leftOffset:popup.left - label.left, em:parseFloat(style.fontSize), shadowX, shadowY};
+    });
+    assert.ok(Math.abs((above ? geometry.aboveGap : geometry.belowGap) - 4) < 1, JSON.stringify(geometry));
+    assert.ok(Math.abs(geometry.leftOffset - 2 * geometry.em) < 1, JSON.stringify(geometry));
+    assert.ok(geometry.shadowX > 0 && (above ? geometry.shadowY < 0 : geometry.shadowY > 0), JSON.stringify(geometry));
+}
+
 /** Each client starts with the same library, but keeps its own IndexedDB, download queue and network. */
 async function seedFolderDevice(page, {cloud = {}, holdSecond = false, scale = false, overlap = false, soleAccount = false} = {}) {
     const url = globalThis.__ONEPLAY_TEST_URL;
@@ -115,8 +133,9 @@ async function seedFolderDevice(page, {cloud = {}, holdSecond = false, scale = f
     };
     const choose = async (row, label, confirm = true) => {
         const menu = await folderMenu(row);
-        const status = await menu.getByRole('button').textContent();
-        await menu.getByRole('button').click();
+        const action = menu.getByRole('button', {name:/^(Make available offline|Available offline…)$/});
+        const status = await action.textContent();
+        await action.click();
         const modal = page.locator('.modal');
         assert.equal(await modal.locator('h3').textContent(), status);
         await modal.getByRole('button', {name:confirm ? label : 'Close', exact:true}).click();
@@ -271,60 +290,184 @@ module.exports = {
     },
 
     /** Use real button clicks so capture-phase pointerdown and the ensuing click are both exercised. */
-    async 'folders: action menus open on selection entry and toggle at the same anchor'(page) {
+    async 'folders: row action menu, dismissal and bar menu switching on mobile'(page) {
         const {child} = await seedFolderDevice(page);
-        const menu = page.locator('.action-dropdown');
+        await page.evaluate(() => window._testFavorites.add({id:'reading', kind:'playlist', name:'Reading list',
+            hasPrivatePlayback:false, members:[]}));
+        const row = child('Keep');
+        const menu = page.locator('.row-action-dropdown');
+        const barMenu = page.locator('#action-bar .action-dropdown');
+        const cancel = page.locator('#select-cancel');
         const share = page.locator('.share-btn');
         const favorite = page.getByRole('button', {name:'Favorite actions'});
-        // In landscape the popup can appear under the original finger. Releasing
-        // over a command must leave that command available for a separate tap.
+        const summary = page.locator('.action-bar-text');
+        const origin = globalThis.__ONEPLAY_TEST_URL.includes('localhost') ? 'local' : 'production';
+        const screenshot = name => page.screenshot({path:`/tmp/oneplay-row-menu-${origin}-${name}.png`, animations:'disabled'});
+
+        // The menu scrolls in a short viewport and releasing the hold leaves the row checked.
         await page.setViewportSize({width:640, height:300});
         const touch = await page.context().newCDPSession(page);
         await touch.send('Emulation.setTouchEmulationEnabled', {enabled:true});
-        const point = await child('Keep').evaluate(row => {
+        const point = await row.evaluate(row => {
             const r = row.getBoundingClientRect();
             return {x:r.right - 100, y:r.y + r.height / 2};
         });
         await touch.send('Input.dispatchTouchEvent', {type:'touchStart', touchPoints:[point]});
-        await menu.getByRole('button', {name:'Rename…'}).waitFor();
+        await menu.waitFor();
         await menu.evaluate(async el => Promise.all(el.getAnimations().map(a => a.finished)));
-        assert.ok(await page.evaluate(({x,y}) => !!document.elementFromPoint(x,y)?.closest('.action-dropdown button'), point));
+        assert.ok(await page.evaluate(({x,y}) => document.elementFromPoint(x,y)?.closest('.tree-row[aria-checked="true"]'), point));
+        assert.ok(await menu.evaluate(el => el.scrollHeight > el.clientHeight && el.getBoundingClientRect().bottom <
+            document.querySelector('#action-bar').getBoundingClientRect().top));
         await touch.send('Input.dispatchTouchEvent', {type:'touchEnd', touchPoints:[]});
         await touch.detach();
+        assert.equal(await row.getAttribute('aria-checked'), 'true');
+        await screenshot('landscape');
         await page.setViewportSize({width:390, height:844});
-        await menu.getByRole('button', {name:'Rename…'}).waitFor();
-        assert.equal(await favorite.getAttribute('aria-expanded'), 'true');
-        await favorite.click();
-        assert.equal(await menu.count(), 0);
-        await favorite.click();
-        await menu.getByRole('button', {name:'Rename…'}).waitFor();
-        await share.click();
-        await menu.getByRole('button', {name:/Put in new playlist/}).waitFor();
-        assert.equal(await menu.count(), 1);
-        await share.click();
-        assert.equal(await menu.count(), 0);
-        await page.locator('#select-cancel').click();
+        await cancel.click();
 
-        await child('Keep').click();
+        const start = Date.now();
+        await row.click({button:'right', position:{x:280,y:15}});
+        await menu.waitFor();
+        emit(`    row menu opened from a right click in ${Date.now() - start} ms including Playwright`);
+        await assertRowMenuPlacement(menu, false);
+        assert.deepEqual(await menu.getByRole('button').allTextContents(), [
+            'Remember my spot', 'Available offline…', 'Rename…', 'Remove…',
+            'Add to existing playlist ♫', 'Put in new playlist ♫',
+        ]);
+        assert.equal(await menu.locator('hr').count(), 1);
+        assert.equal(await favorite.getAttribute('aria-expanded'), 'false');
+        assert.equal(await share.getAttribute('aria-expanded'), 'false');
+        await screenshot('playlist');
+        await menu.getByRole('button', {name:'Remember my spot', exact:true}).click();
+        await page.waitForFunction(() => window._testFavorites.getAll().find(f => f.id === 'keep')?.hasPrivatePlayback);
+        await cancel.click();
+        await row.click({button:'right'});
+        await menu.getByRole('button', {name:'Remember my spot ✓', exact:true}).waitFor();
+        await favorite.click();
+        assert.equal(await menu.count(), 0);
+        await barMenu.getByRole('button', {name:'Rename…'}).waitFor();
+        assert.equal(await favorite.getAttribute('aria-expanded'), 'true');
+        assert.equal(await barMenu.locator('hr').count(), 0);
+        assert.deepEqual(await barMenu.getByRole('button').evaluateAll(buttons =>
+            buttons.map(button => getComputedStyle(button).borderTopWidth)), ['0px','0px','0px','0px']);
+        await screenshot('favorite-bar');
+        await share.click();
+        await barMenu.getByRole('button', {name:/Put in new playlist/}).waitFor();
+        assert.equal(await barMenu.locator('hr').count(), 0);
+        await screenshot('share-bar');
+        await share.click();
+        assert.equal(await barMenu.count(), 0);
+        await cancel.click();
+
+        await row.click({button:'right'});
+        await page.locator('#children').click({position:{x:5,y:650}});
+        assert.equal(await menu.count(), 0);
+        assert.equal(await row.getAttribute('aria-checked'), 'true');
+        await row.click();
+        assert.equal(await cancel.isVisible(), false);
+        await row.click({button:'right'});
+        await row.click();
+        assert.equal(await menu.count(), 0);
+        assert.equal(await cancel.isVisible(), false);
+
+        await row.click();
         const member = page.locator('#children .tree-row').first();
         await member.click({button:'right'});
-        assert.equal(await share.getAttribute('aria-expanded'), 'true');
-        assert.ok(await page.getByRole('button', {name:'Remove selected items'}).isVisible());
-        await page.locator('#select-cancel').click();
+        const removeMember = menu.getByRole('button', {name:'Remove from playlist…', exact:true});
+        assert.ok(await removeMember.evaluate(button => button.classList.contains('danger')));
+        await removeMember.click();
+        await page.getByRole('heading', {name:'Remove from playlist?'}).waitFor();
+        await page.locator('.modal').getByRole('button', {name:'Cancel', exact:true}).click();
+        await cancel.click();
         await page.locator('#breadcrumbs .tree-row').first().locator('.row-name').click();
         await child('OneDrive').click();
         await child('Books').click();
         await child('Dune').click();
         await child('Disc').click();
         const tracks = page.locator('#children .tree-row.file');
-        await tracks.first().click({button:'right'});
-        assert.equal(await share.getAttribute('aria-expanded'), 'true');
-        await tracks.nth(1).click();
+        await tracks.first().click({button:'right', position:{x:280,y:15}});
+        assert.equal(await menu.locator('hr').count(), 0);
+        await tracks.nth(1).click({position:{x:12,y:15}});
         assert.equal(await menu.count(), 0);
-        assert.equal(await page.locator('.action-bar-text').textContent(), '2 Tracks');
+        assert.equal(await summary.textContent(), '2 Tracks');
         await share.click();
+        await barMenu.getByRole('button', {name:/Put in new playlist/}).waitFor();
+        await cancel.click();
+        assert.equal(await barMenu.count(), 0);
+
+        await tracks.first().click({button:'right'});
+        await menu.getByRole('button', {name:/Add to existing playlist/}).click();
+        await page.locator('.modal-playlist-list').getByText('Reading list ♫', {exact:true}).click();
+        await page.waitForFunction(() => window._testFavorites.getAll().find(f => f.id === 'reading')?.members.length === 1);
+        await cancel.waitFor({state:'hidden'});
+        await page.locator('#breadcrumbs .app-root .row-name').click();
+        await child('Reading list').click({button:'right'});
+        await menu.getByRole('button', {name:'Rename…', exact:true}).click();
+        const rename = page.locator('.modal');
+        await rename.locator('input[type=text]').fill('Reading later');
+        await rename.getByRole('button', {name:'Save', exact:true}).click();
+        await child('Reading later').waitFor();
+    },
+
+    async 'folders: row action menu keeps bottom rows reachable and works in Search'(page) {
+        await seedFolderDevice(page, {soleAccount:true});
+        const list = page.locator('#children');
+        const menu = page.locator('.row-action-dropdown');
+        const tracks = list.locator('.tree-row.file');
+        const last = tracks.last();
+        const cancel = page.getByRole('button', {name:'Cancel', exact:true});
+
+        // Check both directions of the viewport change as the footer gives way to the bar.
+        for (const footerHeight of [0, 100]) {
+            await page.evaluate(height => {
+                const footer = document.querySelector('#footer');
+                footer.classList.toggle('visible', height > 0);
+                footer.style.minHeight = `${height}px`;
+                const list = document.querySelector('#children');
+                list.scrollTop = list.scrollHeight;
+            }, footerHeight);
+            await last.click({button:'right', position:{x:280,y:15}});
+            await menu.waitFor();
+            await assertRowMenuPlacement(menu, true);
+            assert.equal(await last.getAttribute('aria-checked'), 'true');
+            assert.ok(await last.evaluate(row => row.getBoundingClientRect().bottom <= row.parentElement.getBoundingClientRect().bottom));
+            if (footerHeight === 0) {
+                const origin = globalThis.__ONEPLAY_TEST_URL.includes('localhost') ? 'local' : 'production';
+                await page.screenshot({path:`/tmp/oneplay-row-menu-${origin}-above.png`, animations:'disabled'});
+                await last.click();
+            } else {
+                await list.evaluate(el => { el.scrollTop -= 48; });
+                await menu.waitFor({state:'detached'});
+                assert.equal(await last.getAttribute('aria-checked'), 'true');
+                await cancel.click();
+            }
+            assert.equal(await cancel.isVisible(), false);
+        }
+
+        // This row has more space above, but enough below for the whole track menu.
+        await list.evaluate(el => { el.scrollTop = 0; });
+        await tracks.nth(8).click({button:'right', position:{x:12,y:15}});
+        await menu.waitFor();
+        await assertRowMenuPlacement(menu, false);
+        await cancel.click();
+
+        await page.getByRole('button', {name:'Search music'}).click();
+        const search = page.locator('.search-input');
+        await search.fill('Song');
+        await tracks.first().click({button:'right', position:{x:280,y:15}});
         await menu.getByRole('button', {name:/Put in new playlist/}).waitFor();
-        await page.locator('#select-cancel').click();
+        assert.equal(await tracks.first().getAttribute('aria-checked'), 'true');
+        assert.equal(await search.evaluate(input => input === document.activeElement), false);
+        await tracks.nth(1).click({position:{x:12,y:15}});
+        assert.equal(await menu.count(), 0);
+        assert.equal(await list.locator('[aria-checked="true"]').count(), 2);
+        await search.fill('Song 39');
+        await tracks.first().filter({hasText:'Song 39'}).waitFor();
+        assert.equal(await cancel.isVisible(), false);
+        await tracks.first().click({button:'right'});
+        await menu.waitFor();
+        await page.locator('.search-close').click();
+        assert.equal(await cancel.isVisible(), false);
         assert.equal(await menu.count(), 0);
     },
 
@@ -386,7 +529,7 @@ module.exports = {
 
         await page.locator('#breadcrumbs .tree-row').first().locator('.row-name').click();
         await playlist.click({button:'right'});
-        await child('Keep').click();
+        await child('Keep').click({position:{x:12,y:15}});
         await directRemove.click();
         await checkConfirmation('two-favorites', 'Remove 2 favorites?', '2 favorites will be removed.', 'Remove');
         await playlist.waitFor({state:'detached'});
@@ -499,7 +642,7 @@ module.exports = {
         assert.equal(await right.isVisible(), false);
         await page.locator('#select-cancel').click();
         const menu = await folderMenu(crumb('Books').locator('.row-name'));
-        assert.deepEqual(await menu.getByRole('button').allTextContents(), ['Available offline…']);
+        assert.equal(await menu.getByRole('button').first().textContent(), 'Available offline…');
         await page.screenshot({path:screenshot('partial-menu')});
         await menu.getByRole('button', {name:'Available offline…', exact:true}).click();
         const modal = page.locator('.modal');
